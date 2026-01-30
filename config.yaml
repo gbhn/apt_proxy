@@ -1,0 +1,39 @@
+# APT Cacher RS Configuration File
+# Place this file at: /etc/apt-cacher/config.yaml or ./config.yaml
+
+# TCP port to listen on (default: 3142)
+port: 8080
+
+# Unix socket path (optional, if set, TCP is ignored)
+# socket: /var/run/apt-cacher.sock
+
+# Cache directory (default: ./apt_cache)
+cache_dir: /var/cache/apt-cacher
+
+# Maximum cache size (bytes or human-readable format)
+# max_cache_size: 10737418240  # 10 GB in bytes
+max_cache_size_human: "10 GB"   # Easier to read
+
+# Maximum LRU cache entries (default: 100000)
+max_lru_entries: 100000
+
+# Format: prefix: upstream_url
+# Requests to /{prefix}/path will be proxied to {upstream_url}/path
+repositories:
+  # Ubuntu repositories
+  ubuntu: "http://archive.ubuntu.com/ubuntu"
+  ubuntu-ports: "http://ports.ubuntu.com/ubuntu-ports"
+  
+  # Ubuntu security
+  security: "http://security.ubuntu.com/ubuntu"
+  
+  # Debian repositories
+  debian: "http://deb.debian.org/debian"
+  debian-security: "http://security.debian.org/debian-security"
+  
+  # Popular PPAs and third-party repos
+  docker: "https://download.docker.com/linux/ubuntu"
+  nodejs: "https://deb.nodesource.com/node_20.x"
+  
+  # Add your custom repositories here
+  # custom: "https://your-repo.example.com"

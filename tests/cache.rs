@@ -1,6 +1,6 @@
 mod helpers;
 
-use apt_cacher_rs::{cache::*, config::Settings};
+use apt_cacher_rs::cache::*;
 use axum::http::HeaderMap;
 use helpers::*;
 

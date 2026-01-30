@@ -109,13 +109,15 @@ mod successful_downloads {
         let _m = mock.mock_get("/test.deb", &test_data).await;
         
         let client = reqwest::Client::new();
-        let url = format!("{}/test.deb", mock.url());
+        // Correctly split URL components: base URL and file path
+        let url = mock.url();
+        let upstream_path = "test.deb";
         
         let path = "test/package.deb";
         let downloader = Downloader::new(
             client,
             url,
-            path.to_string(),
+            upstream_path.to_string(),
             Arc::new(DashMap::new()),
         );
         
@@ -142,13 +144,14 @@ mod successful_downloads {
         let _m = mock.mock_debian_package("/package.deb", &package_data).await;
         
         let client = reqwest::Client::new();
-        let url = format!("{}/package.deb", mock.url());
+        let url = mock.url();
+        let upstream_path = "package.deb";
         
         let path = "ubuntu/pool/main/p/package.deb";
         let downloader = Downloader::new(
             client,
             url,
-            path.to_string(),
+            upstream_path.to_string(),
             Arc::new(DashMap::new()),
         );
         
@@ -186,15 +189,17 @@ mod concurrent_downloads {
         // Загружаем параллельно
         for i in 0..5 {
             let cache_clone = cache.clone();
-            let url = format!("{}/file{}.deb", base_url, i);
+            let url = base_url.clone();
             let client = reqwest::Client::new();
             
             let handle = tokio::spawn(async move {
                 let path = format!("test/file{}.deb", i);
+                let upstream_path = format!("file{}.deb", i);
+                
                 let downloader = Downloader::new(
                     client,
                     url,
-                    path.clone(),
+                    upstream_path,
                     Arc::new(DashMap::new()),
                 );
                 
@@ -245,16 +250,18 @@ mod concurrent_downloads {
         let mut handles = vec![];
         for _ in 0..3 {
             let cache_clone = cache.clone();
-            let url = format!("{}/same.deb", base_url);
+            let url = base_url.clone();
             let client = reqwest::Client::new();
             let in_progress_clone = in_progress.clone();
             
             let handle = tokio::spawn(async move {
                 let path = "test/same.deb";
+                let upstream_path = "same.deb";
+                
                 let downloader = Downloader::new(
                     client,
                     url,
-                    path.to_string(),
+                    upstream_path.to_string(),
                     in_progress_clone,
                 );
                 match downloader.fetch_and_stream(path, &cache_clone).await {
@@ -299,13 +306,14 @@ mod error_handling {
         let _m = mock.mock_get_status("/notfound.deb", 404).await;
         
         let client = reqwest::Client::new();
-        let url = format!("{}/notfound.deb", mock.url());
+        let url = mock.url();
+        let upstream_path = "notfound.deb";
         
         let path = "test/notfound.deb";
         let downloader = Downloader::new(
             client,
             url,
-            path.to_string(),
+            upstream_path.to_string(),
             Arc::new(DashMap::new()),
         );
         
@@ -323,13 +331,14 @@ mod error_handling {
         let _m = mock.mock_get_status("/error.deb", 500).await;
         
         let client = reqwest::Client::new();
-        let url = format!("{}/error.deb", mock.url());
+        let url = mock.url();
+        let upstream_path = "error.deb";
         
         let path = "test/error.deb";
         let downloader = Downloader::new(
             client,
             url,
-            path.to_string(),
+            upstream_path.to_string(),
             Arc::new(DashMap::new()),
         );
         

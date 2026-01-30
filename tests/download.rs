@@ -1,0 +1,337 @@
+mod helpers;
+
+use apt_cacher_rs::{cache::*, download::*};
+use dashmap::DashMap;
+use helpers::*;
+use std::sync::Arc;
+use tokio::time::{sleep, Duration};
+
+/// Группа тестов для создания и инициализации Downloader
+mod creation {
+    use super::*;
+    
+    #[tokio::test]
+    async fn downloader_creation() {
+        let client = reqwest::Client::new();
+        let downloader = Downloader::new(
+            client,
+            "http://example.com".to_string(),
+            "path/to/file".to_string(),
+            Arc::new(DashMap::new()),
+        );
+        
+        drop(downloader);
+    }
+}
+
+/// Группа тестов для DownloadState
+mod download_state {
+    use super::*;
+    
+    #[tokio::test]
+    async fn initial_state() {
+        let state = Arc::new(DownloadState::new());
+        
+        assert_eq!(state.status_code.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!state.is_finished.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!state.is_success.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(state.bytes_written.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    
+    #[tokio::test]
+    async fn mark_finished_success() {
+        let state = Arc::new(DownloadState::new());
+        
+        state.mark_finished(true);
+        
+        assert!(state.is_finished.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(state.is_success.load(std::sync::atomic::Ordering::SeqCst));
+    }
+    
+    #[tokio::test]
+    async fn mark_finished_failure() {
+        let state = Arc::new(DownloadState::new());
+        
+        state.mark_finished(false);
+        
+        assert!(state.is_finished.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!state.is_success.load(std::sync::atomic::Ordering::SeqCst));
+    }
+    
+    #[tokio::test]
+    async fn wait_for_status() {
+        let state = Arc::new(DownloadState::new());
+        let state_clone = state.clone();
+        
+        let handle = tokio::spawn(async move {
+            state_clone.wait_for_status().await
+        });
+        
+        sleep(Duration::from_millis(10)).await;
+        
+        state.status_code.store(200, std::sync::atomic::Ordering::SeqCst);
+        state.notify_status.notify_waiters();
+        
+        let result = handle.await.unwrap();
+        assert_eq!(result, 200);
+    }
+    
+    #[tokio::test]
+    async fn wait_for_status_on_finish() {
+        let state = Arc::new(DownloadState::new());
+        let state_clone = state.clone();
+        
+        let handle = tokio::spawn(async move {
+            state_clone.wait_for_status().await
+        });
+        
+        sleep(Duration::from_millis(10)).await;
+        
+        state.mark_finished(false);
+        
+        let result = handle.await.unwrap();
+        assert_eq!(result, 502);
+    }
+}
+
+/// Группа тестов для успешных загрузок
+mod successful_downloads {
+    use super::*;
+    
+    #[tokio::test]
+    async fn basic_download() {
+        let temp_dir = temp_dir();
+        let settings = basic_settings(temp_dir.path().to_path_buf());
+        let cache = Arc::new(CacheManager::new(settings).await.unwrap());
+        
+        let test_data = generate_test_data(1024);
+        let mut mock = MockServerBuilder::new().await;
+        let _m = mock.mock_get("/test.deb", &test_data).await;
+        
+        let client = reqwest::Client::new();
+        let url = format!("{}/test.deb", mock.url());
+        
+        let downloader = Downloader::new(
+            client,
+            url,
+            "test/package.deb".to_string(),
+            Arc::new(DashMap::new()),
+        );
+        
+        let result = downloader.download_and_cache(cache.clone()).await;
+        assert!(result.is_ok());
+        
+        // Проверяем, что файл сохранен
+        let cached = cache.serve_cached("test/package.deb").await.unwrap();
+        assert!(cached.is_some());
+    }
+    
+    #[tokio::test]
+    async fn download_debian_package() {
+        let temp_dir = temp_dir();
+        let settings = basic_settings(temp_dir.path().to_path_buf());
+        let cache = Arc::new(CacheManager::new(settings).await.unwrap());
+        
+        let package_data = generate_test_data(2048);
+        let mut mock = MockServerBuilder::new().await;
+        let _m = mock.mock_debian_package("/package.deb", &package_data).await;
+        
+        let client = reqwest::Client::new();
+        let url = format!("{}/package.deb", mock.url());
+        
+        let downloader = Downloader::new(
+            client,
+            url,
+            "ubuntu/pool/main/p/package.deb".to_string(),
+            Arc::new(DashMap::new()),
+        );
+        
+        let result = downloader.download_and_cache(cache.clone()).await;
+        assert!(result.is_ok());
+        
+        // Проверяем размер
+        let cache_path = cache.cache_path("ubuntu/pool/main/p/package.deb");
+        assert_file_size(&cache_path, 2048).await;
+    }
+}
+
+/// Группа тестов для параллельных загрузок
+mod concurrent_downloads {
+    use super::*;
+    
+    #[tokio::test]
+    async fn multiple_parallel_downloads() {
+        let temp_dir = temp_dir();
+        let settings = basic_settings(temp_dir.path().to_path_buf());
+        let cache = Arc::new(CacheManager::new(settings).await.unwrap());
+        
+        let mut mock = MockServerBuilder::new().await;
+        
+        // Создаем несколько эндпоинтов
+        let mut handles = vec![];
+        for i in 0..5 {
+            let data = generate_test_data(512);
+            mock.mock_get(&format!("/file{}.deb", i), &data).await;
+        }
+        
+        let base_url = mock.url();
+        
+        // Загружаем параллельно
+        for i in 0..5 {
+            let cache_clone = cache.clone();
+            let url = format!("{}/file{}.deb", base_url, i);
+            let client = reqwest::Client::new();
+            
+            let handle = tokio::spawn(async move {
+                let downloader = Downloader::new(
+                    client,
+                    url,
+                    format!("test/file{}.deb", i),
+                    Arc::new(DashMap::new()),
+                );
+                downloader.download_and_cache(cache_clone).await
+            });
+            
+            handles.push(handle);
+        }
+        
+        // Ждем все загрузки
+        for handle in handles {
+            assert!(handle.await.unwrap().is_ok());
+        }
+        
+        // Проверяем, что все файлы в кеше
+        for i in 0..5 {
+            let cached = cache.serve_cached(&format!("test/file{}.deb", i))
+                .await
+                .unwrap();
+            assert!(cached.is_some());
+        }
+    }
+    
+    #[tokio::test]
+    async fn deduplication_of_same_file() {
+        let temp_dir = temp_dir();
+        let settings = basic_settings(temp_dir.path().to_path_buf());
+        let cache = Arc::new(CacheManager::new(settings).await.unwrap());
+        
+        let test_data = generate_test_data(1024);
+        let mut mock = MockServerBuilder::new().await;
+        let m = mock.mock_get("/same.deb", &test_data).await;
+        
+        let base_url = mock.url();
+        let in_progress = Arc::new(DashMap::new());
+        
+        // Запускаем 3 параллельные загрузки одного файла
+        let mut handles = vec![];
+        for _ in 0..3 {
+            let cache_clone = cache.clone();
+            let url = format!("{}/same.deb", base_url);
+            let client = reqwest::Client::new();
+            let in_progress_clone = in_progress.clone();
+            
+            let handle = tokio::spawn(async move {
+                let downloader = Downloader::new(
+                    client,
+                    url,
+                    "test/same.deb".to_string(),
+                    in_progress_clone,
+                );
+                downloader.download_and_cache(cache_clone).await
+            });
+            
+            handles.push(handle);
+        }
+        
+        for handle in handles {
+            assert!(handle.await.unwrap().is_ok());
+        }
+        
+        // Мок должен быть вызван только один раз (дедупликация)
+        m.assert_async().await;
+    }
+}
+
+/// Группа тестов для обработки ошибок
+mod error_handling {
+    use super::*;
+    
+    #[tokio::test]
+    async fn handle_404_error() {
+        let temp_dir = temp_dir();
+        let settings = basic_settings(temp_dir.path().to_path_buf());
+        let cache = Arc::new(CacheManager::new(settings).await.unwrap());
+        
+        let mut mock = MockServerBuilder::new().await;
+        let _m = mock.mock_get_status("/notfound.deb", 404).await;
+        
+        let client = reqwest::Client::new();
+        let url = format!("{}/notfound.deb", mock.url());
+        
+        let downloader = Downloader::new(
+            client,
+            url,
+            "test/notfound.deb".to_string(),
+            Arc::new(DashMap::new()),
+        );
+        
+        let result = downloader.download_and_cache(cache).await;
+        assert!(result.is_err());
+    }
+    
+    #[tokio::test]
+    async fn handle_server_error() {
+        let temp_dir = temp_dir();
+        let settings = basic_settings(temp_dir.path().to_path_buf());
+        let cache = Arc::new(CacheManager::new(settings).await.unwrap());
+        
+        let mut mock = MockServerBuilder::new().await;
+        let _m = mock.mock_get_status("/error.deb", 500).await;
+        
+        let client = reqwest::Client::new();
+        let url = format!("{}/error.deb", mock.url());
+        
+        let downloader = Downloader::new(
+            client,
+            url,
+            "test/error.deb".to_string(),
+            Arc::new(DashMap::new()),
+        );
+        
+        let result = downloader.download_and_cache(cache).await;
+        assert!(result.is_err());
+    }
+}
+
+/// Группа тестов для работы с медленными соединениями
+mod network_conditions {
+    use super::*;
+    
+    #[tokio::test]
+    async fn handle_slow_download() {
+        let temp_dir = temp_dir();
+        let settings = basic_settings(temp_dir.path().to_path_buf());
+        let cache = Arc::new(CacheManager::new(settings).await.unwrap());
+        
+        let test_data = generate_test_data(512);
+        let mut mock = MockServerBuilder::new().await;
+        let _m = mock.mock_with_delay("/slow.deb", &test_data, 100).await;
+        
+        let client = reqwest::Client::new();
+        let url = format!("{}/slow.deb", mock.url());
+        
+        let downloader = Downloader::new(
+            client,
+            url,
+            "test/slow.deb".to_string(),
+            Arc::new(DashMap::new()),
+        );
+        
+        let result = downloader.download_and_cache(cache.clone()).await;
+        assert!(result.is_ok());
+        
+        // Проверяем, что файл сохранился корректно
+        let cached = cache.serve_cached("test/slow.deb").await.unwrap();
+        assert!(cached.is_some());
+    }
+}

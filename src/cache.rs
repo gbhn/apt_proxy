@@ -2,7 +2,10 @@ use axum::{body::Body, http::HeaderMap, response::Response};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 use tokio::{fs, sync::RwLock};
 use tracing::info;
@@ -55,8 +58,8 @@ impl CacheMetadata {
 
 pub struct CacheManager {
     base_dir: PathBuf,
-    lru: RwLock<lru::LruCache<String, CacheEntry>>,
-    total_size: AtomicU64,
+    lru: Arc<RwLock<lru::LruCache<String, CacheEntry>>>,
+    total_size: Arc<AtomicU64>,
     max_size: u64,
 }
 
@@ -66,10 +69,10 @@ impl CacheManager {
 
         let manager = Self {
             base_dir: settings.cache_dir.clone(),
-            lru: RwLock::new(lru::LruCache::new(
+            lru: Arc::new(RwLock::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(settings.max_lru_entries).unwrap(),
-            )),
-            total_size: AtomicU64::new(0),
+            ))),
+            total_size: Arc::new(AtomicU64::new(0)),
             max_size: settings.max_cache_size,
         };
 
@@ -153,7 +156,7 @@ impl CacheManager {
             _ => return Ok(None),
         };
 
-        let needs_lru_update = {
+        let _needs_lru_update = {
             if let Ok(lru) = self.lru.try_write() {
                 drop(lru);
                 false
@@ -219,14 +222,14 @@ impl CacheManager {
         let total = self.total_size.load(Ordering::Acquire);
         if total > self.max_size {
             let self_clone = self.base_dir.clone();
-            let lru_ref = &self.lru;
-            let total_size_ref = &self.total_size;
+            let lru_ref = self.lru.clone();
+            let total_size_ref = self.total_size.clone();
             let max_size = self.max_size;
             
             tokio::spawn(Self::cleanup_task(
                 self_clone,
-                lru_ref.clone(),
-                total_size_ref.clone(),
+                lru_ref,
+                total_size_ref,
                 max_size,
             ));
         }
@@ -252,8 +255,8 @@ impl CacheManager {
 
     async fn cleanup_task(
         base_dir: PathBuf,
-        lru: RwLock<lru::LruCache<String, CacheEntry>>,
-        total_size: AtomicU64,
+        lru: Arc<RwLock<lru::LruCache<String, CacheEntry>>>,
+        total_size: Arc<AtomicU64>,
         max_size: u64,
     ) {
         let mut current = total_size.load(Ordering::Acquire);

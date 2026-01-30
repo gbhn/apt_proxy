@@ -4,7 +4,7 @@ use axum::{
     routing::get,
     Router,
 };
-use dashmap::DashMap; 
+use dashmap::DashMap;
 use std::sync::Arc;
 
 pub mod cache;
@@ -16,14 +16,14 @@ pub mod utils;
 
 use cache::CacheManager;
 use config::Settings;
+use download::ActiveDownloads;
 use error::{ProxyError, Result};
-use download::ActiveDownloads; 
 
 pub struct AppState {
     pub settings: Settings,
     pub cache: CacheManager,
     pub http_client: reqwest::Client,
-    pub active_downloads: ActiveDownloads, 
+    pub active_downloads: ActiveDownloads,
 }
 
 impl AppState {
@@ -31,13 +31,11 @@ impl AppState {
         let http_client = reqwest::Client::builder()
             .user_agent("apt-cacher-rs/2.1")
             .timeout(std::time::Duration::from_secs(300))
-            .pool_max_idle_per_host(20)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(32)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .http2_prior_knowledge()
             .tcp_keepalive(std::time::Duration::from_secs(60))
             .tcp_nodelay(true)
-            .http2_initial_stream_window_size(Some(1024 * 1024))
-            .http2_initial_connection_window_size(Some(2 * 1024 * 1024))
             .build()
             .expect("Failed to build HTTP client");
 
@@ -45,15 +43,18 @@ impl AppState {
             settings,
             cache,
             http_client,
-            active_downloads: Arc::new(DashMap::with_capacity(64)),
+            active_downloads: Arc::new(DashMap::with_capacity(128)),
         }
     }
 
+    /// Возвращает (upstream_url, path_remainder)
+    /// - upstream_url живёт столько же, сколько self
+    /// - path_remainder живёт столько же, сколько входной path
     #[inline]
-    pub fn resolve_upstream(&self, path: &str) -> Option<(String, String)> {
+    pub fn resolve_upstream<'s, 'p>(&'s self, path: &'p str) -> Option<(&'s str, &'p str)> {
         let (prefix, remainder) = path.split_once('/')?;
         let repo_url = self.settings.repositories.get(prefix)?;
-        Some((repo_url.clone(), remainder.to_string()))
+        Some((repo_url.as_str(), remainder))
     }
 }
 
@@ -86,22 +87,19 @@ async fn proxy_handler(
         .ok_or(ProxyError::RepositoryNotFound)?;
 
     if upstream_path.is_empty() {
-        return Err(ProxyError::InvalidPath("Path missing file name".to_string()));
+        return Err(ProxyError::InvalidPath("Path missing file name".into()));
     }
 
     if let Some(response) = state.cache.serve_cached(&path).await? {
         return Ok(response);
     }
 
-    let download = download::Downloader::new(
+    let downloader = download::Downloader::new(
         state.http_client.clone(),
-        upstream_url,
-        upstream_path,
+        upstream_url.to_string(),  // Конвертируем в String здесь, когда нужно владение
+        upstream_path.to_string(),
         state.active_downloads.clone(),
     );
 
-    download
-        .fetch_and_stream(&path, &state.cache)
-        .await
-        .map_err(Into::into)
+    downloader.fetch_and_stream(&path, &state.cache).await
 }

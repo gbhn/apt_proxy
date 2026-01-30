@@ -4,58 +4,71 @@ pub fn init_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "apt_proxy=info,tower_http=info".to_string()),
+                .unwrap_or_else(|_| "apt_cacher_rs=info,tower_http=info".into()),
         )
         .init();
 }
 
+#[inline]
 pub fn validate_path(path: &str) -> Result<(), crate::error::ProxyError> {
-    if path.is_empty() || path.len() > 2048 {
+    let len = path.len();
+    
+    if len == 0 || len > 2048 {
         return Err(crate::error::ProxyError::InvalidPath(
-            "Path length invalid".to_string(),
+            "Path length invalid".into(),
         ));
     }
-    if path.contains('\0') || path.contains("..") {
+    
+    if memchr::memchr(0, path.as_bytes()).is_some() {
         return Err(crate::error::ProxyError::InvalidPath(
-            "Path contains invalid characters".to_string(),
+            "Path contains null byte".into(),
         ));
     }
+    
+    if path.contains("..") {
+        return Err(crate::error::ProxyError::InvalidPath(
+            "Path contains '..'".into(),
+        ));
+    }
+    
     Ok(())
 }
 
+#[inline]
 pub fn format_size(bytes: u64) -> String {
-    const UNITS: [(u64, &str); 4] = [
-        (1_073_741_824, "GB"),
-        (1_048_576, "MB"),
-        (1024, "KB"),
-        (1, "B"),
-    ];
+    const GB: u64 = 1_073_741_824;
+    const MB: u64 = 1_048_576;
+    const KB: u64 = 1024;
 
-    for (divisor, unit) in UNITS {
-        if bytes >= divisor {
-            return if divisor == 1 {
-                format!("{} {}", bytes, unit)
-            } else {
-                format!("{:.2} {}", bytes as f64 / divisor as f64, unit)
-            };
-        }
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
     }
-    format!("{} B", bytes)
 }
 
+/// Генерация пути кэша - простая версия (быстрее чем with_capacity)
+#[inline]
 pub fn cache_path_for(base_dir: &Path, uri_path: &str) -> PathBuf {
     let hash = blake3::hash(uri_path.as_bytes());
     let hex = hash.to_hex();
+    // join() оптимизирован внутри std, не нужен with_capacity
     base_dir
-        .join(&hex[0..2])
-        .join(&hex[2..4])
+        .join(&hex.as_str()[0..2])
+        .join(&hex.as_str()[2..4])
         .join(hex.as_str())
 }
 
+#[inline]
 pub fn headers_path_for(cache_path: &Path) -> PathBuf {
     cache_path.with_extension("headers")
 }
 
+#[inline]
 pub fn part_path_for(cache_path: &Path) -> PathBuf {
     cache_path.with_extension("part")
 }

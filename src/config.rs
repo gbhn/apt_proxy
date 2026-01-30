@@ -39,20 +39,44 @@ pub struct ConfigFile {
 }
 
 impl ConfigFile {
+    /// Парсинг размера без лишних аллокаций
     pub fn parse_size(s: &str) -> Option<u64> {
-        let s = s.trim().to_uppercase();
-        let units = [("GB", 1_073_741_824), ("MB", 1_048_576), ("KB", 1024), ("B", 1)];
-        
-        units
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+
+        // Сначала пробуем как чистое число
+        if let Ok(n) = s.parse::<u64>() {
+            return Some(n);
+        }
+
+        let bytes = s.as_bytes();
+        let len = bytes.len();
+
+        // Находим позицию где заканчиваются цифры
+        let num_end = bytes
             .iter()
-            .find_map(|(suffix, mult)| {
-                s.strip_suffix(suffix)
-                    .and_then(|n| n.trim().parse::<u64>().ok())
-                    .map(|n| n * mult)
-            })
-            .or_else(|| s.parse().ok())
+            .position(|&b| !b.is_ascii_digit() && b != b' ')
+            .unwrap_or(len);
+
+        let num_str = s[..num_end].trim();
+        let suffix = s[num_end..].trim();
+
+        let num: u64 = num_str.parse().ok()?;
+
+        let multiplier = match suffix.to_ascii_uppercase().as_str() {
+            "GB" | "G" => 1_073_741_824,
+            "MB" | "M" => 1_048_576,
+            "KB" | "K" => 1024,
+            "B" | "" => 1,
+            _ => return None,
+        };
+
+        Some(num * multiplier)
     }
 
+    #[inline]
     fn max_cache_size(&self) -> Option<u64> {
         self.max_cache_size_human
             .as_ref()
@@ -74,7 +98,6 @@ pub struct Settings {
 impl Settings {
     pub async fn load(args: Args) -> anyhow::Result<Self> {
         let config = Self::load_config_file(&args.config).await?;
-        
         let config_max_cache_size = config.max_cache_size();
 
         Ok(Self {
@@ -102,7 +125,9 @@ impl Settings {
             return Ok(serde_yaml::from_str(&content)?);
         }
 
-        for path in ["/etc/apt-cacher/config.yaml", "./config.yaml"] {
+        const CONFIG_PATHS: &[&str] = &["/etc/apt-cacher/config.yaml", "./config.yaml"];
+
+        for path in CONFIG_PATHS {
             if let Ok(content) = tokio::fs::read_to_string(path).await {
                 if let Ok(config) = serde_yaml::from_str(&content) {
                     info!("Loaded config from {}", path);
@@ -115,12 +140,10 @@ impl Settings {
     }
 
     pub fn display_info(&self) {
-        use crate::utils::format_size;
-        
         info!("Configuration:");
         info!("  Cache directory: {:?}", self.cache_dir);
-        info!("  Max cache size: {}", format_size(self.max_cache_size));
-        
+        info!("  Max cache size: {}", crate::utils::format_size(self.max_cache_size));
+
         if self.repositories.is_empty() {
             tracing::warn!("No repositories configured - all requests will return 404");
         } else {

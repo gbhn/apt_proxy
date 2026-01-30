@@ -95,6 +95,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "lru",
+ "memchr",
  "mockito",
  "proptest",
  "rand 0.8.5",

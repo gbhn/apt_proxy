@@ -56,7 +56,7 @@ pub async fn read_file_with_retry(
     for attempt in 0..max_attempts {
         match tokio::fs::read(path).await {
             Ok(data) => return Ok(data),
-            Err(e) if attempt < max_attempts - 1 => {
+            Err(_e) if attempt < max_attempts - 1 => {
                 sleep(Duration::from_millis(50)).await;
             }
             Err(e) => return Err(e),

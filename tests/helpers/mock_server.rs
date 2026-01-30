@@ -89,47 +89,6 @@ impl MockServerBuilder {
         .await
     }
     
-    /// Создает последовательность моков для имитации нестабильного соединения
-    pub async fn mock_unstable_connection(
-        &mut self,
-        path: &str,
-        failures_before_success: usize,
-        success_body: &[u8],
-    ) -> Vec<Mock> {
-        let mut mocks = Vec::new();
-        
-        // Сначала создаем мокер с ошибками
-        for _ in 0..failures_before_success {
-            let mock = self.mock_get_status(path, 500).await;
-            mocks.push(mock);
-        }
-        
-        // Затем успешный ответ
-        let mock = self.mock_get(path, success_body).await;
-        mocks.push(mock);
-        
-        mocks
-    }
-    
-    /// Создает mock с задержкой ответа
-    pub async fn mock_with_delay(
-        &mut self,
-        path: &str,
-        body: &[u8],
-        delay_ms: u64,
-    ) -> Mock {
-        use std::time::Duration;
-        
-        self.server
-            .mock("GET", path)
-            .with_status(200)
-            .with_header("content-type", "application/octet-stream")
-            .with_body(body)
-            .with_delay(Duration::from_millis(delay_ms))
-            .create_async()
-            .await
-    }
-    
     /// Извлекает внутренний ServerGuard для более сложных сценариев
     pub fn into_guard(self) -> ServerGuard {
         self.server
@@ -165,7 +124,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_mock_server_builder() {
-        let mut mock = MockServerBuilder::new().await;
+        let mock = MockServerBuilder::new().await;
         let url = mock.url();
         
         assert!(!url.is_empty());

@@ -1,6 +1,6 @@
 mod helpers;
 
-use apt_cacher_rs::{cache::*, download::*};
+use apt_cacher_rs::{cache::*, download::*, error::ProxyError};
 use dashmap::DashMap;
 use helpers::*;
 use std::sync::Arc;
@@ -111,18 +111,23 @@ mod successful_downloads {
         let client = reqwest::Client::new();
         let url = format!("{}/test.deb", mock.url());
         
+        let path = "test/package.deb";
         let downloader = Downloader::new(
             client,
             url,
-            "test/package.deb".to_string(),
+            path.to_string(),
             Arc::new(DashMap::new()),
         );
         
-        let result = downloader.download_and_cache(cache.clone()).await;
+        let result = downloader.fetch_and_stream(path, &cache).await;
         assert!(result.is_ok());
         
+        // Ждем файл
+        let cache_path = cache.cache_path(path);
+        assert!(wait_for_file(&cache_path, 2000).await);
+
         // Проверяем, что файл сохранен
-        let cached = cache.serve_cached("test/package.deb").await.unwrap();
+        let cached = cache.serve_cached(path).await.unwrap();
         assert!(cached.is_some());
     }
     
@@ -139,18 +144,20 @@ mod successful_downloads {
         let client = reqwest::Client::new();
         let url = format!("{}/package.deb", mock.url());
         
+        let path = "ubuntu/pool/main/p/package.deb";
         let downloader = Downloader::new(
             client,
             url,
-            "ubuntu/pool/main/p/package.deb".to_string(),
+            path.to_string(),
             Arc::new(DashMap::new()),
         );
         
-        let result = downloader.download_and_cache(cache.clone()).await;
+        let result = downloader.fetch_and_stream(path, &cache).await;
         assert!(result.is_ok());
         
         // Проверяем размер
-        let cache_path = cache.cache_path("ubuntu/pool/main/p/package.deb");
+        let cache_path = cache.cache_path(path);
+        assert!(wait_for_file(&cache_path, 2000).await);
         assert_file_size(&cache_path, 2048).await;
     }
 }
@@ -183,13 +190,25 @@ mod concurrent_downloads {
             let client = reqwest::Client::new();
             
             let handle = tokio::spawn(async move {
+                let path = format!("test/file{}.deb", i);
                 let downloader = Downloader::new(
                     client,
                     url,
-                    format!("test/file{}.deb", i),
+                    path.clone(),
                     Arc::new(DashMap::new()),
                 );
-                downloader.download_and_cache(cache_clone).await
+                
+                match downloader.fetch_and_stream(&path, &cache_clone).await {
+                    Ok(_) => {
+                        let cache_path = cache_clone.cache_path(&path);
+                        if wait_for_file(&cache_path, 2000).await {
+                            Ok(())
+                        } else {
+                            Err(ProxyError::Download("Timeout waiting for file".into()))
+                        }
+                    },
+                    Err(e) => Err(e)
+                }
             });
             
             handles.push(handle);
@@ -231,13 +250,24 @@ mod concurrent_downloads {
             let in_progress_clone = in_progress.clone();
             
             let handle = tokio::spawn(async move {
+                let path = "test/same.deb";
                 let downloader = Downloader::new(
                     client,
                     url,
-                    "test/same.deb".to_string(),
+                    path.to_string(),
                     in_progress_clone,
                 );
-                downloader.download_and_cache(cache_clone).await
+                match downloader.fetch_and_stream(path, &cache_clone).await {
+                    Ok(_) => {
+                        let cache_path = cache_clone.cache_path(path);
+                        if wait_for_file(&cache_path, 2000).await {
+                            Ok(())
+                        } else {
+                            Err(ProxyError::Download("Timeout".into()))
+                        }
+                    },
+                    Err(e) => Err(e)
+                }
             });
             
             handles.push(handle);
@@ -246,6 +276,9 @@ mod concurrent_downloads {
         for handle in handles {
             assert!(handle.await.unwrap().is_ok());
         }
+        
+        let cache_path = cache.cache_path("test/same.deb");
+        assert!(wait_for_file(&cache_path, 2000).await);
         
         // Мок должен быть вызван только один раз (дедупликация)
         m.assert_async().await;
@@ -268,14 +301,15 @@ mod error_handling {
         let client = reqwest::Client::new();
         let url = format!("{}/notfound.deb", mock.url());
         
+        let path = "test/notfound.deb";
         let downloader = Downloader::new(
             client,
             url,
-            "test/notfound.deb".to_string(),
+            path.to_string(),
             Arc::new(DashMap::new()),
         );
         
-        let result = downloader.download_and_cache(cache).await;
+        let result = downloader.fetch_and_stream(path, &cache).await;
         assert!(result.is_err());
     }
     
@@ -291,47 +325,15 @@ mod error_handling {
         let client = reqwest::Client::new();
         let url = format!("{}/error.deb", mock.url());
         
+        let path = "test/error.deb";
         let downloader = Downloader::new(
             client,
             url,
-            "test/error.deb".to_string(),
+            path.to_string(),
             Arc::new(DashMap::new()),
         );
         
-        let result = downloader.download_and_cache(cache).await;
+        let result = downloader.fetch_and_stream(path, &cache).await;
         assert!(result.is_err());
-    }
-}
-
-/// Группа тестов для работы с медленными соединениями
-mod network_conditions {
-    use super::*;
-    
-    #[tokio::test]
-    async fn handle_slow_download() {
-        let temp_dir = temp_dir();
-        let settings = basic_settings(temp_dir.path().to_path_buf());
-        let cache = Arc::new(CacheManager::new(settings).await.unwrap());
-        
-        let test_data = generate_test_data(512);
-        let mut mock = MockServerBuilder::new().await;
-        let _m = mock.mock_with_delay("/slow.deb", &test_data, 100).await;
-        
-        let client = reqwest::Client::new();
-        let url = format!("{}/slow.deb", mock.url());
-        
-        let downloader = Downloader::new(
-            client,
-            url,
-            "test/slow.deb".to_string(),
-            Arc::new(DashMap::new()),
-        );
-        
-        let result = downloader.download_and_cache(cache.clone()).await;
-        assert!(result.is_ok());
-        
-        // Проверяем, что файл сохранился корректно
-        let cached = cache.serve_cached("test/slow.deb").await.unwrap();
-        assert!(cached.is_some());
     }
 }

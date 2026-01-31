@@ -59,13 +59,20 @@ impl AppState {
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
+    use tower_http::trace::{TraceLayer, DefaultMakeSpan, DefaultOnResponse};
+    use tower_http::LatencyUnit;
+    
     Router::new()
         .route("/", get(health_check))
         .route("/health", get(health_check))
         .route("/stats", get(stats_handler))
         .route("/*path", get(proxy_handler))
         .with_state(state)
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
+                .on_response(DefaultOnResponse::new().level(tracing::Level::INFO).latency_unit(LatencyUnit::Millis))
+        )
 }
 
 async fn health_check() -> &'static str {
@@ -80,11 +87,15 @@ async fn proxy_handler(
     Path(path): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Response> {
+    tracing::debug!("Request received for path: {}", path);
+    
     utils::validate_path(&path)?;
 
     let (upstream_url, upstream_path) = state
         .resolve_upstream(&path)
         .ok_or(ProxyError::RepositoryNotFound)?;
+
+    tracing::debug!("Resolved upstream: {} -> {}/{}", path, upstream_url, upstream_path);
 
     if upstream_path.is_empty() {
         return Err(ProxyError::InvalidPath("Path missing file name".into()));
@@ -93,6 +104,8 @@ async fn proxy_handler(
     if let Some(response) = state.cache.serve_cached(&path).await? {
         return Ok(response);
     }
+
+    tracing::info!("Cache MISS: {} - downloading from upstream", path);
 
     let downloader = download::Downloader::new(
         state.http_client.clone(),

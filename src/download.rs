@@ -220,8 +220,10 @@ async fn download_file(
         fs::create_dir_all(parent).await?;
     }
 
+    info!("Downloading from: {}", url);
     let response = client.get(&url).send().await?;
     let status = response.status().as_u16();
+    info!("Upstream response status: {}", status);
 
     let metadata = crate::cache::CacheMetadata::from_response(&response, &url);
     *state.metadata.write().await = Some(metadata.clone());
@@ -230,11 +232,17 @@ async fn download_file(
     state.notify_status.notify_waiters();
 
     if !response.status().is_success() {
-        warn!("Upstream returned {}", status);
+        warn!("Upstream returned non-success status: {}", status);
         state.mark_finished(false);
         return Ok(());
     }
 
+    let content_length = response.content_length();
+    if let Some(len) = content_length {
+        info!("Content length: {} bytes ({})", len, crate::utils::format_size(len));
+    }
+
+    info!("Writing to temp file: {:?}", part_path);
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -256,6 +264,11 @@ async fn download_file(
             total += buffer.len() as u64;
             state.notify_progress(total);
             buffer.clear();
+            
+            if total % (5 * 1024 * 1024) == 0 {  // Лог каждые 5MB
+                info!("Downloaded {} / {:?}", crate::utils::format_size(total), 
+                      content_length.map(crate::utils::format_size));
+            }
         }
     }
 
@@ -268,10 +281,12 @@ async fn download_file(
     file.flush().await?;
     drop(file);
 
+    info!("Download complete: {} total, renaming to final path", crate::utils::format_size(total));
     fs::rename(&part_path, &cache_path).await?;
     metadata.save(&cache_path).await?;
 
     state.mark_finished(true);
+    info!("File saved successfully to cache");
     Ok(())
 }
 

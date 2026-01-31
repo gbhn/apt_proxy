@@ -1,12 +1,23 @@
 use std::path::{Path, PathBuf};
 
 pub fn init_logging() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "apt_cacher_rs=info,tower_http=info".into()),
-        )
+    use tracing_subscriber::{fmt, EnvFilter};
+    
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| {
+            EnvFilter::new("apt_cacher_rs=debug,tower_http=debug,hyper=info")
+        });
+    
+    fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_line_number(true)
+        .with_level(true)
+        .compact()
         .init();
+    
+    tracing::info!("Logging initialized");
 }
 
 #[inline]

@@ -1,7 +1,10 @@
 [package]
 name = "apt-cacher-rs"
 version = "2.1.0"
-edition = "2021"
+edition = "2024"
+description = "A high-performance caching proxy for APT repositories"
+license = "MIT"
+repository = "https://github.com/gbhn/apt_proxy"
 
 [dependencies]
 axum = "0.7"
@@ -9,32 +12,24 @@ tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace"] }
 hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
-
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
-
 reqwest = { version = "0.12", features = ["stream", "json"] }
 bytes = "1"
-
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 http-serde = "2.1"
-
 clap = { version = "4", features = ["derive"] }
-
 lru = "0.12"
 dashmap = "6"
 blake3 = "1"
-
 anyhow = "1"
 thiserror = "1"
 memchr = "2"
-
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
 proptest = { version = "1", optional = true }
 criterion = { version = "0.5", optional = true, features = ["async_tokio"] }
 
@@ -53,9 +48,28 @@ name = "cache_bench"
 harness = false
 required-features = ["bench"]
 
+[package.metadata.deb]
+maintainer = "Karim Zabbarov <yolkis@inbox.ru>"
+extended-description = """\
+A lightweight, high-performance caching proxy for APT repositories written in Rust.
+It caches downloaded packages to reduce bandwidth usage and speed up
+subsequent installations on local networks."""
+section = "net"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["config.yaml", "etc/apt-cacher/config.yaml", "644"],
+]
+conf-files = ["/etc/apt-cacher/config.yaml"]
+
+[package.metadata.deb.systemd-units]
+unit-name = "apt-cacher-rs"
+enable = true
+start = true
+
 [profile.release]
-opt-level = 3           
-lto = true              
-codegen-units = 1       
-panic = "abort"         
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
 strip = true

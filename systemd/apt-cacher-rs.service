@@ -1,0 +1,18 @@
+[Unit]
+Description=APT Cacher RS Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+ExecStart=/usr/bin/apt-cacher-rs --config /etc/apt-cacher/config.yaml
+Restart=on-failure
+RestartSec=5s
+CacheDirectory=apt-cacher
+CacheDirectoryMode=0750
+ProtectSystem=full
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

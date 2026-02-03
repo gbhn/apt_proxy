@@ -8,7 +8,7 @@ use std::{
     },
 };
 use tokio::{fs, sync::RwLock};
-use tracing::info;
+use tracing::{info, warn};
 
 const READ_BUFFER_SIZE: usize = 256 * 1024;
 
@@ -84,6 +84,8 @@ impl CacheManager {
     async fn initialize(&self) -> anyhow::Result<()> {
         info!("Initializing cache...");
 
+        self.cleanup_stale_downloads().await?;
+
         let files = self.scan_directory_iterative().await?;
 
         let mut lru = self.lru.write().await;
@@ -101,6 +103,28 @@ impl CacheManager {
             crate::utils::format_size(total)
         );
 
+        Ok(())
+    }
+
+    async fn cleanup_stale_downloads(&self) -> anyhow::Result<()> {
+        let mut dirs_to_scan = vec![self.base_dir.clone()];
+        while let Some(dir) = dirs_to_scan.pop() {
+            let mut entries = match fs::read_dir(&dir).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs_to_scan.push(path);
+                } else if let Some(ext) = path.extension() {
+                    if ext == "part" {
+                        warn!("Removing stale download file: {:?}", path);
+                        let _ = fs::remove_file(path).await;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -161,21 +185,17 @@ impl CacheManager {
         Ok(files)
     }
 
-    /// Оптимизированная версия - один write lock вместо read+write
     pub async fn serve_cached(&self, path: &str) -> crate::error::Result<Option<Response>> {
         let cache_path = self.cache_path(path);
 
-        // Проверяем файл ДО блокировки LRU
         let metadata = match fs::metadata(&cache_path).await {
             Ok(m) if m.is_file() => m,
             _ => return Ok(None),
         };
 
-        // Один write lock - и проверка, и обновление
-        // try_write для неблокирующей попытки
-        if let Ok(mut lru) = self.lru.try_write() {
+        {
+            let mut lru = self.lru.write().await;
             if lru.get(path).is_none() {
-                // Добавляем новую запись
                 let headers_path = crate::utils::headers_path_for(&cache_path);
                 let headers_size = fs::metadata(&headers_path)
                     .await
@@ -189,9 +209,7 @@ impl CacheManager {
                 self.total_size.fetch_add(entry.total_size(), Ordering::AcqRel);
                 lru.put(path.to_string().into_boxed_str(), entry);
             }
-            // Если запись есть - get() уже обновил позицию в LRU
         }
-        // Если не смогли взять lock - не страшно, LRU обновится при следующем запросе
 
         info!("Cache HIT: {}", path);
 

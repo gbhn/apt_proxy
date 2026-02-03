@@ -34,7 +34,15 @@ impl IntoResponse for ProxyError {
             Self::Cache(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         
-        tracing::error!("Request failed: {}", self);
+        match status {
+            StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST => {
+                tracing::warn!("Request failed: {}", self);
+            },
+            _ => {
+                tracing::error!("Request failed: {}", self);
+            }
+        }
+        
         (status, self.to_string()).into_response()
     }
 }

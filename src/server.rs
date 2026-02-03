@@ -14,7 +14,9 @@ pub async fn serve_tcp(app: Router, port: u16) -> anyhow::Result<()> {
     info!("Listening on TCP: {}", addr);
     
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     
     Ok(())
 }
@@ -31,7 +33,7 @@ pub async fn serve_unix(app: Router, socket_path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o777)).await?;
+        fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660)).await?;
     }
 
     loop {
@@ -57,5 +59,29 @@ pub async fn serve_unix(app: Router, socket_path: &Path) -> anyhow::Result<()> {
                 error!("Unix socket connection error: {}", err);
             }
         });
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
     }
 }

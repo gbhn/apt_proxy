@@ -47,9 +47,6 @@ impl AppState {
         }
     }
 
-    /// Возвращает (upstream_url, path_remainder)
-    /// - upstream_url живёт столько же, сколько self
-    /// - path_remainder живёт столько же, сколько входной path
     #[inline]
     pub fn resolve_upstream<'s, 'p>(&'s self, path: &'p str) -> Option<(&'s str, &'p str)> {
         let (prefix, remainder) = path.split_once('/')?;
@@ -97,10 +94,6 @@ async fn proxy_handler(
 
     tracing::debug!("Resolved upstream: {} -> {}/{}", path, upstream_url, upstream_path);
 
-    if upstream_path.is_empty() {
-        return Err(ProxyError::InvalidPath("Path missing file name".into()));
-    }
-
     if let Some(response) = state.cache.serve_cached(&path).await? {
         return Ok(response);
     }
@@ -109,7 +102,7 @@ async fn proxy_handler(
 
     let downloader = download::Downloader::new(
         state.http_client.clone(),
-        upstream_url.to_string(),  // Конвертируем в String здесь, когда нужно владение
+        upstream_url.to_string(),
         upstream_path.to_string(),
         state.active_downloads.clone(),
     );

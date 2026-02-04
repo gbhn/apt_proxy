@@ -1,6 +1,6 @@
 [package]
 name = "apt-cacher-rs"
-version = "2.2.0"
+version = "2.2.6"
 edition = "2024"
 description = "A high-performance caching proxy for APT repositories"
 license = "MIT"
@@ -58,6 +58,7 @@ section = "net"
 priority = "optional"
 depends = "$auto"
 assets = [
+    ["target/release/apt-cacher-rs", "usr/bin/apt-cacher-rs", "755"],
     ["config.yaml", "etc/apt-cacher/config.yaml", "644"],
 ]
 conf-files = ["/etc/apt-cacher/config.yaml"]

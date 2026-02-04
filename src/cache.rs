@@ -12,15 +12,16 @@ use tracing::{info, warn};
 
 const READ_BUFFER_SIZE: usize = 256 * 1024;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct CacheEntry {
     pub data_size: u64,
     pub headers_size: u64,
+    pub metadata: Option<Arc<CacheMetadata>>,
 }
 
 impl CacheEntry {
     #[inline(always)]
-    pub const fn total_size(&self) -> u64 {
+    pub fn total_size(&self) -> u64 {
         self.data_size + self.headers_size
     }
 }
@@ -91,9 +92,9 @@ impl CacheManager {
         let mut lru = self.lru.write().await;
         let mut total = 0u64;
 
-        for (url_path, entry, _) in files {
-            lru.put(url_path.into_boxed_str(), entry);
+        for (url_path, entry) in files {
             total += entry.total_size();
+            lru.put(url_path.into_boxed_str(), entry);
         }
 
         self.total_size.store(total, Ordering::Release);
@@ -128,10 +129,8 @@ impl CacheManager {
         Ok(())
     }
 
-    async fn scan_directory_iterative(
-        &self,
-    ) -> anyhow::Result<Vec<(String, CacheEntry, std::time::SystemTime)>> {
-        let mut files = Vec::with_capacity(1024);
+    async fn scan_directory_iterative(&self) -> anyhow::Result<Vec<(String, CacheEntry)>> {
+        let mut files: Vec<(String, CacheEntry, std::time::SystemTime)> = Vec::with_capacity(1024);
         let mut dirs_to_scan = vec![self.base_dir.clone()];
 
         while let Some(dir) = dirs_to_scan.pop() {
@@ -142,17 +141,17 @@ impl CacheManager {
 
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
-                let metadata = match entry.metadata().await {
+                let file_metadata = match entry.metadata().await {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
 
-                if metadata.is_dir() {
+                if file_metadata.is_dir() {
                     dirs_to_scan.push(path);
                     continue;
                 }
 
-                if !metadata.is_file() {
+                if !file_metadata.is_file() {
                     continue;
                 }
 
@@ -162,40 +161,53 @@ impl CacheManager {
                     }
                 }
 
-                if let Some(meta) = CacheMetadata::load(&path).await {
+                // Load metadata and cache it in the entry
+                if let Some(cache_meta) = CacheMetadata::load(&path).await {
                     let headers_path = crate::utils::headers_path_for(&path);
                     let headers_size = fs::metadata(&headers_path)
                         .await
                         .map(|m| m.len())
                         .unwrap_or(0);
 
+                    let url_path = cache_meta.original_url_path.clone();
+                    
                     files.push((
-                        meta.original_url_path,
+                        url_path,
                         CacheEntry {
-                            data_size: metadata.len(),
+                            data_size: file_metadata.len(),
                             headers_size,
+                            metadata: Some(Arc::new(cache_meta)),
                         },
-                        metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                        file_metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
                     ));
                 }
             }
         }
 
-        files.sort_unstable_by_key(|(_, _, atime)| *atime);
-        Ok(files)
+        // Sort by modification time (oldest first for LRU ordering)
+        files.sort_unstable_by_key(|(_, _, mtime)| *mtime);
+        
+        // Strip mtime from result
+        Ok(files.into_iter().map(|(path, entry, _)| (path, entry)).collect())
     }
 
     pub async fn serve_cached(&self, path: &str) -> crate::error::Result<Option<Response>> {
         let cache_path = self.cache_path(path);
 
-        let metadata = match fs::metadata(&cache_path).await {
+        let file_metadata = match fs::metadata(&cache_path).await {
             Ok(m) if m.is_file() => m,
             _ => return Ok(None),
         };
 
-        {
+        // Get or create entry with cached metadata
+        let cached_meta = {
             let mut lru = self.lru.write().await;
-            if lru.get(path).is_none() {
+
+            if let Some(entry) = lru.get(path) {
+                entry.metadata.clone()
+            } else {
+                // Entry not in LRU - load metadata and add entry
+                let meta = CacheMetadata::load(&cache_path).await.map(Arc::new);
                 let headers_path = crate::utils::headers_path_for(&cache_path);
                 let headers_size = fs::metadata(&headers_path)
                     .await
@@ -203,13 +215,16 @@ impl CacheManager {
                     .unwrap_or(0);
 
                 let entry = CacheEntry {
-                    data_size: metadata.len(),
+                    data_size: file_metadata.len(),
                     headers_size,
+                    metadata: meta.clone(),
                 };
                 self.total_size.fetch_add(entry.total_size(), Ordering::AcqRel);
                 lru.put(path.to_string().into_boxed_str(), entry);
+
+                meta
             }
-        }
+        };
 
         info!("Cache HIT: {}", path);
 
@@ -218,9 +233,8 @@ impl CacheManager {
         let body = Body::from_stream(stream);
 
         let mut response = Response::new(body);
-
-        if let Some(meta) = CacheMetadata::load(&cache_path).await {
-            response.headers_mut().extend(meta.headers);
+        if let Some(meta) = cached_meta {
+            response.headers_mut().extend(meta.headers.clone());
         }
 
         Ok(Some(response))
@@ -246,7 +260,7 @@ impl CacheManager {
         write_result?;
         let headers_size = headers_result?;
 
-        self.update_stats(path, data.len() as u64, headers_size).await;
+        self.update_stats(path, data.len() as u64, headers_size, Some(Arc::new(metadata.clone()))).await;
 
         let total = self.total_size.load(Ordering::Acquire);
         if total > self.max_size {
@@ -261,11 +275,21 @@ impl CacheManager {
         crate::utils::cache_path_for(&self.base_dir, uri_path)
     }
 
-    async fn update_stats(&self, path: &str, data_size: u64, headers_size: u64) {
-        let entry = CacheEntry { data_size, headers_size };
+    async fn update_stats(
+        &self,
+        path: &str,
+        data_size: u64,
+        headers_size: u64,
+        metadata: Option<Arc<CacheMetadata>>,
+    ) {
+        let entry = CacheEntry {
+            data_size,
+            headers_size,
+            metadata,
+        };
         let mut lru = self.lru.write().await;
 
-        if let Some(old) = lru.put(path.to_string().into_boxed_str(), entry) {
+        if let Some(old) = lru.put(path.to_string().into_boxed_str(), entry.clone()) {
             let old_size = old.total_size();
             let new_size = entry.total_size();
             if new_size > old_size {
@@ -312,22 +336,22 @@ impl CacheManager {
                 let Some((old_path, entry)) = lru.pop_lru() else {
                     break;
                 };
-                to_remove.push((old_path.to_string(), entry));
+                to_remove.push((old_path.to_string(), entry.data_size, entry.headers_size));
                 current = current.saturating_sub(entry.total_size());
             }
             to_remove
         };
 
-        for (old_path, entry) in to_remove {
+        for (old_path, data_size, headers_size) in to_remove {
             let cache_path = crate::utils::cache_path_for(&base_dir, &old_path);
             let headers_path = crate::utils::headers_path_for(&cache_path);
 
             let mut removed = 0u64;
             if fs::remove_file(&cache_path).await.is_ok() {
-                removed += entry.data_size;
+                removed += data_size;
             }
             if fs::remove_file(headers_path).await.is_ok() {
-                removed += entry.headers_size;
+                removed += headers_size;
             }
             total_size.fetch_sub(removed, Ordering::AcqRel);
         }

@@ -5,7 +5,7 @@ use futures::Stream;
 use std::{
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     task::{Context, Poll},
@@ -14,17 +14,148 @@ use std::{
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncRead, AsyncWriteExt, ReadBuf},
-    sync::{Notify, RwLock},
+    sync::{watch, Notify, RwLock},
     time::timeout,
 };
 use tracing::{error, info, warn};
 
-const FILE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const HEADER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const FILE_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_BUFFER_SIZE: usize = 256 * 1024;
 const DOWNLOAD_BUFFER_SIZE: usize = 512 * 1024;
 
 pub type ActiveDownloads = Arc<DashMap<Box<str>, Arc<DownloadState>>>;
+
+/// Download status using watch channel
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DownloadStatus {
+    Pending,
+    Downloading { status_code: u16 },
+    Completed { success: bool },
+}
+
+impl DownloadStatus {
+    #[inline]
+    pub fn status_code(&self) -> Option<u16> {
+        match self {
+            Self::Downloading { status_code } => Some(*status_code),
+            Self::Completed { success: true } => Some(200),
+            Self::Completed { success: false } => Some(502),
+            Self::Pending => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_finished(&self) -> bool {
+        matches!(self, Self::Completed { .. })
+    }
+
+    #[inline]
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Completed { success: true })
+    }
+}
+
+/// Состояние загрузки с полной синхронизацией
+pub struct DownloadState {
+    // Status via watch channel
+    status_tx: watch::Sender<DownloadStatus>,
+    status_rx: watch::Receiver<DownloadStatus>,
+
+    // File readiness
+    notify_file_ready: Notify,
+    is_file_ready: AtomicBool,
+
+    // Progress tracking
+    notify_data: Notify,
+    bytes_written: AtomicU64,
+
+    pub metadata: RwLock<Option<crate::cache::CacheMetadata>>,
+}
+
+impl DownloadState {
+    pub fn new() -> Self {
+        let (status_tx, status_rx) = watch::channel(DownloadStatus::Pending);
+        Self {
+            status_tx,
+            status_rx,
+            notify_file_ready: Notify::new(),
+            is_file_ready: AtomicBool::new(false),
+            notify_data: Notify::new(),
+            bytes_written: AtomicU64::new(0),
+            metadata: RwLock::new(None),
+        }
+    }
+
+    /// Ждём получения HTTP статуса от upstream
+    pub async fn wait_for_status(&self) -> u16 {
+        let mut rx = self.status_rx.clone();
+        loop {
+            let status = *rx.borrow_and_update();
+            if let Some(code) = status.status_code() {
+                return code;
+            }
+            // Still pending, wait for change
+            if rx.changed().await.is_err() {
+                // Sender dropped, assume failure
+                return 502;
+            }
+        }
+    }
+
+    /// Ждём готовности файла для чтения
+    pub async fn wait_for_file(&self) -> bool {
+        loop {
+            if self.is_file_ready.load(Ordering::Acquire) {
+                return true;
+            }
+            if self.status().is_finished() {
+                return false; // Закончилось до создания файла
+            }
+            self.notify_file_ready.notified().await;
+        }
+    }
+
+    #[inline]
+    pub fn status(&self) -> DownloadStatus {
+        *self.status_rx.borrow()
+    }
+
+    #[inline]
+    pub fn set_status_code(&self, code: u16) {
+        self.status_tx.send_modify(|s| *s = DownloadStatus::Downloading { status_code: code });
+    }
+
+    #[inline]
+    fn mark_file_ready(&self) {
+        self.is_file_ready.store(true, Ordering::Release);
+        self.notify_file_ready.notify_waiters();
+    }
+
+    #[inline]
+    pub fn mark_finished(&self, success: bool) {
+        self.status_tx.send_modify(|s| *s = DownloadStatus::Completed { success });
+        self.notify_data.notify_waiters();
+        self.notify_file_ready.notify_waiters();
+    }
+
+    #[inline]
+    fn notify_progress(&self, bytes: u64) {
+        self.bytes_written.store(bytes, Ordering::Release);
+        self.notify_data.notify_waiters();
+    }
+
+    #[inline]
+    pub fn is_completed_successfully(&self) -> bool {
+        self.status().is_success()
+    }
+}
+
+impl Default for DownloadState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub struct Downloader {
     client: reqwest::Client,
@@ -60,6 +191,7 @@ impl Downloader {
             self.spawn_download_task(path.to_string(), cache, state.clone());
         }
 
+        // 1. Ждём HTTP статус
         let status_code = timeout(HEADER_WAIT_TIMEOUT, state.wait_for_status())
             .await
             .map_err(|_| crate::error::ProxyError::Download("Header timeout".into()))?;
@@ -71,20 +203,53 @@ impl Downloader {
             ));
         }
 
+        // 2. Ждём создания файла
+        let file_ready = timeout(FILE_READY_TIMEOUT, state.wait_for_file())
+            .await
+            .map_err(|_| crate::error::ProxyError::Download("File ready timeout".into()))?;
+
+        // 3. Если файл не готов, но загрузка успешно завершена — отдаём из кэша
+        if !file_ready {
+            return self.serve_completed_download(&state, path, cache).await;
+        }
+
+        // 4. Пробуем открыть .part файл
         let cache_path = cache.cache_path(path);
         let part_path = crate::utils::part_path_for(&cache_path);
 
-        let file = Self::open_downloading_file(&part_path).await?;
-        let stream = StreamingReader::new(file, state.clone());
+        match File::open(&part_path).await {
+            Ok(file) => {
+                let stream = StreamingReader::new(file, state.clone());
+                let body = Body::from_stream(stream);
+                let mut response = Response::new(body);
 
-        let body = Body::from_stream(stream);
-        let mut response = Response::new(body);
+                if let Some(meta) = state.metadata.read().await.as_ref() {
+                    response.headers_mut().extend(meta.headers.clone());
+                }
 
-        if let Some(meta) = state.metadata.read().await.as_ref() {
-            response.headers_mut().extend(meta.headers.clone());
+                Ok(response)
+            }
+            Err(_) => {
+                // Файл уже переименован — отдаём из кэша
+                self.serve_completed_download(&state, path, cache).await
+            }
         }
+    }
 
-        Ok(response)
+    async fn serve_completed_download(
+        &self,
+        state: &Arc<DownloadState>,
+        path: &str,
+        cache: &crate::cache::CacheManager,
+    ) -> crate::error::Result<Response> {
+        if state.is_completed_successfully() {
+            info!("Download already completed, serving from cache: {}", path);
+            cache.serve_cached(path).await?.ok_or_else(|| {
+                crate::error::ProxyError::Download("Completed but not in cache".into())
+            })
+        } else {
+            Err(crate::error::ProxyError::Download("Download failed".into()))
+        }
     }
 
     fn get_or_create_download(&self, path: &str) -> (Arc<DownloadState>, bool) {
@@ -129,83 +294,6 @@ impl Downloader {
             active.remove(&path_key);
         });
     }
-
-    async fn open_downloading_file(part_path: &std::path::Path) -> crate::error::Result<File> {
-        const MAX_ATTEMPTS: u32 = 20;
-        let mut delay = Duration::from_millis(50);
-
-        for attempt in 0..MAX_ATTEMPTS {
-            match timeout(FILE_OPEN_TIMEOUT, File::open(part_path)).await {
-                Ok(Ok(file)) => return Ok(file),
-                _ if attempt < MAX_ATTEMPTS - 1 => {
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(1));
-                }
-                _ => break,
-            }
-        }
-
-        Err(crate::error::ProxyError::Download(
-            "Failed to open downloading file".into(),
-        ))
-    }
-}
-
-pub struct DownloadState {
-    notify_status: Notify,
-    notify_data: Notify,
-    status_code: AtomicU16,
-    is_finished: AtomicBool,
-    is_success: AtomicBool,
-    bytes_written: AtomicU64,
-    pub metadata: RwLock<Option<crate::cache::CacheMetadata>>,
-}
-
-impl DownloadState {
-    pub fn new() -> Self {
-        Self {
-            notify_status: Notify::new(),
-            notify_data: Notify::new(),
-            status_code: AtomicU16::new(0),
-            is_finished: AtomicBool::new(false),
-            is_success: AtomicBool::new(false),
-            bytes_written: AtomicU64::new(0),
-            metadata: RwLock::new(None),
-        }
-    }
-
-    pub async fn wait_for_status(&self) -> u16 {
-        loop {
-            let code = self.status_code.load(Ordering::Acquire);
-            if code != 0 {
-                return code;
-            }
-            if self.is_finished.load(Ordering::Acquire) {
-                return 502;
-            }
-            self.notify_status.notified().await;
-        }
-    }
-
-    #[inline]
-    pub fn mark_finished(&self, success: bool) {
-        self.is_finished.store(true, Ordering::Release);
-        self.is_success.store(success, Ordering::Release);
-        self.notify_data.notify_waiters();
-        self.notify_status.notify_waiters();
-    }
-
-    #[inline]
-    fn notify_progress(&self, bytes: u64) {
-        self.bytes_written.store(bytes, Ordering::Release);
-        self.notify_data.notify_waiters();
-    }
-}
-
-impl Default for DownloadState {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 async fn download_file(
@@ -228,8 +316,8 @@ async fn download_file(
     let metadata = crate::cache::CacheMetadata::from_response(&response, &url);
     *state.metadata.write().await = Some(metadata.clone());
 
-    state.status_code.store(status, Ordering::Release);
-    state.notify_status.notify_waiters();
+    // Use watch channel to set status
+    state.set_status_code(status);
 
     if !response.status().is_success() {
         warn!("Upstream returned non-success status: {}", status);
@@ -239,7 +327,11 @@ async fn download_file(
 
     let content_length = response.content_length();
     if let Some(len) = content_length {
-        info!("Content length: {} bytes ({})", len, crate::utils::format_size(len));
+        info!(
+            "Content length: {} bytes ({})",
+            len,
+            crate::utils::format_size(len)
+        );
     }
 
     info!("Writing to temp file: {:?}", part_path);
@@ -249,6 +341,9 @@ async fn download_file(
         .truncate(true)
         .open(&part_path)
         .await?;
+
+    // Сигнализируем что файл создан и готов для чтения
+    state.mark_file_ready();
 
     let mut stream = response.bytes_stream();
     let mut total = 0u64;
@@ -264,10 +359,13 @@ async fn download_file(
             total += buffer.len() as u64;
             state.notify_progress(total);
             buffer.clear();
-            
-            if total % (5 * 1024 * 1024) == 0 {  // Лог каждые 5MB
-                info!("Downloaded {} / {:?}", crate::utils::format_size(total), 
-                      content_length.map(crate::utils::format_size));
+
+            if total % (5 * 1024 * 1024) == 0 {
+                info!(
+                    "Downloaded {} / {:?}",
+                    crate::utils::format_size(total),
+                    content_length.map(crate::utils::format_size)
+                );
             }
         }
     }
@@ -281,7 +379,10 @@ async fn download_file(
     file.flush().await?;
     drop(file);
 
-    info!("Download complete: {} total, renaming to final path", crate::utils::format_size(total));
+    info!(
+        "Download complete: {} total, renaming to final path",
+        crate::utils::format_size(total)
+    );
     fs::rename(&part_path, &cache_path).await?;
     metadata.save(&cache_path).await?;
 
@@ -324,11 +425,10 @@ impl Stream for StreamingReader {
                     return Poll::Ready(Some(Ok(Bytes::copy_from_slice(read_buf.filled()))));
                 }
 
-                // n == 0
-                let is_finished = this.state.is_finished.load(Ordering::Acquire);
-
-                if is_finished {
-                    return if this.state.is_success.load(Ordering::Acquire) {
+                // n == 0: EOF или ждём данных
+                let status = this.state.status();
+                if status.is_finished() {
+                    return if status.is_success() {
                         Poll::Ready(None)
                     } else {
                         Poll::Ready(Some(Err(std::io::Error::new(
@@ -340,20 +440,17 @@ impl Stream for StreamingReader {
 
                 let bytes_written = this.state.bytes_written.load(Ordering::Acquire);
                 if this.position < bytes_written {
-                    // Есть данные - пробуем снова
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
 
-                // Ждём новых данных — spawn для ожидания Notify
-                // Это редкий путь, поэтому spawn overhead приемлем
                 let waker = cx.waker().clone();
                 let state = this.state.clone();
                 tokio::spawn(async move {
                     state.notify_data.notified().await;
                     waker.wake();
                 });
-                
+
                 Poll::Pending
             }
             Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),

@@ -1,3 +1,4 @@
+use crate::logging::fields::size;
 use clap::Parser;
 use serde::Deserialize;
 use std::{collections::HashMap, path::PathBuf};
@@ -9,18 +10,29 @@ const DEFAULT_MAX_CACHE_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_LRU_ENTRIES: usize = 100_000;
 
 #[derive(Parser, Clone)]
-#[command(author, version, about)]
+#[command(author, version, about = "High-performance APT caching proxy")]
 pub struct Args {
+    /// Path to configuration file
     #[arg(long, short)]
     pub config: Option<PathBuf>,
+
+    /// TCP port to listen on
     #[arg(long)]
     pub port: Option<u16>,
+
+    /// Unix socket path (overrides TCP port)
     #[arg(long)]
     pub socket: Option<PathBuf>,
+
+    /// Cache directory path
     #[arg(long)]
     pub cache_dir: Option<PathBuf>,
+
+    /// Maximum cache size in bytes
     #[arg(long)]
     pub max_cache_size: Option<u64>,
+
+    /// Maximum LRU cache entries
     #[arg(long)]
     pub max_lru_entries: Option<usize>,
 }
@@ -50,7 +62,8 @@ impl ConfigFile {
         }
 
         let bytes = s.as_bytes();
-        let num_end = bytes.iter()
+        let num_end = bytes
+            .iter()
             .position(|&b| !b.is_ascii_digit() && b != b' ')
             .unwrap_or(bytes.len());
 
@@ -96,13 +109,16 @@ impl Settings {
             port: args.port.or(config.port).unwrap_or(DEFAULT_PORT),
             socket: args.socket.or(config.socket),
             repositories: config.repositories.unwrap_or_default(),
-            cache_dir: args.cache_dir
+            cache_dir: args
+                .cache_dir
                 .or(config.cache_dir)
                 .unwrap_or_else(|| DEFAULT_CACHE_DIR.into()),
-            max_cache_size: args.max_cache_size
+            max_cache_size: args
+                .max_cache_size
                 .or(config_max_cache_size)
                 .unwrap_or(DEFAULT_MAX_CACHE_SIZE),
-            max_lru_entries: args.max_lru_entries
+            max_lru_entries: args
+                .max_lru_entries
                 .or(config.max_lru_entries)
                 .unwrap_or(DEFAULT_MAX_LRU_ENTRIES),
         })
@@ -111,7 +127,7 @@ impl Settings {
     async fn load_config_file(path: &Option<PathBuf>) -> anyhow::Result<ConfigFile> {
         if let Some(path) = path {
             let content = tokio::fs::read_to_string(path).await?;
-            info!("Loaded config from {:?}", path);
+            info!(path = %path.display(), "Loaded configuration file");
             return Ok(serde_yaml::from_str(&content)?);
         }
 
@@ -119,25 +135,36 @@ impl Settings {
         for path in CONFIG_PATHS {
             if let Ok(content) = tokio::fs::read_to_string(path).await {
                 if let Ok(config) = serde_yaml::from_str(&content) {
-                    info!("Loaded config from {}", path);
+                    info!(path = %path, "Loaded configuration file");
                     return Ok(config);
                 }
             }
         }
 
+        info!("Using default configuration");
         Ok(ConfigFile::default())
     }
 
     pub fn display_info(&self) {
-        info!("Cache dir: {:?}, max size: {}", 
-            self.cache_dir, 
-            crate::utils::format_size(self.max_cache_size)
+        info!(
+            path = %self.cache_dir.display(),
+            max_size = %size(self.max_cache_size),
+            max_entries = self.max_lru_entries,
+            "Cache configuration"
         );
 
         if self.repositories.is_empty() {
-            warn!("No repositories configured");
+            warn!("No repositories configured - all requests will fail!");
         } else {
-            info!("Configured {} repositories", self.repositories.len());
+            for (name, url) in &self.repositories {
+                info!(name = %name, url = %url, "Repository configured");
+            }
+        }
+
+        if let Some(ref socket) = self.socket {
+            info!(socket = %socket.display(), "Unix socket mode");
+        } else {
+            info!(port = self.port, "TCP mode");
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "apt-cacher-rs"
-version = "2.2.9"
+version = "2.3.0"
 edition = "2024"
 description = "A high-performance caching proxy for APT repositories"
 license = "MIT"
@@ -9,7 +9,7 @@ repository = "https://github.com/gbhn/apt_proxy"
 [dependencies]
 axum = "0.7"
 tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["trace"] }
+tower-http = { version = "0.5", features = ["trace", "request-id", "util"] }
 hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 tokio = { version = "1", features = ["full"] }
@@ -28,8 +28,15 @@ blake3 = "1"
 anyhow = "1"
 thiserror = "1"
 memchr = "2"
+chrono = "0.4"
+
+# Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
+nu-ansi-term = "0.50"
+
+# Optional
 proptest = { version = "1", optional = true }
 criterion = { version = "0.5", optional = true, features = ["async_tokio"] }
 

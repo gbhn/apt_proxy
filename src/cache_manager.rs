@@ -1,10 +1,14 @@
+use crate::logging::fields::{self, size};
 use crate::storage::Storage;
 use std::{
     num::NonZeroUsize,
-    sync::{atomic::{AtomicU64, Ordering}, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 use tokio::sync::RwLock;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 #[derive(Clone)]
 struct CacheEntry {
@@ -45,38 +49,49 @@ impl CacheManager {
     }
 
     async fn initialize(&self) -> anyhow::Result<()> {
-        info!("Initializing cache index...");
-        self.storage.cleanup_temp_files().await?;
+        let span = info_span!("cache_init");
+        async {
+            info!("Initializing cache index...");
+            self.storage.cleanup_temp_files().await?;
 
-        let files = self.storage.list_all().await?;
-        let mut lru = self.lru.write().await;
-        let mut total = 0u64;
+            let files = self.storage.list_all().await?;
+            let mut lru = self.lru.write().await;
+            let mut total = 0u64;
 
-        for (key, data_size, meta_size, _metadata) in files {
-            let entry = CacheEntry { data_size, meta_size };
-            total += entry.total_size();
-            lru.put(Arc::from(key.as_str()), entry);
+            for (key, data_size, meta_size, _metadata) in files {
+                let entry = CacheEntry {
+                    data_size,
+                    meta_size,
+                };
+                total += entry.total_size();
+                lru.put(Arc::from(key.as_str()), entry);
+            }
+
+            self.total_size.store(total, Ordering::Release);
+            info!(
+                entries = lru.len(),
+                size = %size(total),
+                max_size = %size(self.max_size),
+                "Cache initialized"
+            );
+            Ok(())
         }
-
-        self.total_size.store(total, Ordering::Release);
-        info!(
-            "Cache initialized: {} entries, {} total size", 
-            lru.len(), 
-            crate::utils::format_size(total)
-        );
-        Ok(())
+        .instrument(span)
+        .await
     }
 
     pub async fn contains(&self, key: &str) -> bool {
         if self.lru.read().await.contains(&Arc::from(key)) {
             return true;
         }
-        // Fallback: Check disk if not in LRU
         self.storage.open(key).await.ok().flatten().is_some()
     }
 
     pub async fn mark_used(&self, key: &str, data_size: u64, meta_size: u64) {
-        let entry = CacheEntry { data_size, meta_size };
+        let entry = CacheEntry {
+            data_size,
+            meta_size,
+        };
         let mut lru = self.lru.write().await;
 
         if let Some(old) = lru.put(Arc::from(key), entry.clone()) {
@@ -84,10 +99,12 @@ impl CacheManager {
             if diff > 0 {
                 self.total_size.fetch_add(diff as u64, Ordering::AcqRel);
             } else {
-                self.total_size.fetch_sub(diff.abs() as u64, Ordering::AcqRel);
+                self.total_size
+                    .fetch_sub(diff.unsigned_abs(), Ordering::AcqRel);
             }
         } else {
-            self.total_size.fetch_add(entry.total_size(), Ordering::AcqRel);
+            self.total_size
+                .fetch_add(entry.total_size(), Ordering::AcqRel);
         }
     }
 
@@ -101,9 +118,12 @@ impl CacheManager {
         let total_size = self.total_size.clone();
         let max_size = self.max_size;
 
-        tokio::spawn(async move {
-            Self::cleanup_task(storage, lru, total_size, max_size).await;
-        });
+        tokio::spawn(
+            async move {
+                Self::cleanup_task(storage, lru, total_size, max_size).await;
+            }
+            .instrument(info_span!("cache_cleanup")),
+        );
     }
 
     async fn cleanup_task(
@@ -119,9 +139,9 @@ impl CacheManager {
 
         let target = (max_size as f64 * 0.8) as u64;
         info!(
-            "Cache cleanup: current={}, target={}", 
-            crate::utils::format_size(current),
-            crate::utils::format_size(target)
+            current = %size(current),
+            target = %size(target),
+            "Starting cache cleanup"
         );
 
         let to_remove: Vec<_> = {
@@ -142,25 +162,38 @@ impl CacheManager {
 
         let count = to_remove.len();
         let mut actually_removed = 0u64;
-        
+        let mut errors = 0u32;
+
         for (key, expected_size) in to_remove {
             match storage.delete(&key).await {
                 Ok(removed) => {
                     actually_removed += removed;
                     if removed != expected_size {
-                        debug!("Size mismatch for {}: expected {}, removed {}", 
-                            key, expected_size, removed);
+                        debug!(
+                            key = %fields::path(&key),
+                            expected = %size(expected_size),
+                            actual = %size(removed),
+                            "Size mismatch during cleanup"
+                        );
                     }
                 }
-                Err(e) => warn!("Failed to delete {}: {}", key, e),
+                Err(e) => {
+                    errors += 1;
+                    warn!(
+                        key = %fields::path(&key),
+                        error = %e,
+                        "Failed to delete cache entry"
+                    );
+                }
             }
         }
 
         total_size.fetch_sub(actually_removed, Ordering::AcqRel);
         info!(
-            "Cache cleanup completed: removed {} entries, freed {}", 
-            count,
-            crate::utils::format_size(actually_removed)
+            removed = count,
+            freed = %size(actually_removed),
+            errors = errors,
+            "Cache cleanup completed"
         );
     }
 
@@ -181,11 +214,13 @@ pub struct CacheStats {
 
 impl std::fmt::Display for CacheStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let usage_percent = (self.size as f64 / self.max_size as f64 * 100.0) as u32;
         write!(
             f,
-            "Cache: {}/{} ({} entries)",
-            crate::utils::format_size(self.size),
-            crate::utils::format_size(self.max_size),
+            "Cache: {}/{} ({}%) │ {} entries",
+            size(self.size),
+            size(self.max_size),
+            usage_percent,
             self.entries
         )
     }

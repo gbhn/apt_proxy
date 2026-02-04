@@ -2,25 +2,32 @@ pub mod cache_manager;
 pub mod config;
 pub mod download_manager;
 pub mod error;
+pub mod logging;
 pub mod server;
 pub mod storage;
 pub mod utils;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Request, State},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tower_http::{trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer}, LatencyUnit};
-use tracing::{debug, info, Level};
+use std::time::Instant;
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 use cache_manager::CacheManager;
 use config::Settings;
 use download_manager::DownloadManager;
 use error::{ProxyError, Result};
 use storage::Storage;
+
+/// Global request counter for unique request IDs
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct AppState {
     pub settings: Settings,
@@ -34,7 +41,7 @@ impl AppState {
         let storage = Arc::new(Storage::new(settings.cache_dir.clone()).await?);
 
         let http_client = reqwest::Client::builder()
-            .user_agent("apt-cacher-rs/3.0")
+            .user_agent(format!("apt-cacher-rs/{}", env!("CARGO_PKG_VERSION")))
             .timeout(std::time::Duration::from_secs(300))
             .connect_timeout(std::time::Duration::from_secs(10))
             .pool_max_idle_per_host(16)
@@ -48,7 +55,8 @@ impl AppState {
             storage.clone(),
             settings.max_cache_size,
             settings.max_lru_entries,
-        ).await?;
+        )
+        .await?;
 
         Ok(Self {
             settings,
@@ -72,16 +80,60 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health_check))
         .route("/stats", get(stats_handler))
         .route("/*path", get(proxy_handler))
+        .layer(middleware::from_fn(request_logging_middleware))
+        .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .with_state(state)
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(Level::DEBUG))
-                .on_response(
-                    DefaultOnResponse::new()
-                        .level(Level::DEBUG)
-                        .latency_unit(LatencyUnit::Millis),
-                ),
-        )
+}
+
+/// Middleware for request logging with timing
+async fn request_logging_middleware(request: Request, next: Next) -> Response {
+    let request_id = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let path = uri.path().to_string();
+
+    let start = Instant::now();
+
+    let span = info_span!(
+        "request",
+        id = request_id,
+        method = %method,
+    );
+
+    let response = next.run(request).instrument(span).await;
+
+    let elapsed = start.elapsed();
+    let status = response.status();
+
+    // Log based on status code
+    if status.is_success() {
+        info!(
+            target: "http",
+            status = %status.as_u16(),
+            path = %logging::fields::path(&path),
+            time = %logging::fields::duration(elapsed),
+            "Request completed"
+        );
+    } else if status.is_client_error() {
+        warn!(
+            target: "http",
+            status = %status.as_u16(),
+            path = %logging::fields::path(&path),
+            time = %logging::fields::duration(elapsed),
+            "Client error"
+        );
+    } else {
+        tracing::error!(
+            target: "http",
+            status = %status.as_u16(),
+            path = %logging::fields::path(&path),
+            time = %logging::fields::duration(elapsed),
+            "Server error"
+        );
+    }
+
+    response
 }
 
 async fn health_check() -> &'static str {
@@ -98,7 +150,7 @@ async fn proxy_handler(
     Path(path): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Response> {
-    debug!("Request: {}", path);
+    debug!(path = %logging::fields::path(&path), "Processing request");
     utils::validate_path(&path)?;
 
     let (upstream_url, upstream_path) = state
@@ -106,9 +158,15 @@ async fn proxy_handler(
         .ok_or(ProxyError::RepositoryNotFound)?;
 
     if state.cache.contains(&path).await {
-        info!("Cache HIT: {}", path);
+        info!(
+            path = %logging::fields::path(&path),
+            "Cache HIT"
+        );
 
-        let stored = state.storage.open(&path).await
+        let stored = state
+            .storage
+            .open(&path)
+            .await
             .map_err(|e| ProxyError::Cache(std::io::Error::new(std::io::ErrorKind::Other, e)))?
             .ok_or(ProxyError::RepositoryNotFound)?;
 
@@ -116,12 +174,18 @@ async fn proxy_handler(
 
         let stream = tokio_util::io::ReaderStream::with_capacity(stored.file, 256 * 1024);
         let mut response = Response::new(axum::body::Body::from_stream(stream));
-        response.headers_mut().extend(stored.metadata.headers.clone());
+        response
+            .headers_mut()
+            .extend(stored.metadata.headers.clone());
 
         return Ok(response);
     }
 
-    info!("Cache MISS: {}", path);
+    info!(
+        path = %logging::fields::path(&path),
+        upstream = %upstream_url,
+        "Cache MISS -> fetching"
+    );
 
     let full_url = format!(
         "{}/{}",

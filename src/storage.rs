@@ -1,3 +1,4 @@
+use crate::logging::fields::size;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -5,7 +6,7 @@ use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncWriteExt, BufWriter},
 };
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 const WRITE_BUFFER_SIZE: usize = 512 * 1024;
 
@@ -39,6 +40,10 @@ pub struct Storage {
 impl Storage {
     pub async fn new(base_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&base_dir).await?;
+        debug!(
+            path = %base_dir.display(),
+            "Storage directory initialized"
+        );
         Ok(Self { base_dir })
     }
 
@@ -64,19 +69,19 @@ impl Storage {
 
     pub async fn open(&self, key: &str) -> Result<Option<StoredFile>> {
         let path = self.path_for(key);
-        
+
         let file = match File::open(&path).await {
             Ok(f) => f,
             Err(_) => return Ok(None),
         };
 
-        let size = file.metadata().await?.len();
+        let file_size = file.metadata().await?.len();
         let metadata = self.load_metadata(&path).await?;
-        
+
         Ok(Some(StoredFile {
             file,
             metadata,
-            size,
+            size: file_size,
         }))
     }
 
@@ -94,6 +99,8 @@ impl Storage {
             .truncate(true)
             .open(&temp_path)
             .await?;
+
+        debug!(path = %temp_path.display(), "Created temp file");
 
         Ok(StorageWriter {
             writer: BufWriter::with_capacity(WRITE_BUFFER_SIZE, file),
@@ -118,15 +125,21 @@ impl Storage {
             fs::remove_file(&metadata_path).await.ok();
         }
 
+        debug!(
+            key = %crate::logging::fields::path(key),
+            freed = %size(deleted),
+            "Deleted cache entry"
+        );
+
         Ok(deleted)
     }
 
     async fn save_metadata(&self, cache_path: &Path, metadata: &CacheMetadata) -> Result<u64> {
         let meta_path = self.metadata_path_for(cache_path);
         let json = serde_json::to_vec(metadata)?;
-        let size = json.len() as u64;
+        let meta_size = json.len() as u64;
         fs::write(meta_path, json).await?;
-        Ok(size)
+        Ok(meta_size)
     }
 
     async fn load_metadata(&self, cache_path: &Path) -> Result<CacheMetadata> {
@@ -138,6 +151,7 @@ impl Storage {
     pub async fn cleanup_temp_files(&self) -> Result<()> {
         let mut dirs = vec![self.base_dir.clone()];
         let mut count = 0u32;
+        let mut total_size = 0u64;
 
         while let Some(dir) = dirs.pop() {
             let mut entries = match fs::read_dir(&dir).await {
@@ -151,16 +165,26 @@ impl Storage {
                     dirs.push(path);
                 } else if let Some(ext) = path.extension() {
                     if ext == "tmp" || ext == "part" {
-                        debug!("Removing stale temp file: {:?}", path.file_name());
+                        if let Ok(meta) = fs::metadata(&path).await {
+                            total_size += meta.len();
+                        }
+                        debug!(
+                            file = %path.file_name().unwrap_or_default().to_string_lossy(),
+                            "Removing stale temp file"
+                        );
                         let _ = fs::remove_file(path).await;
                         count += 1;
                     }
                 }
             }
         }
-        
+
         if count > 0 {
-            info!("Cleaned up {} stale temp file(s)", count);
+            info!(
+                files = count,
+                freed = %size(total_size),
+                "Cleaned up stale temp files"
+            );
         }
         Ok(())
     }
@@ -238,12 +262,20 @@ impl StorageWriter {
         self.bytes_written
     }
 
-    pub async fn finalize(mut self, storage: &Storage, metadata: CacheMetadata) -> Result<(u64, u64)> {
+    pub async fn finalize(
+        mut self,
+        storage: &Storage,
+        metadata: CacheMetadata,
+    ) -> Result<(u64, u64)> {
         self.writer.flush().await?;
         drop(self.writer);
 
         fs::rename(&self.temp_path, &self.final_path).await?;
-        debug!("Saved: {:?}", self.final_path.file_name());
+        debug!(
+            path = %self.final_path.file_name().unwrap_or_default().to_string_lossy(),
+            size = %size(self.bytes_written),
+            "Saved to cache"
+        );
 
         let meta_size = storage.save_metadata(&self.final_path, &metadata).await?;
         Ok((self.bytes_written, meta_size))
@@ -252,6 +284,10 @@ impl StorageWriter {
     pub async fn abort(self) -> Result<()> {
         drop(self.writer);
         fs::remove_file(&self.temp_path).await.ok();
+        warn!(
+            path = %self.temp_path.display(),
+            "Aborted write operation"
+        );
         Ok(())
     }
 }

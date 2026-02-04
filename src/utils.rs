@@ -1,38 +1,24 @@
 use std::path::{Path, PathBuf};
-use tracing_subscriber::{fmt, EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
-
-pub fn init_logging() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("apt_cacher_rs=info,tower_http=info,hyper=warn"));
-    
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(
-            fmt::layer()
-                .with_target(false)
-                .with_thread_ids(false)
-                .with_line_number(false)
-                .with_level(true)
-                .compact()
-        )
-        .init();
-    
-    tracing::info!("APT Cacher RS started");
-}
 
 #[inline]
 pub fn validate_path(path: &str) -> Result<(), crate::error::ProxyError> {
     let len = path.len();
     if len == 0 || len > 2048 {
-        return Err(crate::error::ProxyError::InvalidPath("Path length invalid".into()));
+        return Err(crate::error::ProxyError::InvalidPath(
+            "Path length invalid".into(),
+        ));
     }
-    
+
     if memchr::memchr(0, path.as_bytes()).is_some() {
-        return Err(crate::error::ProxyError::InvalidPath("Path contains null byte".into()));
+        return Err(crate::error::ProxyError::InvalidPath(
+            "Path contains null byte".into(),
+        ));
     }
-    
+
     if path.contains("..") {
-        return Err(crate::error::ProxyError::InvalidPath("Path contains '..'".into()));
+        return Err(crate::error::ProxyError::InvalidPath(
+            "Path contains '..'".into(),
+        ));
     }
     Ok(())
 }

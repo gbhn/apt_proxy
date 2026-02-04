@@ -1,3 +1,4 @@
+use crate::logging::fields::{self, size};
 use crate::storage::{CacheMetadata, Storage};
 use axum::{body::Body, response::Response};
 use bytes::Bytes;
@@ -5,7 +6,10 @@ use dashmap::DashMap;
 use futures::{Stream, StreamExt};
 use std::{
     pin::Pin,
-    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -15,12 +19,12 @@ use tokio::{
     sync::{watch, Notify},
     time::timeout,
 };
-use tracing::{error, info, warn, debug};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 const HEADER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const READ_BUFFER_SIZE: usize = 256 * 1024;
-const PROGRESS_LOG_INTERVAL: u64 = 50 * 1024 * 1024; // Log every 50MB
+const PROGRESS_LOG_INTERVAL: u64 = 50 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum DownloadStatus {
@@ -56,7 +60,7 @@ struct DownloadState {
     notify_data: Notify,
     bytes_written: AtomicU64,
     metadata: tokio::sync::OnceCell<Arc<CacheMetadata>>,
-    waiters: AtomicU64, // Track number of concurrent clients
+    waiters: AtomicU64,
 }
 
 impl DownloadState {
@@ -104,7 +108,9 @@ impl DownloadState {
     }
 
     fn set_status_code(&self, code: u16) {
-        let _ = self.status_tx.send(DownloadStatus::Downloading { status_code: code });
+        let _ = self
+            .status_tx
+            .send(DownloadStatus::Downloading { status_code: code });
     }
 
     fn mark_file_ready(&self) {
@@ -151,7 +157,11 @@ impl DownloadManager {
         }
     }
 
-    pub async fn get_or_download(&self, key: &str, upstream_url: String) -> crate::error::Result<Response> {
+    pub async fn get_or_download(
+        &self,
+        key: &str,
+        upstream_url: String,
+    ) -> crate::error::Result<Response> {
         let (state, is_new) = self.get_or_create_download(key);
         state.add_waiter();
 
@@ -201,18 +211,33 @@ impl DownloadManager {
         }
     }
 
-    async fn serve_from_storage(&self, key: &str, state: &Arc<DownloadState>) -> crate::error::Result<Response> {
+    async fn serve_from_storage(
+        &self,
+        key: &str,
+        state: &Arc<DownloadState>,
+    ) -> crate::error::Result<Response> {
         if !state.status().is_success() {
             return Err(crate::error::ProxyError::Download("Download failed".into()));
         }
 
-        let stored = self.storage.open(key).await
-            .map_err(|e| crate::error::ProxyError::Cache(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+        let stored = self
+            .storage
+            .open(key)
+            .await
+            .map_err(|e| {
+                crate::error::ProxyError::Cache(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e,
+                ))
+            })?
             .ok_or_else(|| crate::error::ProxyError::Download("Not found in storage".into()))?;
 
-        let stream = tokio_util::io::ReaderStream::with_capacity(stored.file, READ_BUFFER_SIZE);
+        let stream =
+            tokio_util::io::ReaderStream::with_capacity(stored.file, READ_BUFFER_SIZE);
         let mut response = Response::new(Body::from_stream(stream));
-        response.headers_mut().extend(stored.metadata.headers.clone());
+        response
+            .headers_mut()
+            .extend(stored.metadata.headers.clone());
         Ok(response)
     }
 
@@ -220,11 +245,17 @@ impl DownloadManager {
         let key_arc: Arc<str> = Arc::from(key);
         match self.active.entry(key_arc.clone()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
-                debug!("Joining download: {}", shorten_path(key));
+                debug!(
+                    path = %fields::path(key),
+                    "Joining existing download"
+                );
                 (entry.get().clone(), false)
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
-                info!("Starting download: {}", shorten_path(key));
+                info!(
+                    path = %fields::path(key),
+                    "Starting new download"
+                );
                 let state = Arc::new(DownloadState::new());
                 entry.insert(state.clone());
                 (state, true)
@@ -232,19 +263,46 @@ impl DownloadManager {
         }
     }
 
-    fn spawn_download_task(&self, key: String, upstream_url: String, state: Arc<DownloadState>) {
+    fn spawn_download_task(
+        &self,
+        key: String,
+        upstream_url: String,
+        state: Arc<DownloadState>,
+    ) {
         let client = self.client.clone();
         let storage = self.storage.clone();
         let active = self.active.clone();
         let key_arc = Arc::from(key.as_str());
 
-        tokio::spawn(async move {
-            match download_file(client, upstream_url, &key, storage, state.clone()).await {
-                Ok(size) => info!("Download completed: {} ({})", shorten_path(&key), crate::utils::format_size(size)),
-                Err(e) => error!("Download failed: {} - {}", shorten_path(&key), e),
+        let span = info_span!(
+            "download",
+            path = %fields::path(&key),
+        );
+
+        tokio::spawn(
+            async move {
+                let start = std::time::Instant::now();
+                match download_file(client, upstream_url, &key, storage, state.clone()).await {
+                    Ok(downloaded_size) => {
+                        let elapsed = start.elapsed();
+                        if downloaded_size > 0 {
+                            let speed = downloaded_size as f64 / elapsed.as_secs_f64();
+                            info!(
+                                size = %size(downloaded_size),
+                                time = %fields::duration(elapsed),
+                                speed = %format!("{}/s", size(speed as u64)),
+                                "Download completed"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Download failed");
+                    }
+                }
+                active.remove(&key_arc);
             }
-            active.remove(&key_arc);
-        });
+            .instrument(span),
+        );
     }
 
     pub fn active_count(&self) -> usize {
@@ -259,37 +317,40 @@ async fn download_file(
     storage: Arc<Storage>,
     state: Arc<DownloadState>,
 ) -> anyhow::Result<u64> {
-    debug!("Fetching: {}", url);
+    debug!(url = %url, "Fetching from upstream");
+
     let response = client.get(&url).send().await?;
     let status = response.status().as_u16();
 
     state.set_status_code(status);
 
     if !response.status().is_success() {
-        warn!("Upstream error: {} returned {}", shorten_path(key), status);
+        warn!(
+            status = status,
+            url = %url,
+            "Upstream returned error"
+        );
         state.mark_finished(false);
         return Ok(0);
     }
 
     let content_length = response.content_length().unwrap_or(0);
     let waiters = state.waiter_count();
-    
-    if content_length > 0 {
-        info!("Downloading {} ({}) for {} client(s)", 
-            shorten_path(key), 
-            crate::utils::format_size(content_length),
-            waiters
-        );
-    } else {
-        info!("Downloading {} (unknown size) for {} client(s)", shorten_path(key), waiters);
-    }
+
+    info!(
+        size = %if content_length > 0 { size(content_length) } else { "unknown".to_string() },
+        clients = waiters,
+        "Downloading"
+    );
 
     let response_headers = response.headers().clone();
-    
+
     let mut metadata = CacheMetadata {
         headers: response_headers,
         original_url: url.clone(),
-        stored_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+        stored_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
         content_length,
     };
 
@@ -300,25 +361,28 @@ async fn download_file(
 
     let mut stream = response.bytes_stream();
     let mut last_log_bytes = 0u64;
-    
+
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         writer.write(&chunk).await?;
         let bytes = writer.bytes_written();
         state.notify_progress(bytes);
-        
-        // Log progress only for large files at intervals
-        if content_length > PROGRESS_LOG_INTERVAL && bytes - last_log_bytes >= PROGRESS_LOG_INTERVAL {
-            let progress = if content_length > 0 {
-                format!("{}/{} ({:.0}%)", 
-                    crate::utils::format_size(bytes),
-                    crate::utils::format_size(content_length),
-                    (bytes as f64 / content_length as f64) * 100.0
-                )
+
+        // Progress logging for large files
+        if content_length > PROGRESS_LOG_INTERVAL
+            && bytes - last_log_bytes >= PROGRESS_LOG_INTERVAL
+        {
+            let percent = if content_length > 0 {
+                (bytes as f64 / content_length as f64 * 100.0) as u32
             } else {
-                crate::utils::format_size(bytes)
+                0
             };
-            debug!("Progress {}: {}", shorten_path(key), progress);
+            debug!(
+                downloaded = %size(bytes),
+                total = %size(content_length),
+                percent = percent,
+                "Download progress"
+            );
             last_log_bytes = bytes;
         }
     }
@@ -366,12 +430,14 @@ impl Stream for StreamingReader {
 
                 let status = this.state.status();
                 if status.is_finished() {
-                    // Clean up waiter count when stream ends
                     this.state.remove_waiter();
                     return if status.is_success() {
                         Poll::Ready(None)
                     } else {
-                        Poll::Ready(Some(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Download failed"))))
+                        Poll::Ready(Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "Download failed",
+                        ))))
                     };
                 }
 
@@ -402,16 +468,5 @@ impl Stream for StreamingReader {
 impl Drop for StreamingReader {
     fn drop(&mut self) {
         self.state.remove_waiter();
-    }
-}
-
-/// Shorten long paths for cleaner logs
-fn shorten_path(path: &str) -> &str {
-    const MAX_LEN: usize = 80;
-    if path.len() <= MAX_LEN {
-        path
-    } else {
-        let end_start = path.len() - MAX_LEN + 3;
-        &path[end_start..]
     }
 }

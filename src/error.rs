@@ -1,5 +1,6 @@
 use axum::{http::StatusCode, response::IntoResponse};
 use thiserror::Error;
+use tracing::{warn, error};
 
 pub type Result<T> = std::result::Result<T, ProxyError>;
 
@@ -35,12 +36,8 @@ impl IntoResponse for ProxyError {
         };
         
         match status {
-            StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST => {
-                tracing::warn!("Request failed: {}", self);
-            },
-            _ => {
-                tracing::error!("Request failed: {}", self);
-            }
+            StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST => warn!("Request failed: {}", self),
+            _ => error!("Request failed: {}", self),
         }
         
         (status, self.to_string()).into_response()

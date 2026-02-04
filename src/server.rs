@@ -2,10 +2,7 @@ use axum::{body::Body, extract::Request, Router};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::{net::SocketAddr, path::Path};
-use tokio::{
-    fs,
-    net::{TcpListener, UnixListener},
-};
+use tokio::{fs, net::{TcpListener, UnixListener}};
 use tower::Service;
 use tracing::{error, info};
 
@@ -17,7 +14,6 @@ pub async fn serve_tcp(app: Router, port: u16) -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    
     Ok(())
 }
 
@@ -29,7 +25,6 @@ pub async fn serve_unix(app: Router, socket_path: &Path) -> anyhow::Result<()> {
     }
 
     let listener = UnixListener::bind(socket_path)?;
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -46,9 +41,7 @@ pub async fn serve_unix(app: Router, socket_path: &Path) -> anyhow::Result<()> {
                 let mut app = app.clone();
                 async move {
                     let (parts, incoming) = req.into_parts();
-                    let body = Body::new(incoming);
-                    let req = Request::from_parts(parts, body);
-                    app.call(req).await
+                    app.call(Request::from_parts(parts, Body::new(incoming))).await
                 }
             });
 
@@ -64,9 +57,7 @@ pub async fn serve_unix(app: Router, socket_path: &Path) -> anyhow::Result<()> {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
     };
 
     #[cfg(unix)]
@@ -76,12 +67,8 @@ async fn shutdown_signal() {
             .recv()
             .await;
     };
-
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
+    tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
 }

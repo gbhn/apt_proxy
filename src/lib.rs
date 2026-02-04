@@ -1,50 +1,61 @@
+pub mod cache_manager;
+pub mod config;
+pub mod download_manager;
+pub mod error;
+pub mod server;
+pub mod storage;
+pub mod utils;
+
 use axum::{
     extract::{Path, State},
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
-use dashmap::DashMap;
 use std::sync::Arc;
+use tower_http::{trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer}, LatencyUnit};
+use tracing::{debug, info, Level};
 
-pub mod cache;
-pub mod config;
-pub mod download;
-pub mod error;
-pub mod server;
-pub mod utils;
-
-use cache::CacheManager;
+use cache_manager::CacheManager;
 use config::Settings;
-use download::ActiveDownloads;
+use download_manager::DownloadManager;
 use error::{ProxyError, Result};
+use storage::Storage;
 
 pub struct AppState {
     pub settings: Settings,
-    pub cache: CacheManager,
-    pub http_client: reqwest::Client,
-    pub active_downloads: ActiveDownloads,
+    cache: CacheManager,
+    downloader: DownloadManager,
+    storage: Arc<Storage>,
 }
 
 impl AppState {
-    pub fn new(settings: Settings, cache: CacheManager) -> Self {
+    pub async fn new(settings: Settings) -> anyhow::Result<Self> {
+        let storage = Arc::new(Storage::new(settings.cache_dir.clone()).await?);
+
         let http_client = reqwest::Client::builder()
-            .user_agent("apt-cacher-rs/2.1")
+            .user_agent("apt-cacher-rs/3.0")
             .timeout(std::time::Duration::from_secs(300))
             .connect_timeout(std::time::Duration::from_secs(10))
-            .pool_max_idle_per_host(32)
+            .pool_max_idle_per_host(16)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .tcp_keepalive(std::time::Duration::from_secs(60))
-            .tcp_nodelay(true)
-            .build()
-            .expect("Failed to build HTTP client");
+            .tcp_nodelay(false)
+            .build()?;
 
-        Self {
+        let downloader = DownloadManager::new(http_client, storage.clone());
+        let cache = CacheManager::new(
+            storage.clone(),
+            settings.max_cache_size,
+            settings.max_lru_entries,
+        ).await?;
+
+        Ok(Self {
             settings,
             cache,
-            http_client,
-            active_downloads: Arc::new(DashMap::with_capacity(128)),
-        }
+            downloader,
+            storage,
+        })
     }
 
     #[inline]
@@ -56,9 +67,6 @@ impl AppState {
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    use tower_http::trace::{TraceLayer, DefaultMakeSpan, DefaultOnResponse};
-    use tower_http::LatencyUnit;
-    
     Router::new()
         .route("/", get(health_check))
         .route("/health", get(health_check))
@@ -67,8 +75,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
         .layer(
             TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
-                .on_response(DefaultOnResponse::new().level(tracing::Level::INFO).latency_unit(LatencyUnit::Millis))
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(
+                    DefaultOnResponse::new()
+                        .level(Level::INFO)
+                        .latency_unit(LatencyUnit::Millis),
+                ),
         )
 }
 
@@ -77,35 +89,53 @@ async fn health_check() -> &'static str {
 }
 
 async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    state.cache.get_stats().await
+    let stats = state.cache.stats().await;
+    let active = state.downloader.active_count();
+    format!("{}\nActive Downloads: {}", stats, active)
 }
 
 async fn proxy_handler(
     Path(path): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Response> {
-    tracing::debug!("Request received for path: {}", path);
-    
+    debug!("Request received for path: {}", path);
     utils::validate_path(&path)?;
 
     let (upstream_url, upstream_path) = state
         .resolve_upstream(&path)
         .ok_or(ProxyError::RepositoryNotFound)?;
 
-    tracing::debug!("Resolved upstream: {} -> {}/{}", path, upstream_url, upstream_path);
+    debug!("Resolved upstream: {} -> {}/{}", path, upstream_url, upstream_path);
 
-    if let Some(response) = state.cache.serve_cached(&path).await? {
+    if state.cache.contains(&path).await {
+        info!("Cache HIT: {}", path);
+
+        let stored = state.storage.open(&path).await
+            .map_err(|e| ProxyError::Cache(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .ok_or(ProxyError::RepositoryNotFound)?;
+
+        state.cache.mark_used(&path, stored.size, 0).await;
+
+        let stream = tokio_util::io::ReaderStream::with_capacity(stored.file, 256 * 1024);
+        let mut response = Response::new(axum::body::Body::from_stream(stream));
+        response.headers_mut().extend(stored.metadata.headers.clone());
+
         return Ok(response);
     }
 
-    tracing::info!("Cache MISS: {} - downloading from upstream", path);
+    info!("Cache MISS: {} - downloading", path);
 
-    let downloader = download::Downloader::new(
-        state.http_client.clone(),
-        upstream_url.to_string(),
-        upstream_path.to_string(),
-        state.active_downloads.clone(),
+    let full_url = format!(
+        "{}/{}",
+        upstream_url.trim_end_matches('/'),
+        upstream_path.trim_start_matches('/')
     );
 
-    downloader.fetch_and_stream(&path, &state.cache).await
+    let response = state.downloader.get_or_download(&path, full_url).await?;
+
+    if state.cache.needs_cleanup() {
+        state.cache.spawn_cleanup();
+    }
+
+    Ok(response)
 }

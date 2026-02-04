@@ -1,12 +1,9 @@
 use std::path::{Path, PathBuf};
+use tracing_subscriber::{fmt, EnvFilter};
 
 pub fn init_logging() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            EnvFilter::new("apt_cacher_rs=debug,tower_http=debug,hyper=info")
-        });
+        .unwrap_or_else(|_| EnvFilter::new("apt_cacher_rs=debug,tower_http=debug,hyper=info"));
     
     fmt()
         .with_env_filter(filter)
@@ -23,25 +20,17 @@ pub fn init_logging() {
 #[inline]
 pub fn validate_path(path: &str) -> Result<(), crate::error::ProxyError> {
     let len = path.len();
-    
     if len == 0 || len > 2048 {
-        return Err(crate::error::ProxyError::InvalidPath(
-            "Path length invalid".into(),
-        ));
+        return Err(crate::error::ProxyError::InvalidPath("Path length invalid".into()));
     }
     
     if memchr::memchr(0, path.as_bytes()).is_some() {
-        return Err(crate::error::ProxyError::InvalidPath(
-            "Path contains null byte".into(),
-        ));
+        return Err(crate::error::ProxyError::InvalidPath("Path contains null byte".into()));
     }
     
     if path.contains("..") {
-        return Err(crate::error::ProxyError::InvalidPath(
-            "Path contains '..'".into(),
-        ));
+        return Err(crate::error::ProxyError::InvalidPath("Path contains '..'".into()));
     }
-    
     Ok(())
 }
 
@@ -62,12 +51,10 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Генерация пути кэша - простая версия (быстрее чем with_capacity)
 #[inline]
 pub fn cache_path_for(base_dir: &Path, uri_path: &str) -> PathBuf {
     let hash = blake3::hash(uri_path.as_bytes());
     let hex = hash.to_hex();
-    // join() оптимизирован внутри std, не нужен with_capacity
     base_dir
         .join(&hex.as_str()[0..2])
         .join(&hex.as_str()[2..4])

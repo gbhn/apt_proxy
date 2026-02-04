@@ -1,7 +1,7 @@
 use clap::Parser;
 use serde::Deserialize;
 use std::{collections::HashMap, path::PathBuf};
-use tracing::info;
+use tracing::{info, warn, debug};
 
 const DEFAULT_PORT: u16 = 3142;
 const DEFAULT_CACHE_DIR: &str = "./apt_cache";
@@ -39,33 +39,25 @@ pub struct ConfigFile {
 }
 
 impl ConfigFile {
-    /// Парсинг размера без лишних аллокаций
     pub fn parse_size(s: &str) -> Option<u64> {
         let s = s.trim();
         if s.is_empty() {
             return None;
         }
 
-        // Сначала пробуем как чистое число
         if let Ok(n) = s.parse::<u64>() {
             return Some(n);
         }
 
         let bytes = s.as_bytes();
-        let len = bytes.len();
-
-        // Находим позицию где заканчиваются цифры
-        let num_end = bytes
-            .iter()
+        let num_end = bytes.iter()
             .position(|&b| !b.is_ascii_digit() && b != b' ')
-            .unwrap_or(len);
+            .unwrap_or(bytes.len());
 
-        let num_str = s[..num_end].trim();
-        let suffix = s[num_end..].trim();
+        let num: u64 = s[..num_end].trim().parse().ok()?;
+        let suffix = s[num_end..].trim().to_ascii_uppercase();
 
-        let num: u64 = num_str.parse().ok()?;
-
-        let multiplier = match suffix.to_ascii_uppercase().as_str() {
+        let multiplier = match suffix.as_str() {
             "GB" | "G" => 1_073_741_824,
             "MB" | "M" => 1_048_576,
             "KB" | "K" => 1024,
@@ -104,16 +96,13 @@ impl Settings {
             port: args.port.or(config.port).unwrap_or(DEFAULT_PORT),
             socket: args.socket.or(config.socket),
             repositories: config.repositories.unwrap_or_default(),
-            cache_dir: args
-                .cache_dir
+            cache_dir: args.cache_dir
                 .or(config.cache_dir)
                 .unwrap_or_else(|| DEFAULT_CACHE_DIR.into()),
-            max_cache_size: args
-                .max_cache_size
+            max_cache_size: args.max_cache_size
                 .or(config_max_cache_size)
                 .unwrap_or(DEFAULT_MAX_CACHE_SIZE),
-            max_lru_entries: args
-                .max_lru_entries
+            max_lru_entries: args.max_lru_entries
                 .or(config.max_lru_entries)
                 .unwrap_or(DEFAULT_MAX_LRU_ENTRIES),
         })
@@ -126,7 +115,6 @@ impl Settings {
         }
 
         const CONFIG_PATHS: &[&str] = &["/etc/apt-cacher/config.yaml", "./config.yaml"];
-
         for path in CONFIG_PATHS {
             if let Ok(content) = tokio::fs::read_to_string(path).await {
                 if let Ok(config) = serde_yaml::from_str(&content) {
@@ -145,11 +133,11 @@ impl Settings {
         info!("  Max cache size: {}", crate::utils::format_size(self.max_cache_size));
 
         if self.repositories.is_empty() {
-            tracing::warn!("No repositories configured - all requests will return 404");
+            warn!("No repositories configured - all requests will return 404");
         } else {
             info!("  Repositories: {}", self.repositories.len());
             for (key, url) in &self.repositories {
-                tracing::debug!("    /{} -> {}", key, url);
+                debug!("    /{} -> {}", key, url);
             }
         }
     }

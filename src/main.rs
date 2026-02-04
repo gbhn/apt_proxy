@@ -1,9 +1,6 @@
 use clap::Parser;
 use std::sync::Arc;
-
-use apt_cacher_rs::{
-    build_router, cache::CacheManager, config::{Args, Settings}, server, utils, AppState
-};
+use apt_cacher_rs::{build_router, config::{Args, Settings}, server, utils, AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -11,17 +8,14 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let settings = Settings::load(args).await?;
-    
+
     settings.display_info();
 
-    let cache = CacheManager::new(settings.clone()).await?;
-    let state = Arc::new(AppState::new(settings, cache));
-
+    let state = Arc::new(AppState::new(settings.clone()).await?);
     let app = build_router(state.clone());
-    
-    if let Some(ref socket_path) = state.settings.socket {
-        server::serve_unix(app, socket_path).await
-    } else {
-        server::serve_tcp(app, state.settings.port).await
+
+    match state.settings.socket {
+        Some(ref socket_path) => server::serve_unix(app, socket_path).await,
+        None => server::serve_tcp(app, state.settings.port).await,
     }
 }

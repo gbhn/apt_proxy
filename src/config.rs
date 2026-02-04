@@ -1,6 +1,7 @@
 use crate::logging::fields::size;
 use clap::Parser;
 use serde::Deserialize;
+use serde_yml as serde_yaml;
 use std::{collections::HashMap, path::PathBuf};
 use tracing::{info, warn};
 
@@ -13,27 +14,27 @@ const DEFAULT_MAX_LRU_ENTRIES: usize = 100_000;
 #[command(author, version, about = "High-performance APT caching proxy")]
 pub struct Args {
     /// Path to configuration file
-    #[arg(long, short)]
+    #[arg(long, short, env = "APT_CACHER_CONFIG")]
     pub config: Option<PathBuf>,
 
     /// TCP port to listen on
-    #[arg(long)]
+    #[arg(long, env = "APT_CACHER_PORT")]
     pub port: Option<u16>,
 
     /// Unix socket path (overrides TCP port)
-    #[arg(long)]
+    #[arg(long, env = "APT_CACHER_SOCKET")]
     pub socket: Option<PathBuf>,
 
     /// Cache directory path
-    #[arg(long)]
+    #[arg(long, env = "APT_CACHER_CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
 
     /// Maximum cache size in bytes
-    #[arg(long)]
+    #[arg(long, env = "APT_CACHER_MAX_CACHE_SIZE")]
     pub max_cache_size: Option<u64>,
 
     /// Maximum LRU cache entries
-    #[arg(long)]
+    #[arg(long, env = "APT_CACHER_MAX_LRU_ENTRIES")]
     pub max_lru_entries: Option<usize>,
 }
 
@@ -71,9 +72,9 @@ impl ConfigFile {
         let suffix = s[num_end..].trim().to_ascii_uppercase();
 
         let multiplier = match suffix.as_str() {
-            "GB" | "G" => 1_073_741_824,
-            "MB" | "M" => 1_048_576,
-            "KB" | "K" => 1024,
+            "GB" | "G" | "GIB" => 1_073_741_824,
+            "MB" | "M" | "MIB" => 1_048_576,
+            "KB" | "K" | "KIB" => 1024,
             "B" | "" => 1,
             _ => return None,
         };
@@ -128,13 +129,13 @@ impl Settings {
         if let Some(path) = path {
             let content = tokio::fs::read_to_string(path).await?;
             info!(path = %path.display(), "Loaded configuration file");
-            return Ok(serde_yml::from_str(&content)?);
+            return Ok(serde_yaml::from_str(&content)?);
         }
 
         const CONFIG_PATHS: &[&str] = &["/etc/apt-cacher/config.yaml", "./config.yaml"];
         for path in CONFIG_PATHS {
             if let Ok(content) = tokio::fs::read_to_string(path).await {
-                if let Ok(config) = serde_yml::from_str(&content) {
+                if let Ok(config) = serde_yaml::from_str(&content) {
                     info!(path = %path, "Loaded configuration file");
                     return Ok(config);
                 }

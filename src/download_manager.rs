@@ -171,7 +171,7 @@ impl DownloadManager {
 
         let status_code = timeout(HEADER_WAIT_TIMEOUT, state.wait_for_status())
             .await
-            .map_err(|_| crate::error::ProxyError::Download("Header timeout".into()))?;
+            .map_err(|_| crate::error::ProxyError::Timeout("Header timeout".into()))?;
 
         if status_code != 200 {
             state.remove_waiter();
@@ -183,7 +183,7 @@ impl DownloadManager {
 
         let file_ready = timeout(FILE_READY_TIMEOUT, state.wait_for_file())
             .await
-            .map_err(|_| crate::error::ProxyError::Download("File ready timeout".into()))?;
+            .map_err(|_| crate::error::ProxyError::Timeout("File ready timeout".into()))?;
 
         if !file_ready {
             state.remove_waiter();
@@ -310,6 +310,14 @@ impl DownloadManager {
     }
 }
 
+/// Helper function to extract header value as String
+fn header_to_string(headers: &reqwest::header::HeaderMap, name: reqwest::header::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+}
+
 async fn download_file(
     client: reqwest::Client,
     url: String,
@@ -344,6 +352,10 @@ async fn download_file(
     );
 
     let response_headers = response.headers().clone();
+    
+    // Extract ETag and Last-Modified headers
+    let etag = header_to_string(&response_headers, reqwest::header::ETAG);
+    let last_modified = header_to_string(&response_headers, reqwest::header::LAST_MODIFIED);
 
     let mut metadata = CacheMetadata {
         headers: response_headers,
@@ -352,6 +364,8 @@ async fn download_file(
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs(),
         content_length,
+        etag,
+        last_modified,
     };
 
     state.metadata.set(Arc::new(metadata.clone())).ok();

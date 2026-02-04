@@ -9,6 +9,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 const WRITE_BUFFER_SIZE: usize = 512 * 1024;
+const MAX_CONCURRENT_WRITES: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMetadata {
@@ -17,24 +18,38 @@ pub struct CacheMetadata {
     pub original_url: String,
     pub stored_at: u64,
     pub content_length: u64,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
 }
 
 impl CacheMetadata {
     pub fn new(response: &reqwest::Response, url: &str, size: u64) -> Self {
+        let headers = response.headers();
         Self {
-            headers: response.headers().clone(),
+            headers: headers.clone(),
             original_url: url.to_string(),
             stored_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
             content_length: size,
+            etag: headers
+                .get(http::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from),
+            last_modified: headers
+                .get(http::header::LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from),
         }
     }
 }
 
 pub struct Storage {
     base_dir: PathBuf,
+    write_semaphore: tokio::sync::Semaphore,
 }
 
 impl Storage {
@@ -44,17 +59,21 @@ impl Storage {
             path = %base_dir.display(),
             "Storage directory initialized"
         );
-        Ok(Self { base_dir })
+        Ok(Self {
+            base_dir,
+            write_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_WRITES),
+        })
     }
 
     #[inline]
     pub fn path_for(&self, key: &str) -> PathBuf {
         let hash = blake3::hash(key.as_bytes());
         let hex = hash.to_hex();
+        let hex_str = hex.as_str();
         self.base_dir
-            .join(&hex.as_str()[0..2])
-            .join(&hex.as_str()[2..4])
-            .join(hex.as_str())
+            .join(&hex_str[0..2])
+            .join(&hex_str[2..4])
+            .join(hex_str)
     }
 
     #[inline]
@@ -67,12 +86,18 @@ impl Storage {
         cache_path.with_extension("meta")
     }
 
+    pub async fn exists(&self, key: &str) -> bool {
+        let path = self.path_for(key);
+        fs::try_exists(&path).await.unwrap_or(false)
+    }
+
     pub async fn open(&self, key: &str) -> Result<Option<StoredFile>> {
         let path = self.path_for(key);
 
         let file = match File::open(&path).await {
             Ok(f) => f,
-            Err(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
         };
 
         let file_size = file.metadata().await?.len();
@@ -86,6 +111,8 @@ impl Storage {
     }
 
     pub async fn create(&self, key: &str) -> Result<StorageWriter> {
+        let _permit = self.write_semaphore.acquire().await?;
+        
         let final_path = self.path_for(key);
         let temp_path = self.temp_path_for(key);
 
@@ -235,6 +262,20 @@ impl Storage {
         }
         Ok(files)
     }
+    
+    /// Get storage statistics
+    pub async fn stats(&self) -> StorageStats {
+        let available_permits = self.write_semaphore.available_permits();
+        StorageStats {
+            active_writes: MAX_CONCURRENT_WRITES - available_permits,
+            max_concurrent_writes: MAX_CONCURRENT_WRITES,
+        }
+    }
+}
+
+pub struct StorageStats {
+    pub active_writes: usize,
+    pub max_concurrent_writes: usize,
 }
 
 pub struct StoredFile {
@@ -258,7 +299,7 @@ impl StorageWriter {
     }
 
     #[inline]
-    pub fn bytes_written(&self) -> u64 {
+    pub const fn bytes_written(&self) -> u64 {
         self.bytes_written
     }
 

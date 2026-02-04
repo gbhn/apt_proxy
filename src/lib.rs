@@ -79,7 +79,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/", get(health_check))
         .route("/health", get(health_check))
         .route("/stats", get(stats_handler))
-        .route("/*path", get(proxy_handler))
+        .route("/{*path}", get(proxy_handler))
         .layer(middleware::from_fn(request_logging_middleware))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))

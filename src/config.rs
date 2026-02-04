@@ -128,13 +128,13 @@ impl Settings {
         if let Some(path) = path {
             let content = tokio::fs::read_to_string(path).await?;
             info!(path = %path.display(), "Loaded configuration file");
-            return Ok(serde_yaml::from_str(&content)?);
+            return Ok(serde_yml::from_str(&content)?);
         }
 
         const CONFIG_PATHS: &[&str] = &["/etc/apt-cacher/config.yaml", "./config.yaml"];
         for path in CONFIG_PATHS {
             if let Ok(content) = tokio::fs::read_to_string(path).await {
-                if let Ok(config) = serde_yaml::from_str(&content) {
+                if let Ok(config) = serde_yml::from_str(&content) {
                     info!(path = %path, "Loaded configuration file");
                     return Ok(config);
                 }

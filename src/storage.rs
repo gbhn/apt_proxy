@@ -5,7 +5,7 @@ use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncWriteExt, BufWriter},
 };
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 const WRITE_BUFFER_SIZE: usize = 512 * 1024;
 
@@ -70,7 +70,6 @@ impl Storage {
             Err(_) => return Ok(None),
         };
 
-        // FIX: Read metadata size before moving `file` into StoredFile
         let size = file.metadata().await?.len();
         let metadata = self.load_metadata(&path).await?;
         
@@ -138,6 +137,7 @@ impl Storage {
 
     pub async fn cleanup_temp_files(&self) -> Result<()> {
         let mut dirs = vec![self.base_dir.clone()];
+        let mut count = 0u32;
 
         while let Some(dir) = dirs.pop() {
             let mut entries = match fs::read_dir(&dir).await {
@@ -151,11 +151,16 @@ impl Storage {
                     dirs.push(path);
                 } else if let Some(ext) = path.extension() {
                     if ext == "tmp" || ext == "part" {
-                        warn!("Removing stale temp file: {:?}", path);
+                        debug!("Removing stale temp file: {:?}", path.file_name());
                         let _ = fs::remove_file(path).await;
+                        count += 1;
                     }
                 }
             }
+        }
+        
+        if count > 0 {
+            info!("Cleaned up {} stale temp file(s)", count);
         }
         Ok(())
     }
@@ -238,7 +243,7 @@ impl StorageWriter {
         drop(self.writer);
 
         fs::rename(&self.temp_path, &self.final_path).await?;
-        info!("Atomically saved file: {:?}", self.final_path);
+        debug!("Saved: {:?}", self.final_path.file_name());
 
         let meta_size = storage.save_metadata(&self.final_path, &metadata).await?;
         Ok((self.bytes_written, meta_size))

@@ -15,11 +15,12 @@ use tokio::{
     sync::{watch, Notify},
     time::timeout,
 };
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, debug};
 
 const HEADER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const READ_BUFFER_SIZE: usize = 256 * 1024;
+const PROGRESS_LOG_INTERVAL: u64 = 50 * 1024 * 1024; // Log every 50MB
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum DownloadStatus {
@@ -55,6 +56,7 @@ struct DownloadState {
     notify_data: Notify,
     bytes_written: AtomicU64,
     metadata: tokio::sync::OnceCell<Arc<CacheMetadata>>,
+    waiters: AtomicU64, // Track number of concurrent clients
 }
 
 impl DownloadState {
@@ -68,6 +70,7 @@ impl DownloadState {
             notify_data: Notify::new(),
             bytes_written: AtomicU64::new(0),
             metadata: tokio::sync::OnceCell::new(),
+            waiters: AtomicU64::new(0),
         }
     }
 
@@ -119,6 +122,18 @@ impl DownloadState {
         self.bytes_written.store(bytes, Ordering::Release);
         self.notify_data.notify_waiters();
     }
+
+    fn add_waiter(&self) {
+        self.waiters.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn remove_waiter(&self) {
+        self.waiters.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn waiter_count(&self) -> u64 {
+        self.waiters.load(Ordering::Relaxed)
+    }
 }
 
 pub struct DownloadManager {
@@ -138,6 +153,7 @@ impl DownloadManager {
 
     pub async fn get_or_download(&self, key: &str, upstream_url: String) -> crate::error::Result<Response> {
         let (state, is_new) = self.get_or_create_download(key);
+        state.add_waiter();
 
         if is_new {
             self.spawn_download_task(key.to_string(), upstream_url, state.clone());
@@ -148,6 +164,7 @@ impl DownloadManager {
             .map_err(|_| crate::error::ProxyError::Download("Header timeout".into()))?;
 
         if status_code != 200 {
+            state.remove_waiter();
             return Err(crate::error::ProxyError::UpstreamError(
                 axum::http::StatusCode::from_u16(status_code)
                     .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
@@ -159,6 +176,7 @@ impl DownloadManager {
             .map_err(|_| crate::error::ProxyError::Download("File ready timeout".into()))?;
 
         if !file_ready {
+            state.remove_waiter();
             if state.status().is_success() {
                 return self.serve_from_storage(key, &state).await;
             } else {
@@ -176,7 +194,10 @@ impl DownloadManager {
                 }
                 Ok(response)
             }
-            Err(_) => self.serve_from_storage(key, &state).await,
+            Err(_) => {
+                state.remove_waiter();
+                self.serve_from_storage(key, &state).await
+            }
         }
     }
 
@@ -184,7 +205,6 @@ impl DownloadManager {
         if !state.status().is_success() {
             return Err(crate::error::ProxyError::Download("Download failed".into()));
         }
-        info!("Download completed, serving from storage: {}", key);
 
         let stored = self.storage.open(key).await
             .map_err(|e| crate::error::ProxyError::Cache(std::io::Error::new(std::io::ErrorKind::Other, e)))?
@@ -200,11 +220,11 @@ impl DownloadManager {
         let key_arc: Arc<str> = Arc::from(key);
         match self.active.entry(key_arc.clone()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
-                info!("Joining existing download: {}", key);
+                debug!("Joining download: {}", shorten_path(key));
                 (entry.get().clone(), false)
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
-                info!("Starting new download: {}", key);
+                info!("Starting download: {}", shorten_path(key));
                 let state = Arc::new(DownloadState::new());
                 entry.insert(state.clone());
                 (state, true)
@@ -220,8 +240,8 @@ impl DownloadManager {
 
         tokio::spawn(async move {
             match download_file(client, upstream_url, &key, storage, state.clone()).await {
-                Ok(_) => info!("Download completed: {}", key),
-                Err(e) => error!("Download failed: {} - {}", key, e),
+                Ok(size) => info!("Download completed: {} ({})", shorten_path(&key), crate::utils::format_size(size)),
+                Err(e) => error!("Download failed: {} - {}", shorten_path(&key), e),
             }
             active.remove(&key_arc);
         });
@@ -238,23 +258,30 @@ async fn download_file(
     key: &str,
     storage: Arc<Storage>,
     state: Arc<DownloadState>,
-) -> anyhow::Result<()> {
-    info!("Downloading from: {}", url);
+) -> anyhow::Result<u64> {
+    debug!("Fetching: {}", url);
     let response = client.get(&url).send().await?;
     let status = response.status().as_u16();
 
-    info!("Upstream response status: {}", status);
     state.set_status_code(status);
 
     if !response.status().is_success() {
-        warn!("Upstream returned non-success status: {}", status);
+        warn!("Upstream error: {} returned {}", shorten_path(key), status);
         state.mark_finished(false);
-        return Ok(());
+        return Ok(0);
     }
 
     let content_length = response.content_length().unwrap_or(0);
+    let waiters = state.waiter_count();
+    
     if content_length > 0 {
-        info!("Content length: {} bytes ({})", content_length, crate::utils::format_size(content_length));
+        info!("Downloading {} ({}) for {} client(s)", 
+            shorten_path(key), 
+            crate::utils::format_size(content_length),
+            waiters
+        );
+    } else {
+        info!("Downloading {} (unknown size) for {} client(s)", shorten_path(key), waiters);
     }
 
     let response_headers = response.headers().clone();
@@ -272,28 +299,36 @@ async fn download_file(
     state.mark_file_ready();
 
     let mut stream = response.bytes_stream();
+    let mut last_log_bytes = 0u64;
+    
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         writer.write(&chunk).await?;
-        state.notify_progress(writer.bytes_written());
+        let bytes = writer.bytes_written();
+        state.notify_progress(bytes);
         
-        if writer.bytes_written() % (5 * 1024 * 1024) < chunk.len() as u64 {
-             info!("Downloaded {} / {}",
-                crate::utils::format_size(writer.bytes_written()),
-                if content_length > 0 { crate::utils::format_size(content_length) } else { "?".to_string() }
-            );
+        // Log progress only for large files at intervals
+        if content_length > PROGRESS_LOG_INTERVAL && bytes - last_log_bytes >= PROGRESS_LOG_INTERVAL {
+            let progress = if content_length > 0 {
+                format!("{}/{} ({:.0}%)", 
+                    crate::utils::format_size(bytes),
+                    crate::utils::format_size(content_length),
+                    (bytes as f64 / content_length as f64) * 100.0
+                )
+            } else {
+                crate::utils::format_size(bytes)
+            };
+            debug!("Progress {}: {}", shorten_path(key), progress);
+            last_log_bytes = bytes;
         }
     }
 
     let total = writer.bytes_written();
-    info!("Download complete: {}", crate::utils::format_size(total));
-
     metadata.content_length = total;
 
     writer.finalize(&storage, metadata).await?;
     state.mark_finished(true);
-    info!("File saved successfully to storage");
-    Ok(())
+    Ok(total)
 }
 
 struct StreamingReader {
@@ -331,6 +366,8 @@ impl Stream for StreamingReader {
 
                 let status = this.state.status();
                 if status.is_finished() {
+                    // Clean up waiter count when stream ends
+                    this.state.remove_waiter();
                     return if status.is_success() {
                         Poll::Ready(None)
                     } else {
@@ -353,8 +390,28 @@ impl Stream for StreamingReader {
 
                 Poll::Pending
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Err(e)) => {
+                this.state.remove_waiter();
+                Poll::Ready(Some(Err(e)))
+            }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl Drop for StreamingReader {
+    fn drop(&mut self) {
+        self.state.remove_waiter();
+    }
+}
+
+/// Shorten long paths for cleaner logs
+fn shorten_path(path: &str) -> &str {
+    const MAX_LEN: usize = 80;
+    if path.len() <= MAX_LEN {
+        path
+    } else {
+        let end_start = path.len() - MAX_LEN + 3;
+        &path[end_start..]
     }
 }

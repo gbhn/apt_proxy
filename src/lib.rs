@@ -75,10 +75,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
         .layer(
             TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .make_span_with(DefaultMakeSpan::new().level(Level::DEBUG))
                 .on_response(
                     DefaultOnResponse::new()
-                        .level(Level::INFO)
+                        .level(Level::DEBUG)
                         .latency_unit(LatencyUnit::Millis),
                 ),
         )
@@ -98,14 +98,12 @@ async fn proxy_handler(
     Path(path): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Response> {
-    debug!("Request received for path: {}", path);
+    debug!("Request: {}", path);
     utils::validate_path(&path)?;
 
     let (upstream_url, upstream_path) = state
         .resolve_upstream(&path)
         .ok_or(ProxyError::RepositoryNotFound)?;
-
-    debug!("Resolved upstream: {} -> {}/{}", path, upstream_url, upstream_path);
 
     if state.cache.contains(&path).await {
         info!("Cache HIT: {}", path);
@@ -123,7 +121,7 @@ async fn proxy_handler(
         return Ok(response);
     }
 
-    info!("Cache MISS: {} - downloading", path);
+    info!("Cache MISS: {}", path);
 
     let full_url = format!(
         "{}/{}",

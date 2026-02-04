@@ -4,7 +4,7 @@ use std::{
     sync::{atomic::{AtomicU64, Ordering}, Arc},
 };
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 #[derive(Clone)]
 struct CacheEntry {
@@ -45,7 +45,7 @@ impl CacheManager {
     }
 
     async fn initialize(&self) -> anyhow::Result<()> {
-        info!("Initializing cache...");
+        info!("Initializing cache index...");
         self.storage.cleanup_temp_files().await?;
 
         let files = self.storage.list_all().await?;
@@ -59,7 +59,11 @@ impl CacheManager {
         }
 
         self.total_size.store(total, Ordering::Release);
-        info!("Cache initialized: {} files, {}", lru.len(), crate::utils::format_size(total));
+        info!(
+            "Cache initialized: {} entries, {} total size", 
+            lru.len(), 
+            crate::utils::format_size(total)
+        );
         Ok(())
     }
 
@@ -67,7 +71,7 @@ impl CacheManager {
         if self.lru.read().await.contains(&Arc::from(key)) {
             return true;
         }
-        // Fallback: Check disk if not in LRU (e.g., just restarted)
+        // Fallback: Check disk if not in LRU
         self.storage.open(key).await.ok().flatten().is_some()
     }
 
@@ -113,8 +117,12 @@ impl CacheManager {
             return;
         }
 
-        info!("Cache cleanup started: {} / {}", crate::utils::format_size(current), crate::utils::format_size(max_size));
         let target = (max_size as f64 * 0.8) as u64;
+        info!(
+            "Cache cleanup: current={}, target={}", 
+            crate::utils::format_size(current),
+            crate::utils::format_size(target)
+        );
 
         let to_remove: Vec<_> = {
             let mut lru = lru.write().await;
@@ -132,13 +140,16 @@ impl CacheManager {
             list
         };
 
+        let count = to_remove.len();
         let mut actually_removed = 0u64;
+        
         for (key, expected_size) in to_remove {
             match storage.delete(&key).await {
                 Ok(removed) => {
                     actually_removed += removed;
                     if removed != expected_size {
-                        info!("Size mismatch for {}: expected {}, removed {}", key, expected_size, removed);
+                        debug!("Size mismatch for {}: expected {}, removed {}", 
+                            key, expected_size, removed);
                     }
                 }
                 Err(e) => warn!("Failed to delete {}: {}", key, e),
@@ -146,7 +157,11 @@ impl CacheManager {
         }
 
         total_size.fetch_sub(actually_removed, Ordering::AcqRel);
-        info!("Cleanup finished: removed {}", crate::utils::format_size(actually_removed));
+        info!(
+            "Cache cleanup completed: removed {} entries, freed {}", 
+            count,
+            crate::utils::format_size(actually_removed)
+        );
     }
 
     pub async fn stats(&self) -> CacheStats {
@@ -168,7 +183,7 @@ impl std::fmt::Display for CacheStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Cache Size: {} / {}\nLRU Entries: {}",
+            "Cache: {}/{} ({} entries)",
             crate::utils::format_size(self.size),
             crate::utils::format_size(self.max_size),
             self.entries

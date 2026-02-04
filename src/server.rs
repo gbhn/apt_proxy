@@ -8,7 +8,7 @@ use tracing::{error, info};
 
 pub async fn serve_tcp(app: Router, port: u16) -> anyhow::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("Listening on TCP: {}", addr);
+    info!("Listening on TCP {}", addr);
     
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app)
@@ -18,7 +18,7 @@ pub async fn serve_tcp(app: Router, port: u16) -> anyhow::Result<()> {
 }
 
 pub async fn serve_unix(app: Router, socket_path: &Path) -> anyhow::Result<()> {
-    info!("Listening on Unix socket: {:?}", socket_path);
+    info!("Listening on Unix socket {:?}", socket_path);
     
     if socket_path.exists() {
         fs::remove_file(socket_path).await?;
@@ -70,5 +70,8 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
-    tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
+    tokio::select! { 
+        _ = ctrl_c => info!("Received Ctrl+C, shutting down"),
+        _ = terminate => info!("Received SIGTERM, shutting down")
+    }
 }

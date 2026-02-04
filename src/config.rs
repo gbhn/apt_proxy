@@ -1,7 +1,7 @@
 use clap::Parser;
 use serde::Deserialize;
 use std::{collections::HashMap, path::PathBuf};
-use tracing::{info, warn, debug};
+use tracing::{info, warn};
 
 const DEFAULT_PORT: u16 = 3142;
 const DEFAULT_CACHE_DIR: &str = "./apt_cache";
@@ -111,6 +111,7 @@ impl Settings {
     async fn load_config_file(path: &Option<PathBuf>) -> anyhow::Result<ConfigFile> {
         if let Some(path) = path {
             let content = tokio::fs::read_to_string(path).await?;
+            info!("Loaded config from {:?}", path);
             return Ok(serde_yaml::from_str(&content)?);
         }
 
@@ -128,17 +129,15 @@ impl Settings {
     }
 
     pub fn display_info(&self) {
-        info!("Configuration:");
-        info!("  Cache directory: {:?}", self.cache_dir);
-        info!("  Max cache size: {}", crate::utils::format_size(self.max_cache_size));
+        info!("Cache dir: {:?}, max size: {}", 
+            self.cache_dir, 
+            crate::utils::format_size(self.max_cache_size)
+        );
 
         if self.repositories.is_empty() {
-            warn!("No repositories configured - all requests will return 404");
+            warn!("No repositories configured");
         } else {
-            info!("  Repositories: {}", self.repositories.len());
-            for (key, url) in &self.repositories {
-                debug!("    /{} -> {}", key, url);
-            }
+            info!("Configured {} repositories", self.repositories.len());
         }
     }
 }

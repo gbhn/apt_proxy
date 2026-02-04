@@ -1,20 +1,23 @@
 use std::path::{Path, PathBuf};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{fmt, EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 pub fn init_logging() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("apt_cacher_rs=debug,tower_http=debug,hyper=info"));
+        .unwrap_or_else(|_| EnvFilter::new("apt_cacher_rs=info,tower_http=info,hyper=warn"));
     
-    fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_thread_ids(false)
-        .with_line_number(true)
-        .with_level(true)
-        .compact()
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            fmt::layer()
+                .with_target(false)
+                .with_thread_ids(false)
+                .with_line_number(false)
+                .with_level(true)
+                .compact()
+        )
         .init();
     
-    tracing::info!("Logging initialized");
+    tracing::info!("APT Cacher RS started");
 }
 
 #[inline]
@@ -41,13 +44,13 @@ pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
 
     if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
+        format!("{:.2}GB", bytes as f64 / GB as f64)
     } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
+        format!("{:.2}MB", bytes as f64 / MB as f64)
     } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
+        format!("{:.2}KB", bytes as f64 / KB as f64)
     } else {
-        format!("{} B", bytes)
+        format!("{}B", bytes)
     }
 }
 

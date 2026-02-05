@@ -55,8 +55,7 @@ pub fn format_duration_secs(seconds: u64) -> String {
 
 /// Вычисляет путь в кэше для заданного URI.
 ///
-/// Использует blake3 для хэширования. Для типичных URL (< 2KB) это занимает
-/// микросекунды и не требует spawn_blocking.
+/// Использует blake3 для хэширования.
 #[inline]
 pub fn cache_path_for(base_dir: &Path, uri_path: &str) -> PathBuf {
     let hash = blake3::hash(uri_path.as_bytes());
@@ -92,4 +91,16 @@ pub fn build_upstream_url(base_url: &str, path: &str) -> Result<String, url::Par
     let base = url::Url::parse(base_url)?;
     let full = base.join(path)?;
     Ok(full.to_string())
+}
+
+/// Генерирует уникальный идентификатор (UUID v4)
+#[inline]
+pub fn generate_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Генерирует короткий уникальный идентификатор
+#[inline]
+pub fn generate_short_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }

@@ -3,26 +3,25 @@ use crate::config::CacheSettings;
 use crate::logging::fields::{self, size};
 use crate::metrics;
 use crate::storage::{CacheMetadata, Storage};
+use async_stream::stream;
 use axum::{body::Body, response::Response};
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};
 use std::{
-    pin::Pin,
+    io::SeekFrom,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    task::{Context, Poll},
     time::Duration,
 };
 use tokio::{
     fs::File,
-    io::{AsyncRead, ReadBuf},
+    io::{AsyncReadExt, AsyncSeekExt},
     sync::{watch, RwLock},
     time::timeout,
 };
-use tokio_stream::wrappers::WatchStream;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
 const HEADER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -268,7 +267,7 @@ impl DownloadManager {
         let temp_path = self.storage.path_for(key).with_extension("tmp");
         match File::open(&temp_path).await {
             Ok(file) => {
-                let stream = StreamingReader::new(file, state.clone());
+                let stream = create_streaming_reader(file, state.clone());
                 let mut response = Response::new(Body::from_stream(stream));
                 if let Some(meta) = state.get_metadata().await {
                     response.headers_mut().extend(meta.headers.clone());
@@ -402,6 +401,57 @@ impl DownloadManager {
 
     pub fn active_count(&self) -> usize {
         self.active.len()
+    }
+}
+
+/// Создаёт stream для чтения из файла, который ещё записывается
+/// Использует async_stream для более декларативного кода
+fn create_streaming_reader(
+    mut file: File,
+    state: Arc<DownloadState>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
+    stream! {
+        let mut buffer = vec![0u8; READ_BUFFER_SIZE];
+        let mut position = 0u64;
+        let mut status_rx = state.status_rx.clone();
+
+        loop {
+            match file.read(&mut buffer).await {
+                Ok(0) => {
+                    // EOF - проверяем завершилась ли загрузка
+                    let status = state.status();
+                    if status.is_finished() {
+                        state.remove_waiter();
+                        if !status.is_success() {
+                            yield Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "Download failed",
+                            ));
+                        }
+                        break;
+                    }
+                    
+                    // Ждём новых данных
+                    tokio::select! {
+                        _ = status_rx.changed() => {
+                            // Статус изменился, попробуем прочитать снова
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                            // Небольшая задержка перед повторной попыткой
+                        }
+                    }
+                }
+                Ok(n) => {
+                    position += n as u64;
+                    yield Ok(Bytes::copy_from_slice(&buffer[..n]));
+                }
+                Err(e) => {
+                    state.remove_waiter();
+                    yield Err(e);
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -581,90 +631,4 @@ async fn download_file(
     let (file_size, meta_size) = writer.finalize(&storage, final_metadata).await?;
     state.mark_finished(true, file_size, meta_size);
     Ok((file_size, meta_size))
-}
-
-struct StreamingReader {
-    file: File,
-    state: Arc<DownloadState>,
-    buffer: Box<[u8]>,
-    position: u64,
-    waiter_removed: bool,
-    status_stream: WatchStream<DownloadStatus>,
-}
-
-impl StreamingReader {
-    fn new(file: File, state: Arc<DownloadState>) -> Self {
-        let status_stream = WatchStream::new(state.status_rx.clone());
-        Self {
-            file,
-            state,
-            buffer: vec![0u8; READ_BUFFER_SIZE].into_boxed_slice(),
-            position: 0,
-            waiter_removed: false,
-            status_stream,
-        }
-    }
-
-    fn remove_waiter_once(&mut self) {
-        if !self.waiter_removed {
-            self.waiter_removed = true;
-            self.state.remove_waiter();
-        }
-    }
-}
-
-impl Stream for StreamingReader {
-    type Item = Result<Bytes, std::io::Error>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        let mut read_buf = ReadBuf::new(&mut this.buffer);
-
-        match Pin::new(&mut this.file).poll_read(cx, &mut read_buf) {
-            Poll::Ready(Ok(())) => {
-                let n = read_buf.filled().len();
-                if n > 0 {
-                    this.position += n as u64;
-                    return Poll::Ready(Some(Ok(Bytes::copy_from_slice(read_buf.filled()))));
-                }
-
-                let status = this.state.status();
-                if status.is_finished() {
-                    this.remove_waiter_once();
-                    return if status.is_success() {
-                        Poll::Ready(None)
-                    } else {
-                        Poll::Ready(Some(Err(std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "Download failed",
-                        ))))
-                    };
-                }
-
-                match Pin::new(&mut this.status_stream).poll_next(cx) {
-                    Poll::Ready(Some(_)) => {
-                        cx.waker().wake_by_ref();
-                    }
-                    Poll::Ready(None) => {
-                        this.remove_waiter_once();
-                        return Poll::Ready(None);
-                    }
-                    Poll::Pending => {}
-                }
-
-                Poll::Pending
-            }
-            Poll::Ready(Err(e)) => {
-                this.remove_waiter_once();
-                Poll::Ready(Some(Err(e)))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl Drop for StreamingReader {
-    fn drop(&mut self) {
-        self.remove_waiter_once();
-    }
 }

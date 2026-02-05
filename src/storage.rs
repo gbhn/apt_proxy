@@ -3,12 +3,13 @@
 use crate::logging::fields::size;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use ssri::Integrity;
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tempfile::NamedTempFile;
 use tokio::{
     fs::{self, File},
-    io::AsyncWriteExt,
+    io::{AsyncSeekExt, AsyncWriteExt},
     sync::{OwnedSemaphorePermit, Semaphore},
 };
 use tracing::{debug, info, warn};
@@ -56,22 +57,27 @@ impl CacheMetadata {
 
 pub struct Storage {
     cache_path: PathBuf,
+    temp_dir: PathBuf,
     write_semaphore: Arc<Semaphore>,
 }
 
 impl Storage {
     pub async fn new(base_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&base_dir).await?;
+        
+        let temp_dir = base_dir.join("tmp");
+        fs::create_dir_all(&temp_dir).await?;
+        
         debug!(path = %base_dir.display(), "Storage directory initialized");
         Ok(Self {
             cache_path: base_dir,
+            temp_dir,
             write_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_WRITES)),
         })
     }
 
     #[inline]
     pub fn path_for(&self, key: &str) -> PathBuf {
-        // Для совместимости с download_manager, возвращаем путь на основе хэша
         let hash = blake3::hash(key.as_bytes());
         let hex = hash.to_hex();
         let hex_str = hex.as_str();
@@ -81,6 +87,11 @@ impl Storage {
             .join(hex_str)
     }
 
+    /// Возвращает путь к директории для временных файлов
+    pub fn temp_dir(&self) -> &Path {
+        &self.temp_dir
+    }
+
     pub async fn exists(&self, key: &str) -> bool {
         cacache::exists(&self.cache_path, key).await
     }
@@ -88,7 +99,6 @@ impl Storage {
     pub async fn metadata_size(&self, key: &str) -> Result<u64> {
         match cacache::metadata(&self.cache_path, key).await {
             Ok(Some(meta)) => {
-                // Приблизительный размер метаданных
                 Ok(meta.raw_metadata.as_ref().map_or(0, |m| m.len() as u64) + 256)
             }
             _ => Ok(0),
@@ -133,19 +143,21 @@ impl Storage {
 
     pub async fn create(&self, key: &str) -> Result<StorageWriter> {
         let permit = self.write_semaphore.clone().acquire_owned().await?;
-        let cache_path = self.cache_path.clone();
-
-        // Создаём временный файл для streaming write
-        let temp_dir = cache_path.join("tmp");
-        fs::create_dir_all(&temp_dir).await?;
-
-        let temp_path = temp_dir.join(format!("{}.tmp", uuid_simple()));
-        let file = File::create(&temp_path).await?;
+        
+        // Используем tempfile crate для безопасного создания временных файлов
+        let temp_file = tempfile::Builder::new()
+            .prefix("apt-cache-")
+            .suffix(".tmp")
+            .tempfile_in(&self.temp_dir)?;
+        
+        let temp_path = temp_file.path().to_path_buf();
+        let std_file = temp_file.into_file();
+        let file = File::from_std(std_file);
 
         debug!(key = %key, "Created temp file for streaming write");
 
         Ok(StorageWriter {
-            cache_path,
+            cache_path: self.cache_path.clone(),
             key: key.to_string(),
             temp_path,
             file: Some(file),
@@ -170,19 +182,12 @@ impl Storage {
         Ok(deleted_size)
     }
 
-    pub async fn save_metadata(&self, _cache_path: &Path, _metadata: &CacheMetadata) -> Result<u64> {
-        // В cacache метаданные сохраняются вместе с контентом
-        // Этот метод оставлен для совместимости
-        Ok(0)
-    }
-
     pub async fn cleanup_temp_files(&self) -> Result<()> {
-        let temp_dir = self.cache_path.join("tmp");
-        if temp_dir.exists() {
+        if self.temp_dir.exists() {
             let mut count = 0u32;
             let mut total_size = 0u64;
 
-            let mut entries = fs::read_dir(&temp_dir).await?;
+            let mut entries = fs::read_dir(&self.temp_dir).await?;
             while let Some(entry) = entries.next_entry().await? {
                 if let Ok(meta) = entry.metadata().await {
                     total_size += meta.len();
@@ -200,7 +205,7 @@ impl Storage {
             }
         }
 
-        // Также запускаем GC cacache для удаления orphaned content
+        // GC cacache для удаления orphaned content
         let gc_result = cacache::gc(&self.cache_path).await?;
         if gc_result.entries_removed > 0 || gc_result.content_removed > 0 {
             info!(
@@ -285,6 +290,17 @@ impl StorageWriter {
         self.bytes_written
     }
 
+    /// Возвращает путь к временному файлу для чтения во время записи
+    pub fn temp_path(&self) -> &Path {
+        &self.temp_path
+    }
+
+    /// Открывает временный файл для чтения (для streaming во время записи)
+    pub async fn open_for_reading(&self) -> Result<File> {
+        let file = File::open(&self.temp_path).await?;
+        Ok(file)
+    }
+
     pub async fn finalize(
         mut self,
         _storage: &Storage,
@@ -361,14 +377,4 @@ impl Drop for StorageWriter {
             });
         }
     }
-}
-
-/// Простой генератор уникальных ID
-fn uuid_simple() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{:x}", now)
 }

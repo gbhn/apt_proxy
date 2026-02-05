@@ -1,51 +1,25 @@
-# TCP port to listen on
-port: 8080
+port: 3142
 
-# Unix socket path (optional, if set, TCP is ignored)
-# socket: /var/run/apt-cacher.sock
-
-# Cache directory
-cache_dir: /var/cache/apt-cacher
-
-# Maximum cache size 
-max_cache_size: 10 GiB
-
-# Maximum LRU cache entries
-max_lru_entries: 100000
-
-# Repository Mappings
-# Format: prefix: upstream_url
 repositories:
   ubuntu: "http://archive.ubuntu.com/ubuntu"
-  ubuntu-ports: "http://ports.ubuntu.com/ubuntu-ports"
-  security: "http://security.ubuntu.com/ubuntu"
+  ubuntu-security: "http://security.ubuntu.com/ubuntu"
   debian: "http://deb.debian.org/debian"
   debian-security: "http://security.debian.org/debian-security"
-  docker: "https://download.docker.com/linux/ubuntu"
-  nodejs: "https://deb.nodesource.com/node_20.x"
 
-# Cache TTL Settings (RFC 7234 compliant)
+cache_dir: "/var/cache/apt-cacher"
+max_cache_size: "10 GiB"
+
 cache:
-  # Теперь можно использовать humantime формат для TTL
-  default_ttl: 1day
-  min_ttl: 1h
-  max_ttl: 7days
-  stale_while_revalidate: 1h
-  ignore_cache_control: false
-  
-  ttl_overrides:
-    - pattern: ".*\\.deb$"
-      ttl: 30days
-    - pattern: ".*\\.dsc$"
-      ttl: 30days
-    - pattern: ".*Release.*"
-      ttl: 5min
-    - pattern: ".*Packages.*"
-      ttl: 30min
-    - pattern: ".*InRelease$"
-      ttl: 5min
+  default_ttl: "24h"
+  min_ttl: "1h"
+  max_ttl: "7d"
+  ttl_rules:
+    - pattern: ".*\\.(deb|udeb)$"
+      ttl: "30d"
+    - pattern: ".*/by-hash/.*"
+      ttl: "365d"
+    - pattern: ".*(Release|InRelease|Packages|Sources)(\\.gz|\\.xz|\\.bz2)?$"
+      ttl: "1h"
 
-  validation:
-    use_etag: true
-    use_last_modified: true
-    always_revalidate: false
+prometheus: false
+prometheus_port: 9090

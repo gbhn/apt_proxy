@@ -1,254 +1,117 @@
-pub mod cache_manager;
-pub mod cache_policy;
+pub mod cache;
 pub mod config;
-pub mod download_manager;
+pub mod downloader;
 pub mod error;
-pub mod logging;
 pub mod metrics;
 pub mod server;
 pub mod storage;
-pub mod utils;
 
 use axum::{
-    extract::{Path, Request, State},
+    extract::{Path, State},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tower::ServiceBuilder;
-use tower_http::{
-    catch_panic::CatchPanicLayer,
-    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
-    timeout::TimeoutLayer,
-    limit::ConcurrencyLimitLayer,
-};
-use tracing::{debug, info, info_span, warn, Instrument};
-
-use cache_manager::CacheManager;
+use cache::CacheManager;
 use config::Settings;
-use download_manager::DownloadManager;
+use downloader::Downloader;
 use error::{ProxyError, Result};
-use storage::Storage;
+use std::sync::Arc;
+use std::time::Instant;
+use tower::ServiceBuilder;
+use tower_http::{catch_panic::CatchPanicLayer, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
+use tracing::{info, warn};
 
-static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
-const MAX_CONCURRENT_REQUESTS: usize = 1000;
-
-pub struct AppState {
+pub struct App {
     pub settings: Settings,
-    cache: CacheManager,
-    downloader: DownloadManager,
-    storage: Arc<Storage>,
+    downloader: Downloader,
 }
 
-impl AppState {
+impl App {
     pub async fn new(settings: Settings) -> anyhow::Result<Self> {
-        let storage = Arc::new(Storage::new(settings.cache_dir.clone()).await?);
+        let storage = Arc::new(storage::Storage::new(settings.cache_dir.clone()).await?);
+        let cache_config = Arc::new(settings.cache.clone());
+        let cache = CacheManager::new(storage, cache_config, settings.max_cache_size).await?;
+        let downloader = Downloader::new(cache);
 
-        let http_client = reqwest::Client::builder()
-            .user_agent(format!("apt-cacher-rs/{}", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(300))
-            .connect_timeout(Duration::from_secs(10))
-            .pool_max_idle_per_host(16)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(60))
-            .tcp_nodelay(false)
-            .build()?;
-
-        let cache_settings = Arc::new(settings.cache.clone());
-
-        let downloader = DownloadManager::new(
-            http_client,
-            storage.clone(),
-            cache_settings.clone(),
-        );
-
-        let cache = CacheManager::new(
-            storage.clone(),
-            cache_settings,
-            settings.max_cache_size,
-            settings.max_lru_entries,
-        )
-        .await?;
-
-        cache.spawn_expiry_checker(3600);
-
-        Ok(Self {
-            settings,
-            cache,
-            downloader,
-            storage,
-        })
+        Ok(Self { settings, downloader })
     }
 
-    #[inline]
-    pub fn resolve_upstream<'a>(&'a self, path: &'a str) -> Option<(&'a str, &'a str)> {
-        let (prefix, remainder) = path.split_once('/')?;
-        let repo_url = self.settings.repositories.get(prefix)?;
-        Some((repo_url.as_str(), remainder))
+    fn resolve_url(&self, path: &str) -> Option<String> {
+        let (prefix, rest) = path.split_once('/')?;
+        let base = self.settings.repositories.get(prefix)?;
+        Some(format!("{}/{}", base.trim_end_matches('/'), rest))
     }
 }
 
-pub fn build_router(state: Arc<AppState>) -> Router {
+pub fn router(app: Arc<App>) -> Router {
     Router::new()
-        .route("/", get(health_check))
-        .route("/health", get(health_check))
-        .route("/stats", get(stats_handler))
-        .route("/metrics", get(prometheus_handler))
+        .route("/", get(|| async { "OK" }))
+        .route("/health", get(|| async { "OK" }))
+        .route("/metrics", get(metrics_handler))
         .route("/{*path}", get(proxy_handler))
-        // Используем tower ServiceBuilder для middleware stack
         .layer(
             ServiceBuilder::new()
-                // Catch panics и преобразуем в 500
                 .layer(CatchPanicLayer::new())
-                // Лимит конкурентных запросов
-                .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
-                // Таймаут на весь запрос (из tower-http)
-                .layer(TimeoutLayer::new(REQUEST_TIMEOUT))
-                // Request ID
-                .layer(PropagateRequestIdLayer::x_request_id())
-                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+                .layer(ConcurrencyLimitLayer::new(1000))
+                .layer(TimeoutLayer::new(std::time::Duration::from_secs(300))),
         )
-        .layer(middleware::from_fn(request_logging_middleware))
-        .with_state(state)
+        .layer(middleware::from_fn(logging_middleware))
+        .with_state(app)
 }
 
-async fn request_logging_middleware(request: Request, next: Next) -> Response {
-    let request_id = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let method = request.method().clone();
-    let uri = request.uri().clone();
-    let path = uri.path().to_string();
-
+async fn logging_middleware(req: axum::extract::Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
     let start = Instant::now();
 
-    let span = info_span!("request", id = request_id, method = %method);
+    let resp = next.run(req).await;
 
-    let response = next.run(request).instrument(span).await;
-
+    let status = resp.status().as_u16();
     let elapsed = start.elapsed();
-    let status = response.status();
 
-    if status.is_success() {
-        info!(
-            target: "http",
-            status = %status.as_u16(),
-            path = %logging::fields::path(&path),
-            time = %logging::fields::duration(elapsed),
-            "Request completed"
-        );
-    } else if status.is_client_error() {
-        warn!(
-            target: "http",
-            status = %status.as_u16(),
-            path = %logging::fields::path(&path),
-            time = %logging::fields::duration(elapsed),
-            "Client error"
-        );
+    if status < 400 {
+        info!(status, path, time_ms = elapsed.as_millis(), "Request");
     } else {
-        tracing::error!(
-            target: "http",
-            status = %status.as_u16(),
-            path = %logging::fields::path(&path),
-            time = %logging::fields::duration(elapsed),
-            "Server error"
-        );
+        warn!(status, path, time_ms = elapsed.as_millis(), "Request");
     }
 
-    response
+    resp
 }
 
-async fn health_check() -> &'static str {
-    "OK"
-}
-
-async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let cache_stats = state.cache.stats().await;
-    let active = state.downloader.active_count();
-    format!("{}\nActive Downloads: {}", cache_stats, active)
-}
-
-async fn prometheus_handler() -> impl IntoResponse {
-    match metrics::render_prometheus() {
-        Some(metrics) => (
-            [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-            metrics,
-        ),
+async fn metrics_handler() -> impl IntoResponse {
+    match metrics::render() {
+        Some(m) => ([(axum::http::header::CONTENT_TYPE, "text/plain")], m),
         None => (
             [(axum::http::header::CONTENT_TYPE, "text/plain")],
-            "# Prometheus exporter not enabled\n".to_string(),
+            "# Prometheus not enabled\n".to_string(),
         ),
     }
 }
 
 async fn proxy_handler(
     Path(path): Path<String>,
-    State(state): State<Arc<AppState>>,
+    State(app): State<Arc<App>>,
 ) -> Result<Response> {
-    debug!(path = %logging::fields::path(&path), "Processing request");
-    utils::validate_path(&path)?;
+    validate_path(&path)?;
 
-    let (upstream_url, upstream_path) = state
-        .resolve_upstream(&path)
-        .ok_or(ProxyError::RepositoryNotFound)?;
+    let url = app.resolve_url(&path).ok_or(ProxyError::RepositoryNotFound)?;
+    app.downloader.fetch(&path, &url).await
+}
 
-    // Проверяем кэш
-    if state.cache.contains(&path).await {
-        if let Ok(Some(stored)) = state.storage.open(&path).await {
-            info!(path = %logging::fields::path(&path), "Cache HIT");
-
-            let meta_size = state.storage.metadata_size(&path).await.unwrap_or(0);
-            state
-                .cache
-                .mark_used(&path, stored.size, meta_size, stored.metadata.clone())
-                .await;
-
-            metrics::record_cache_hit(stored.size);
-
-            let stream = tokio_util::io::ReaderStream::with_capacity(stored.file, 256 * 1024);
-            let mut response = Response::new(axum::body::Body::from_stream(stream));
-            response
-                .headers_mut()
-                .extend(stored.metadata.headers.clone());
-
-            return Ok(response);
-        }
+fn validate_path(path: &str) -> Result<()> {
+    if path.is_empty() || path.len() > 2048 {
+        return Err(ProxyError::InvalidPath("Invalid length".into()));
     }
 
-    let existing_metadata = state.storage.get_metadata(&path).await.ok().flatten();
-
-    metrics::record_cache_miss();
-
-    info!(
-        path = %logging::fields::path(&path),
-        upstream = %upstream_url,
-        revalidating = existing_metadata.is_some(),
-        "Cache MISS -> fetching"
-    );
-
-    let full_url = format!(
-        "{}/{}",
-        upstream_url.trim_end_matches('/'),
-        upstream_path.trim_start_matches('/')
-    );
-
-    let (response, file_size, meta_size, metadata) = state
-        .downloader
-        .get_or_download(&path, full_url, existing_metadata)
-        .await?;
-
-    state
-        .cache
-        .mark_used(&path, file_size, meta_size, metadata)
-        .await;
-
-    if state.cache.needs_cleanup() {
-        state.cache.spawn_cleanup();
+    if memchr::memchr(0, path.as_bytes()).is_some() {
+        return Err(ProxyError::InvalidPath("Null byte in path".into()));
     }
 
-    Ok(response)
+    let clean = path_clean::PathClean::clean(std::path::Path::new(path));
+    if clean.to_string_lossy().starts_with("..") {
+        return Err(ProxyError::InvalidPath("Path traversal attempt".into()));
+    }
+
+    Ok(())
 }

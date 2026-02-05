@@ -90,7 +90,7 @@ checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
 name = "apt-cacher-rs"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -103,7 +103,9 @@ dependencies = [
  "dashmap",
  "futures",
  "http",
+ "http-cache-semantics",
  "http-serde",
+ "httpdate",
  "hyper",
  "hyper-util",
  "lru",
@@ -113,6 +115,7 @@ dependencies = [
  "percent-encoding",
  "proptest",
  "rand",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
@@ -941,6 +944,18 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
+]
+
+[[package]]
+name = "http-cache-semantics"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4311240f94cb6fe622337dc580b09ddd6ae4a891eb121dba20cf4f77ca4e7129"
+dependencies = [
+ "http",
+ "http-serde",
+ "serde",
+ "time",
 ]
 
 [[package]]

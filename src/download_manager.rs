@@ -1,3 +1,5 @@
+use crate::cache_policy::is_not_modified_response;
+use crate::config::CacheSettings;
 use crate::logging::fields::{self, size};
 use crate::storage::{CacheMetadata, Storage};
 use axum::{body::Body, response::Response};
@@ -23,13 +25,14 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 
 const HEADER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_READY_TIMEOUT: Duration = Duration::from_secs(60);
-const READ_BUFFER_SIZE: usize = 256 * 1024;
+const READ_BUFFER_SIZE: usize = 64 * 1024;
 const PROGRESS_LOG_INTERVAL: u64 = 50 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum DownloadStatus {
     Pending,
     Downloading { status_code: u16 },
+    NotModified,
     Completed { success: bool },
 }
 
@@ -37,6 +40,7 @@ impl DownloadStatus {
     pub fn status_code(&self) -> Option<u16> {
         match self {
             Self::Downloading { status_code } => Some(*status_code),
+            Self::NotModified => Some(304),
             Self::Completed { success: true } => Some(200),
             Self::Completed { success: false } => Some(502),
             Self::Pending => None,
@@ -44,11 +48,14 @@ impl DownloadStatus {
     }
 
     pub fn is_finished(&self) -> bool {
-        matches!(self, Self::Completed { .. })
+        matches!(self, Self::Completed { .. } | Self::NotModified)
     }
 
     pub fn is_success(&self) -> bool {
-        matches!(self, Self::Completed { success: true })
+        matches!(
+            self,
+            Self::Completed { success: true } | Self::NotModified
+        )
     }
 }
 
@@ -61,6 +68,8 @@ struct DownloadState {
     bytes_written: AtomicU64,
     metadata: tokio::sync::OnceCell<Arc<CacheMetadata>>,
     waiters: AtomicU64,
+    file_size: AtomicU64,
+    meta_size: AtomicU64,
 }
 
 impl DownloadState {
@@ -75,15 +84,19 @@ impl DownloadState {
             bytes_written: AtomicU64::new(0),
             metadata: tokio::sync::OnceCell::new(),
             waiters: AtomicU64::new(0),
+            file_size: AtomicU64::new(0),
+            meta_size: AtomicU64::new(0),
         }
     }
 
     async fn wait_for_status(&self) -> u16 {
         let mut rx = self.status_rx.clone();
         loop {
-            let status = *rx.borrow_and_update();
-            if let Some(code) = status.status_code() {
-                return code;
+            {
+                let status = rx.borrow_and_update();
+                if let Some(code) = status.status_code() {
+                    return code;
+                }
             }
             if rx.changed().await.is_err() {
                 return 502;
@@ -108,9 +121,12 @@ impl DownloadState {
     }
 
     fn set_status_code(&self, code: u16) {
-        let _ = self
-            .status_tx
-            .send(DownloadStatus::Downloading { status_code: code });
+        let status = if is_not_modified_response(code) {
+            DownloadStatus::NotModified
+        } else {
+            DownloadStatus::Downloading { status_code: code }
+        };
+        let _ = self.status_tx.send(status);
     }
 
     fn mark_file_ready(&self) {
@@ -118,8 +134,18 @@ impl DownloadState {
         self.notify_file_ready.notify_waiters();
     }
 
-    fn mark_finished(&self, success: bool) {
+    fn mark_finished(&self, success: bool, file_size: u64, meta_size: u64) {
+        self.file_size.store(file_size, Ordering::Release);
+        self.meta_size.store(meta_size, Ordering::Release);
         let _ = self.status_tx.send(DownloadStatus::Completed { success });
+        self.notify_data.notify_waiters();
+        self.notify_file_ready.notify_waiters();
+    }
+
+    fn mark_not_modified(&self, file_size: u64, meta_size: u64) {
+        self.file_size.store(file_size, Ordering::Release);
+        self.meta_size.store(meta_size, Ordering::Release);
+        let _ = self.status_tx.send(DownloadStatus::NotModified);
         self.notify_data.notify_waiters();
         self.notify_file_ready.notify_waiters();
     }
@@ -140,19 +166,32 @@ impl DownloadState {
     fn waiter_count(&self) -> u64 {
         self.waiters.load(Ordering::Relaxed)
     }
+
+    fn get_sizes(&self) -> (u64, u64) {
+        (
+            self.file_size.load(Ordering::Acquire),
+            self.meta_size.load(Ordering::Acquire),
+        )
+    }
 }
 
 pub struct DownloadManager {
     client: reqwest::Client,
     storage: Arc<Storage>,
+    settings: Arc<CacheSettings>,
     active: Arc<DashMap<Arc<str>, Arc<DownloadState>>>,
 }
 
 impl DownloadManager {
-    pub fn new(client: reqwest::Client, storage: Arc<Storage>) -> Self {
+    pub fn new(
+        client: reqwest::Client,
+        storage: Arc<Storage>,
+        settings: Arc<CacheSettings>,
+    ) -> Self {
         Self {
             client,
             storage,
+            settings,
             active: Arc::new(DashMap::with_capacity(128)),
         }
     }
@@ -161,17 +200,28 @@ impl DownloadManager {
         &self,
         key: &str,
         upstream_url: String,
-    ) -> crate::error::Result<Response> {
+        existing_metadata: Option<CacheMetadata>,
+    ) -> crate::error::Result<(Response, u64, u64, CacheMetadata)> {
         let (state, is_new) = self.get_or_create_download(key);
         state.add_waiter();
 
         if is_new {
-            self.spawn_download_task(key.to_string(), upstream_url, state.clone());
+            self.spawn_download_task(
+                key.to_string(),
+                upstream_url,
+                state.clone(),
+                existing_metadata,
+            );
         }
 
         let status_code = timeout(HEADER_WAIT_TIMEOUT, state.wait_for_status())
             .await
             .map_err(|_| crate::error::ProxyError::Timeout("Header timeout".into()))?;
+
+        if status_code == 304 {
+            state.remove_waiter();
+            return self.serve_from_storage(key, &state).await;
+        }
 
         if status_code != 200 {
             state.remove_waiter();
@@ -202,7 +252,26 @@ impl DownloadManager {
                 if let Some(meta) = state.metadata.get() {
                     response.headers_mut().extend(meta.headers.clone());
                 }
-                Ok(response)
+
+                let (file_size, meta_size) = state.get_sizes();
+                let metadata = state
+                    .metadata
+                    .get()
+                    .map(|m| (**m).clone())
+                    .unwrap_or_else(|| CacheMetadata {
+                        headers: Default::default(),
+                        original_url: String::new(),
+                        key: Some(key.to_string()),
+                        stored_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                        content_length: file_size,
+                        etag: None,
+                        last_modified: None,
+                    });
+
+                Ok((response, file_size, meta_size, metadata))
             }
             Err(_) => {
                 state.remove_waiter();
@@ -215,7 +284,7 @@ impl DownloadManager {
         &self,
         key: &str,
         state: &Arc<DownloadState>,
-    ) -> crate::error::Result<Response> {
+    ) -> crate::error::Result<(Response, u64, u64, CacheMetadata)> {
         if !state.status().is_success() {
             return Err(crate::error::ProxyError::Download("Download failed".into()));
         }
@@ -232,13 +301,14 @@ impl DownloadManager {
             })?
             .ok_or_else(|| crate::error::ProxyError::Download("Not found in storage".into()))?;
 
-        let stream =
-            tokio_util::io::ReaderStream::with_capacity(stored.file, READ_BUFFER_SIZE);
+        let stream = tokio_util::io::ReaderStream::with_capacity(stored.file, READ_BUFFER_SIZE);
         let mut response = Response::new(Body::from_stream(stream));
         response
             .headers_mut()
             .extend(stored.metadata.headers.clone());
-        Ok(response)
+
+        let (file_size, meta_size) = state.get_sizes();
+        Ok((response, file_size, meta_size, stored.metadata))
     }
 
     fn get_or_create_download(&self, key: &str) -> (Arc<DownloadState>, bool) {
@@ -268,9 +338,11 @@ impl DownloadManager {
         key: String,
         upstream_url: String,
         state: Arc<DownloadState>,
+        existing_metadata: Option<CacheMetadata>,
     ) {
         let client = self.client.clone();
         let storage = self.storage.clone();
+        let settings = self.settings.clone();
         let active = self.active.clone();
         let key_arc = Arc::from(key.as_str());
 
@@ -282,17 +354,30 @@ impl DownloadManager {
         tokio::spawn(
             async move {
                 let start = std::time::Instant::now();
-                match download_file(client, upstream_url, &key, storage, state.clone()).await {
-                    Ok(downloaded_size) => {
+                match download_file(
+                    client,
+                    upstream_url,
+                    &key,
+                    storage,
+                    settings,
+                    state.clone(),
+                    existing_metadata,
+                )
+                .await
+                {
+                    Ok((downloaded_size, meta_size)) => {
                         let elapsed = start.elapsed();
                         if downloaded_size > 0 {
                             let speed = downloaded_size as f64 / elapsed.as_secs_f64();
                             info!(
                                 size = %size(downloaded_size),
+                                meta_size = %size(meta_size),
                                 time = %fields::duration(elapsed),
                                 speed = %format!("{}/s", size(speed as u64)),
                                 "Download completed"
                             );
+                        } else {
+                            info!("Content not modified (304)");
                         }
                     }
                     Err(e) => {
@@ -310,8 +395,10 @@ impl DownloadManager {
     }
 }
 
-/// Helper function to extract header value as String
-fn header_to_string(headers: &reqwest::header::HeaderMap, name: reqwest::header::HeaderName) -> Option<String> {
+fn header_to_string(
+    headers: &reqwest::header::HeaderMap,
+    name: reqwest::header::HeaderName,
+) -> Option<String> {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
@@ -323,14 +410,51 @@ async fn download_file(
     url: String,
     key: &str,
     storage: Arc<Storage>,
+    settings: Arc<CacheSettings>,
     state: Arc<DownloadState>,
-) -> anyhow::Result<u64> {
+    existing_metadata: Option<CacheMetadata>,
+) -> anyhow::Result<(u64, u64)> {
     debug!(url = %url, "Fetching from upstream");
 
-    let response = client.get(&url).send().await?;
+    let mut request = client.get(&url);
+
+    if let Some(ref metadata) = existing_metadata {
+        if settings.validation.use_etag {
+            if let Some(ref etag) = metadata.etag {
+                debug!(etag = %etag, "Adding If-None-Match header");
+                request = request.header("If-None-Match", etag);
+            }
+        }
+
+        if settings.validation.use_last_modified {
+            if let Some(ref last_modified) = metadata.last_modified {
+                debug!(last_modified = %last_modified, "Adding If-Modified-Since header");
+                request = request.header("If-Modified-Since", last_modified);
+            }
+        }
+    }
+
+    let response = request.send().await?;
     let status = response.status().as_u16();
 
     state.set_status_code(status);
+
+    if status == 304 {
+        info!("Upstream returned 304 Not Modified");
+        if let Some(_metadata) = existing_metadata {
+            let meta_size = storage.metadata_size(key).await.unwrap_or(0);
+            let file_size = storage
+                .open(key)
+                .await
+                .ok()
+                .flatten()
+                .map(|s| s.size)
+                .unwrap_or(0);
+
+            state.mark_not_modified(file_size, meta_size);
+            return Ok((0, 0));
+        }
+    }
 
     if !response.status().is_success() {
         warn!(
@@ -338,8 +462,8 @@ async fn download_file(
             url = %url,
             "Upstream returned error"
         );
-        state.mark_finished(false);
-        return Ok(0);
+        state.mark_finished(false, 0, 0);
+        return Ok((0, 0));
     }
 
     let content_length = response.content_length().unwrap_or(0);
@@ -352,14 +476,14 @@ async fn download_file(
     );
 
     let response_headers = response.headers().clone();
-    
-    // Extract ETag and Last-Modified headers
+
     let etag = header_to_string(&response_headers, reqwest::header::ETAG);
     let last_modified = header_to_string(&response_headers, reqwest::header::LAST_MODIFIED);
 
     let mut metadata = CacheMetadata {
         headers: response_headers,
         original_url: url.clone(),
+        key: Some(key.to_string()),
         stored_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs(),
@@ -382,9 +506,7 @@ async fn download_file(
         let bytes = writer.bytes_written();
         state.notify_progress(bytes);
 
-        // Progress logging for large files
-        if content_length > PROGRESS_LOG_INTERVAL
-            && bytes - last_log_bytes >= PROGRESS_LOG_INTERVAL
+        if content_length > PROGRESS_LOG_INTERVAL && bytes - last_log_bytes >= PROGRESS_LOG_INTERVAL
         {
             let percent = if content_length > 0 {
                 (bytes as f64 / content_length as f64 * 100.0) as u32
@@ -404,9 +526,9 @@ async fn download_file(
     let total = writer.bytes_written();
     metadata.content_length = total;
 
-    writer.finalize(&storage, metadata).await?;
-    state.mark_finished(true);
-    Ok(total)
+    let (file_size, meta_size) = writer.finalize(&storage, metadata).await?;
+    state.mark_finished(true, file_size, meta_size);
+    Ok((file_size, meta_size))
 }
 
 struct StreamingReader {
@@ -455,14 +577,9 @@ impl Stream for StreamingReader {
                     };
                 }
 
-                let bytes_written = this.state.bytes_written.load(Ordering::Acquire);
-                if this.position < bytes_written {
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-
                 let waker = cx.waker().clone();
                 let state = this.state.clone();
+
                 tokio::spawn(async move {
                     state.notify_data.notified().await;
                     waker.wake();

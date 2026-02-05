@@ -13,7 +13,6 @@ use tracing::info;
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Determine log format from environment or default
     let log_format = std::env::var("LOG_FORMAT")
         .ok()
         .and_then(|s| match s.to_lowercase().as_str() {
@@ -24,27 +23,23 @@ async fn main() -> Result<()> {
         })
         .unwrap_or(LogFormat::Pretty);
 
-    // Initialize logging
     let log_config = LogConfig {
         level: std::env::var("RUST_LOG")
             .unwrap_or_else(|_| "apt_cacher_rs=info,tower_http=info,hyper=warn".to_string()),
         format: log_format,
-        colors: None, // Auto-detect
+        colors: None,
         file: std::env::var("LOG_FILE").ok().map(Into::into),
     };
 
     let _guard = logging::init(log_config);
 
-    // Print banner for pretty format
     if log_format == LogFormat::Pretty {
         logging::print_banner();
     }
 
-    // Load settings
     let settings = Settings::load(args).await?;
     settings.display_info();
 
-    // Initialize application state
     let state = Arc::new(AppState::new(settings.clone()).await?);
     let app = build_router(state.clone());
 
@@ -55,7 +50,6 @@ async fn main() -> Result<()> {
         "Server ready"
     );
 
-    // Start server
     match state.settings.socket {
         Some(ref socket_path) => server::serve_unix(app, socket_path).await,
         None => server::serve_tcp(app, state.settings.port).await,

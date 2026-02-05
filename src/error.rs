@@ -33,7 +33,6 @@ pub enum ProxyError {
 }
 
 impl ProxyError {
-    /// Returns true if this error is retryable
     #[inline]
     pub const fn is_retryable(&self) -> bool {
         matches!(
@@ -42,7 +41,6 @@ impl ProxyError {
         )
     }
 
-    /// Returns the appropriate HTTP status code for this error
     #[inline]
     pub const fn status_code(&self) -> StatusCode {
         match self {

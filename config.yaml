@@ -23,3 +23,64 @@ repositories:
   debian-security: "http://security.debian.org/debian-security"
   docker: "https://download.docker.com/linux/ubuntu"
   nodejs: "https://deb.nodesource.com/node_20.x"
+
+# Cache TTL Settings (RFC 7234 compliant)
+cache:
+  # Default TTL if no caching headers present (seconds)
+  # Default: 86400 (24 hours)
+  default_ttl: 86400
+  
+  # Minimum TTL - never cache for less than this (seconds)
+  # Default: 3600 (1 hour)
+  min_ttl: 3600
+  
+  # Maximum TTL - never cache for more than this (seconds)
+  # Default: 604800 (7 days)
+  max_ttl: 604800
+  
+  # Ignore upstream Cache-Control headers
+  # Default: false (respect upstream headers)
+  ignore_cache_control: false
+  
+  # Stale-while-revalidate: serve stale content while fetching fresh (seconds)
+  # Default: 3600 (1 hour)
+  stale_while_revalidate: 3600
+  
+  # Pattern-based TTL overrides
+  # Patterns are matched against the request path
+  ttl_overrides:
+    # Package files (.deb, .udeb) - cache longer
+    - pattern: ".*\\.(deb|udeb)$"
+      ttl: 2592000  # 30 days
+      
+    # Index files (Packages, Release, InRelease) - shorter TTL
+    - pattern: ".*/Packages(\\.gz|\\.xz|\\.bz2)?$"
+      ttl: 3600     # 1 hour
+      
+    - pattern: ".*/InRelease$"
+      ttl: 1800     # 30 minutes
+      
+    - pattern: ".*/Release(\\.gpg)?$"
+      ttl: 1800     # 30 minutes
+      
+    # Translation files
+    - pattern: ".*/Translation-.*"
+      ttl: 7200     # 2 hours
+      
+    # Contents files
+    - pattern: ".*/Contents-.*"
+      ttl: 86400    # 24 hours
+
+  # Validation settings
+  validation:
+    # Use ETags for validation
+    # Default: true
+    use_etag: true
+    
+    # Use Last-Modified for validation
+    # Default: true
+    use_last_modified: true
+    
+    # Revalidate on each request (always check if-modified-since)
+    # Default: false
+    always_revalidate: false

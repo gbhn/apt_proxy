@@ -1,6 +1,6 @@
 [package]
 name = "apt-cacher-rs"
-version = "2.4.0"
+version = "2.5.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A high-performance caching proxy for APT repositories"
@@ -8,12 +8,10 @@ license = "MIT"
 repository = "https://github.com/gbhn/apt_proxy"
 
 [dependencies]
-# Web framework
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "request-id"] }
 
-# HTTP
 hyper = { version = "1.8", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 reqwest = { version = "0.12", default-features = false, features = [
@@ -25,36 +23,33 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 http = "1.4"
 
-# Async runtime
+http-cache-semantics = "2.1"
+httpdate = "1.0"
+
 tokio = { version = "1.49", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
 
-# Serialization
 bytes = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yml = "0.0.12"
 http-serde = "2.1"
 
-# CLI
 clap = { version = "4.5", features = ["derive", "env"] }
 
-# Caching & data structures
 lru = "0.12"
 dashmap = "6.1"
 blake3 = "1.8"
+regex = "1.12"
 
-# Error handling
 anyhow = "1.0"
 thiserror = "2.0"
 
-# Utilities
 memchr = "2.7"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 percent-encoding = "2.3"
 
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 tracing-appender = "0.2"

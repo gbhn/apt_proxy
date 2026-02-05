@@ -1,4 +1,5 @@
 use crate::logging::fields::size;
+use crate::utils;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,8 @@ pub struct CacheMetadata {
     #[serde(with = "http_serde::header_map")]
     pub headers: axum::http::HeaderMap,
     pub original_url: String,
+    #[serde(default)]
+    pub key: Option<String>,
     pub stored_at: u64,
     pub content_length: u64,
     #[serde(default)]
@@ -30,6 +33,7 @@ impl CacheMetadata {
         Self {
             headers: headers.clone(),
             original_url: url.to_string(),
+            key: None,
             stored_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -67,13 +71,7 @@ impl Storage {
 
     #[inline]
     pub fn path_for(&self, key: &str) -> PathBuf {
-        let hash = blake3::hash(key.as_bytes());
-        let hex = hash.to_hex();
-        let hex_str = hex.as_str();
-        self.base_dir
-            .join(&hex_str[0..2])
-            .join(&hex_str[2..4])
-            .join(hex_str)
+        utils::cache_path_for(&self.base_dir, key)
     }
 
     #[inline]
@@ -83,31 +81,39 @@ impl Storage {
 
     #[inline]
     fn metadata_path_for(&self, cache_path: &Path) -> PathBuf {
-        cache_path.with_extension("meta")
+        utils::meta_path_for(cache_path)
     }
 
     pub async fn exists(&self, key: &str) -> bool {
+        fs::try_exists(self.path_for(key)).await.unwrap_or(false)
+    }
+
+    pub async fn metadata_size(&self, key: &str) -> Result<u64> {
         let path = self.path_for(key);
-        fs::try_exists(&path).await.unwrap_or(false)
+        let meta_path = self.metadata_path_for(&path);
+        
+        match fs::metadata(&meta_path).await {
+            Ok(meta) => Ok(meta.len()),
+            Err(_) => Ok(0),
+        }
     }
 
     pub async fn open(&self, key: &str) -> Result<Option<StoredFile>> {
         let path = self.path_for(key);
 
-        let file = match File::open(&path).await {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-
-        let file_size = file.metadata().await?.len();
-        let metadata = self.load_metadata(&path).await?;
-
-        Ok(Some(StoredFile {
-            file,
-            metadata,
-            size: file_size,
-        }))
+        match File::open(&path).await {
+            Ok(file) => {
+                let file_size = file.metadata().await?.len();
+                let metadata = self.load_metadata(&path).await?;
+                Ok(Some(StoredFile {
+                    file,
+                    metadata,
+                    size: file_size,
+                }))
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn create(&self, key: &str) -> Result<StorageWriter> {
@@ -143,13 +149,15 @@ impl Storage {
         let mut deleted = 0u64;
 
         if let Ok(meta) = fs::metadata(&path).await {
-            deleted += meta.len();
-            fs::remove_file(&path).await.ok();
+            if fs::remove_file(&path).await.is_ok() {
+                deleted += meta.len();
+            }
         }
 
         if let Ok(meta) = fs::metadata(&metadata_path).await {
-            deleted += meta.len();
-            fs::remove_file(&metadata_path).await.ok();
+            if fs::remove_file(&metadata_path).await.is_ok() {
+                deleted += meta.len();
+            }
         }
 
         debug!(
@@ -161,7 +169,7 @@ impl Storage {
         Ok(deleted)
     }
 
-    async fn save_metadata(&self, cache_path: &Path, metadata: &CacheMetadata) -> Result<u64> {
+    pub async fn save_metadata(&self, cache_path: &Path, metadata: &CacheMetadata) -> Result<u64> {
         let meta_path = self.metadata_path_for(cache_path);
         let json = serde_json::to_vec(metadata)?;
         let meta_size = json.len() as u64;
@@ -195,11 +203,7 @@ impl Storage {
                         if let Ok(meta) = fs::metadata(&path).await {
                             total_size += meta.len();
                         }
-                        debug!(
-                            file = %path.file_name().unwrap_or_default().to_string_lossy(),
-                            "Removing stale temp file"
-                        );
-                        let _ = fs::remove_file(path).await;
+                        let _ = fs::remove_file(&path).await;
                         count += 1;
                     }
                 }
@@ -237,22 +241,22 @@ impl Storage {
                     dirs.push(path);
                     continue;
                 }
-                if !meta.is_file() {
+                
+                if path.extension().map_or(false, |e| e == "meta" || e == "tmp" || e == "part") {
                     continue;
-                }
-
-                if let Some(ext) = path.extension() {
-                    if ext == "meta" || ext == "tmp" || ext == "part" {
-                        continue;
-                    }
                 }
 
                 if let Ok(cache_meta) = self.load_metadata(&path).await {
                     let meta_path = self.metadata_path_for(&path);
                     let meta_size = fs::metadata(&meta_path).await.map(|m| m.len()).unwrap_or(0);
 
+                    let effective_key = cache_meta
+                        .key
+                        .clone()
+                        .unwrap_or_else(|| cache_meta.original_url.clone());
+
                     files.push((
-                        cache_meta.original_url.clone(),
+                        effective_key,
                         meta.len(),
                         meta_size,
                         cache_meta,
@@ -263,7 +267,6 @@ impl Storage {
         Ok(files)
     }
     
-    /// Get storage statistics
     pub async fn stats(&self) -> StorageStats {
         let available_permits = self.write_semaphore.available_permits();
         StorageStats {

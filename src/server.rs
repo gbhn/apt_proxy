@@ -89,7 +89,6 @@ pub async fn serve_unix(app: Router, socket_path: &Path) -> anyhow::Result<()> {
         }
     }
 
-    // Cleanup socket file
     if socket_path.exists() {
         fs::remove_file(socket_path).await.ok();
     }
@@ -107,10 +106,9 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler");
+        term.recv().await;
     };
 
     #[cfg(not(unix))]

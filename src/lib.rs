@@ -1,4 +1,5 @@
 pub mod cache_manager;
+pub mod cache_policy;
 pub mod config;
 pub mod download_manager;
 pub mod error;
@@ -26,7 +27,6 @@ use download_manager::DownloadManager;
 use error::{ProxyError, Result};
 use storage::Storage;
 
-/// Global request counter for unique request IDs
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct AppState {
@@ -50,13 +50,23 @@ impl AppState {
             .tcp_nodelay(false)
             .build()?;
 
-        let downloader = DownloadManager::new(http_client, storage.clone());
+        let cache_settings = Arc::new(settings.cache.clone());
+        
+        let downloader = DownloadManager::new(
+            http_client, 
+            storage.clone(),
+            cache_settings.clone(),
+        );
+        
         let cache = CacheManager::new(
             storage.clone(),
+            cache_settings,
             settings.max_cache_size,
             settings.max_lru_entries,
         )
         .await?;
+
+        cache.spawn_expiry_checker(3600);
 
         Ok(Self {
             settings,
@@ -86,7 +96,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Middleware for request logging with timing
 async fn request_logging_middleware(request: Request, next: Next) -> Response {
     let request_id = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let method = request.method().clone();
@@ -106,7 +115,6 @@ async fn request_logging_middleware(request: Request, next: Next) -> Response {
     let elapsed = start.elapsed();
     let status = response.status();
 
-    // Log based on status code
     if status.is_success() {
         info!(
             target: "http",
@@ -170,7 +178,9 @@ async fn proxy_handler(
             .map_err(|e| ProxyError::Cache(std::io::Error::new(std::io::ErrorKind::Other, e)))?
             .ok_or(ProxyError::RepositoryNotFound)?;
 
-        state.cache.mark_used(&path, stored.size, 0).await;
+        let meta_size = state.storage.metadata_size(&path).await.unwrap_or(0);
+        
+        state.cache.mark_used(&path, stored.size, meta_size, stored.metadata.clone()).await;
 
         let stream = tokio_util::io::ReaderStream::with_capacity(stored.file, 256 * 1024);
         let mut response = Response::new(axum::body::Body::from_stream(stream));
@@ -181,9 +191,12 @@ async fn proxy_handler(
         return Ok(response);
     }
 
+    let existing_metadata = state.storage.open(&path).await.ok().flatten().map(|s| s.metadata);
+
     info!(
         path = %logging::fields::path(&path),
         upstream = %upstream_url,
+        revalidating = existing_metadata.is_some(),
         "Cache MISS -> fetching"
     );
 
@@ -193,7 +206,12 @@ async fn proxy_handler(
         upstream_path.trim_start_matches('/')
     );
 
-    let response = state.downloader.get_or_download(&path, full_url).await?;
+    let (response, file_size, meta_size, metadata) = state
+        .downloader
+        .get_or_download(&path, full_url, existing_metadata)
+        .await?;
+
+    state.cache.mark_used(&path, file_size, meta_size, metadata).await;
 
     if state.cache.needs_cleanup() {
         state.cache.spawn_cleanup();

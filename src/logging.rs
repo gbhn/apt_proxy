@@ -15,16 +15,11 @@ use tracing_subscriber::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Logging configuration
 #[derive(Debug, Clone)]
 pub struct LogConfig {
-    /// Log level filter (e.g., "info", "debug", "apt_cacher_rs=debug,tower_http=info")
     pub level: String,
-    /// Output format: "pretty", "compact", "json"
     pub format: LogFormat,
-    /// Enable colors (auto-detected if None)
     pub colors: Option<bool>,
-    /// Optional log file path
     pub file: Option<std::path::PathBuf>,
 }
 
@@ -47,12 +42,10 @@ impl Default for LogConfig {
     }
 }
 
-/// Guard that must be kept alive for async logging to file
 pub struct LogGuard {
     _file_guard: Option<WorkerGuard>,
 }
 
-/// Initialize the logging system with the given configuration
 pub fn init(config: LogConfig) -> LogGuard {
     let use_colors = config.colors.unwrap_or_else(|| std::io::stderr().is_terminal());
     
@@ -62,7 +55,6 @@ pub fn init(config: LogConfig) -> LogGuard {
 
     let registry = tracing_subscriber::registry().with(filter);
 
-    // Handle each combination of format and file logging explicitly
     match (&config.file, config.format) {
         (Some(path), LogFormat::Json) => {
             let (file_writer, guard) = create_file_appender(path);
@@ -137,7 +129,6 @@ fn create_file_appender(path: &Path) -> (tracing_appender::non_blocking::NonBloc
     tracing_appender::non_blocking(file_appender)
 }
 
-/// Pretty formatter with custom styling
 struct PrettyFormatter {
     colors: bool,
 }
@@ -214,14 +205,11 @@ where
         let metadata = event.metadata();
         let level = *metadata.level();
 
-        // Timestamp
         let now = chrono::Local::now();
         write!(writer, "{} ", self.dim(&now.format("%H:%M:%S%.3f").to_string()))?;
 
-        // Level
         write!(writer, "{} ", self.style_level(level))?;
 
-        // Target (shortened)
         let target = metadata.target();
         let short_target = if target.starts_with("apt_cacher_rs") {
             target.strip_prefix("apt_cacher_rs::").unwrap_or(target)
@@ -232,10 +220,8 @@ where
         };
         write!(writer, "{} ", self.cyan(&format!("{:>12}", short_target)))?;
 
-        // Separator
         write!(writer, "{} ", self.dim("│"))?;
 
-        // Span fields
         if let Some(scope) = ctx.event_scope() {
             let mut seen = false;
             for span in scope.from_root() {
@@ -255,14 +241,12 @@ where
             }
         }
 
-        // Event message
         ctx.field_format().format_fields(writer.by_ref(), event)?;
 
         writeln!(writer)
     }
 }
 
-/// Print startup banner with version and configuration info
 pub fn print_banner() {
     let banner = format!(
         r#"
@@ -282,21 +266,17 @@ pub fn print_banner() {
     }
 }
 
-/// Structured logging helpers
 pub mod fields {
-    /// Create a key-value field for file sizes
     #[inline]
     pub fn size(bytes: u64) -> String {
         crate::utils::format_size(bytes)
     }
 
-    /// Create a shortened path for display
     #[inline]
     pub fn path(p: &str) -> &str {
         shorten_path(p, 60)
     }
 
-    /// Shorten long paths for cleaner logs
     #[inline]
     pub fn shorten_path(path: &str, max_len: usize) -> &str {
         if path.len() <= max_len {
@@ -307,7 +287,6 @@ pub mod fields {
         }
     }
 
-    /// Format duration in human-readable form
     pub fn duration(d: std::time::Duration) -> String {
         let ms = d.as_millis();
         if ms < 1000 {
@@ -320,7 +299,6 @@ pub mod fields {
     }
 }
 
-/// Helper to shorten paths (re-export for convenience)
 pub use fields::shorten_path;
 
 #[cfg(test)]

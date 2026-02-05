@@ -21,10 +21,7 @@ macro_rules! atomic_gauge {
         }
 
         pub fn $dec() {
-            let val = $static
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)))
-                .unwrap_or(1)
-                .saturating_sub(1);
+            let val = $static.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
             gauge!($metric).set(val as f64);
         }
 

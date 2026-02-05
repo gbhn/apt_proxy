@@ -159,7 +159,10 @@ fn validate_path(path: &str) -> Result<()> {
         }
     }
 
-    let normalized = path_clean::PathClean::clean(std::path::Path::new(decoded.as_ref()));
+    let normalized = std::panic::catch_unwind(|| {
+        path_clean::PathClean::clean(std::path::Path::new(decoded.as_ref()))
+    }).map_err(|_| ProxyError::InvalidPath("Malformed path".into()))?;
+    
     if normalized.to_string_lossy().starts_with("..") {
         return Err(ProxyError::InvalidPath("Path traversal".into()));
     }

@@ -12,13 +12,15 @@ use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tracing::{debug, info, warn};
 
-const LOAD_CONCURRENCY: usize = 64;
+const LOAD_CONCURRENCY: usize = 32;
 
 #[derive(Clone, Copy, Debug)]
 struct CacheEntry { size: u64 }
 
 impl CacheEntry {
-    fn weight(&self) -> u32 { (self.size / 1024).clamp(1, u32::MAX as u64) as u32 }
+    fn weight(&self) -> u32 { 
+        ((self.size / 1024).min(u32::MAX as u64).max(1)) as u32 
+    }
 }
 
 struct TtlPolicy { config: Arc<CacheConfig> }
@@ -148,7 +150,11 @@ impl CacheManager {
     }
 
     pub async fn commit(&self, key: &str, temp_data: PathBuf, meta: &Metadata) -> anyhow::Result<()> {
-        self.index.run_pending_tasks().await;
+        let index_clone = self.index.clone();
+        tokio::spawn(async move {
+            index_clone.run_pending_tasks().await;
+        });
+
         self.storage.put_from_temp_data(key, temp_data, meta).await?;
         self.index.insert(key.to_owned(), CacheEntry { size: meta.size }).await;
         metrics::record_cache_operation("commit");

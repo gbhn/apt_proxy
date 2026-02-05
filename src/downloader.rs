@@ -22,14 +22,15 @@ use tracing::{debug, info, warn};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SIZE: u64 = 2 << 30;
-const BUFFER_SIZE: usize = 64 * 1024;
+const BUFFER_SIZE: usize = 128 * 1024;
+const FOLLOW_TIMEOUT: Duration = Duration::from_secs(30);
 
 const FORWARD_HEADERS: &[axum::http::HeaderName] = &[CONTENT_TYPE, CONTENT_LENGTH, ETAG, LAST_MODIFIED, CACHE_CONTROL];
 
 #[derive(Clone, Debug)]
 enum State {
     Starting,
-    Streaming { written: u64, len: Option<u64>, headers: Arc<axum::http::HeaderMap> },
+    Streaming { written: u64, len: Option<u64> },
     Done { cached: bool },
     Failed(String),
 }
@@ -38,15 +39,19 @@ struct Download {
     tx: watch::Sender<State>,
     rx: watch::Receiver<State>,
     path: PathBuf,
+    headers: Arc<axum::http::HeaderMap>,
 }
 
 impl Download {
     fn new(path: PathBuf) -> Self {
         let (tx, rx) = watch::channel(State::Starting);
-        Self { tx, rx, path }
+        Self { tx, rx, path, headers: Arc::new(axum::http::HeaderMap::new()) }
     }
     fn notify(&self, s: State) { let _ = self.tx.send(s); }
     fn subscribe(&self) -> watch::Receiver<State> { self.rx.clone() }
+    fn set_headers(&mut self, headers: axum::http::HeaderMap) {
+        self.headers = Arc::new(headers);
+    }
 }
 
 #[derive(Clone)]
@@ -98,14 +103,15 @@ impl Downloader {
 
         let dl = Arc::new(Download::new(path.clone()));
 
-        // Atomic insert
         use dashmap::mapref::entry::Entry;
         match self.active.entry(key.to_string()) {
             Entry::Occupied(e) => {
                 metrics::record_coalesced();
                 let existing = e.get().clone();
                 drop(e);
-                let _ = tokio::fs::remove_file(&path).await;
+                tokio::spawn(async move { 
+                    let _ = tokio::fs::remove_file(&path).await; 
+                });
                 return self.follow(key, existing).await;
             }
             Entry::Vacant(v) => { v.insert(dl.clone()); }
@@ -131,8 +137,7 @@ impl Downloader {
         let key = key.as_ref();
         let mut rx = dl.subscribe();
 
-        // Wait for headers
-        let (headers, len) = loop {
+        let len = loop {
             let state = {
                 let borrowed = rx.borrow_and_update();
                 borrowed.clone()
@@ -140,11 +145,13 @@ impl Downloader {
             
             match state {
                 State::Starting => { 
-                    if rx.changed().await.is_err() { 
-                        return Err(ProxyError::download("Cancelled")); 
-                    } 
+                    match tokio::time::timeout(FOLLOW_TIMEOUT, rx.changed()).await {
+                        Ok(Ok(_)) => {},
+                        Ok(Err(_)) => return Err(ProxyError::download("Cancelled")),
+                        Err(_) => return Err(ProxyError::Timeout),
+                    }
                 }
-                State::Streaming { headers, len, .. } => break (headers, len),
+                State::Streaming { len, .. } => break len,
                 State::Done { cached: true } => return self.cache.open(key).await
                     .map(|(f, m)| file_response(f, m))
                     .ok_or_else(|| ProxyError::download("Cache miss after 304")),
@@ -157,7 +164,7 @@ impl Downloader {
 
         let stream = follow_stream(dl.path.clone(), rx);
         let mut resp = Response::new(Body::from_stream(stream));
-        resp.headers_mut().extend((*headers).clone());
+        resp.headers_mut().extend((*dl.headers).clone());
         if let Some(l) = len {
             if let Ok(v) = axum::http::HeaderValue::from_str(&l.to_string()) {
                 resp.headers_mut().insert(CONTENT_LENGTH, v);
@@ -241,7 +248,6 @@ impl Downloader {
             return Err(ProxyError::download("File too large"));
         }
 
-        // Extract headers BEFORE consuming response with bytes_stream()
         let resp_headers = resp.headers().clone();
         let etag = resp_headers.get(http::header::ETAG)
             .and_then(|v| v.to_str().ok())
@@ -251,9 +257,11 @@ impl Downloader {
             .map(String::from);
         
         let headers = filter_headers(&resp_headers);
-        let headers_arc = Arc::new(headers.clone());
+        
+        let dl_mut = unsafe { &mut *(dl as *const Download as *mut Download) };
+        dl_mut.set_headers(headers.clone());
 
-        dl.notify(State::Streaming { written: 0, len: content_len, headers: headers_arc.clone() });
+        dl.notify(State::Streaming { written: 0, len: content_len });
 
         // Now consume the response
         let mut stream = resp.bytes_stream();
@@ -267,7 +275,7 @@ impl Downloader {
             file.write_all(&bytes).await.map_err(ProxyError::Cache)?;
             file.flush().await.map_err(ProxyError::Cache)?;
             
-            dl.notify(State::Streaming { written, len: content_len, headers: headers_arc.clone() });
+            dl.notify(State::Streaming { written, len: content_len });
             metrics::set_download_progress(key, written);
         }
 
@@ -322,19 +330,20 @@ fn follow_stream(path: PathBuf, mut rx: watch::Receiver<State>) -> impl Stream<I
         let mut buf = vec![0u8; BUFFER_SIZE];
 
         loop {
-            // Clone state to release the lock before any await
             let (written, done) = {
-                let state = rx.borrow_and_update().clone();
-                match state {
+                let state = rx.borrow_and_update();
+                match *state {
                     State::Starting => (0, false),
                     State::Streaming { written, .. } => (written, false),
                     State::Done { .. } => (u64::MAX, true),
-                    State::Failed(e) => { yield Err(std::io::Error::other(e)); return; }
+                    State::Failed(ref e) => { 
+                        yield Err(std::io::Error::other(e.clone())); 
+                        return; 
+                    }
                 }
             };
 
             while pos < written {
-                // Calculate read size before borrowing buf
                 let remaining = (written - pos) as usize;
                 let buf_len = buf.len();
                 let to_read = remaining.min(buf_len);

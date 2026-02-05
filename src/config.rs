@@ -24,6 +24,9 @@ pub struct Args {
     pub cache_dir: Option<PathBuf>,
     #[arg(long, env = "APT_CACHER_PROMETHEUS", default_value_t = false)]
     pub prometheus: bool,
+    // FIXED: Bug #14 - Added flag to allow starting without repositories
+    #[arg(long, env = "APT_CACHER_ALLOW_EMPTY", default_value_t = false)]
+    pub allow_empty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -151,8 +154,15 @@ impl Settings {
         if let Some(ref dir) = args.cache_dir { config.cache_dir = Some(dir.clone()); }
         if args.prometheus { config.prometheus = Some(true); }
 
+        // FIXED: Bug #14 - Return error if no repositories configured and not allowed
         if config.repositories.is_empty() {
-            warn!("No repositories configured");
+            if !args.allow_empty {
+                return Err(anyhow::anyhow!(
+                    "No repositories configured. Add repositories to config or use --allow-empty flag."
+                ));
+            } else {
+                warn!("No repositories configured - proxy will reject all requests");
+            }
         }
 
         let cache = Self::build_cache_config(config.cache);

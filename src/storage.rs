@@ -1,6 +1,7 @@
 use crate::metrics;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,10 +22,14 @@ fn now_secs() -> u64 {
 
 fn instance_id() -> u64 {
     *INSTANCE_ID.get_or_init(|| {
-        std::process::id() as u64 ^ SystemTime::now()
+        let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
-            .as_nanos() as u64
+            .as_nanos();
+        let low = nanos as u64;
+        let high = (nanos >> 64) as u64;
+        (std::process::id() as u64).wrapping_mul(6364136223846793005)
+            ^ low.wrapping_add(high)
     })
 }
 
@@ -211,7 +216,7 @@ impl Storage {
         }
 
         if let Err(e) = fs::rename(&temp_meta, &meta_path).await {
-            let _ = fs::remove_file(&data_path).await;
+            warn!(key, error = %e, "Failed to write metadata, data file left as orphan");
             let _ = fs::remove_file(&temp_meta).await;
             return Err(e.into());
         }
@@ -250,7 +255,9 @@ impl Storage {
 
     pub async fn cleanup_orphans(&self) -> Result<usize> {
         let mut stack = vec![self.base.clone()];
-        let mut removed = 0usize;
+        let mut data_files = HashSet::new();
+        let mut meta_files = HashSet::new();
+        let mut all_files = Vec::new();
 
         while let Some(dir) = stack.pop() {
             let mut entries = match fs::read_dir(&dir).await { Ok(e) => e, Err(_) => continue };
@@ -265,16 +272,39 @@ impl Storage {
                     continue;
                 }
 
-                let is_orphan = match path.extension().and_then(|e| e.to_str()) {
-                    Some("json") => !fs::try_exists(path.with_extension("")).await.unwrap_or(true),
-                    None if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.len() == 64) => {
-                        !fs::try_exists(path.with_extension("json")).await.unwrap_or(true)
-                    }
-                    _ => false,
-                };
+                let is_hash_file = path.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.split('.').next().unwrap_or(""))
+                    .is_some_and(|n| n.len() == 64 && n.chars().all(|c| c.is_ascii_hexdigit()));
 
-                if is_orphan {
-                    let _ = fs::remove_file(&path).await;
+                if !is_hash_file {
+                    continue;
+                }
+
+                match path.extension().and_then(|e| e.to_str()) {
+                    Some("json") => {
+                        meta_files.insert(path.with_extension(""));
+                        all_files.push((path, true));
+                    }
+                    None => {
+                        data_files.insert(path.clone());
+                        all_files.push((path, false));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut removed = 0usize;
+        for (path, is_meta) in all_files {
+            let is_orphan = if is_meta {
+                !data_files.contains(&path.with_extension(""))
+            } else {
+                !meta_files.contains(&path)
+            };
+
+            if is_orphan {
+                if let Ok(_) = fs::remove_file(&path).await {
                     removed += 1;
                 }
             }

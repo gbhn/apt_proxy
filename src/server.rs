@@ -1,37 +1,58 @@
+use anyhow::{Context, Result};
 use axum::Router;
 use listenfd::ListenFd;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tracing::info;
 
-pub async fn serve(app: Router, port: u16) -> anyhow::Result<()> {
+/// Starts the HTTP server with graceful shutdown support
+pub async fn serve(app: Router, port: u16) -> Result<()> {
     let listener = create_listener(port).await?;
-    info!(addr = %listener.local_addr()?, "Server listening");
+
+    let local_addr = listener
+        .local_addr()
+        .context("Failed to get local address")?;
+
+    info!(addr = %local_addr, "Server listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await
+        .context("Server error")?;
 
     info!("Server stopped gracefully");
     Ok(())
 }
 
-async fn create_listener(port: u16) -> anyhow::Result<TcpListener> {
+/// Creates a TCP listener, preferring systemd socket activation
+async fn create_listener(port: u16) -> Result<TcpListener> {
     // Try systemd socket activation first
-    if let Some(std_listener) = ListenFd::from_env().take_tcp_listener(0)? {
-        std_listener.set_nonblocking(true)?;
+    if let Some(std_listener) = ListenFd::from_env()
+        .take_tcp_listener(0)
+        .context("Failed to take systemd socket")?
+    {
+        std_listener
+            .set_nonblocking(true)
+            .context("Failed to set socket non-blocking")?;
         info!("Using systemd socket activation");
-        return Ok(TcpListener::from_std(std_listener)?);
+        return TcpListener::from_std(std_listener).context("Failed to convert socket");
     }
 
     // Fall back to binding directly
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!(%addr, "Binding to address");
-    Ok(TcpListener::bind(addr).await?)
+    TcpListener::bind(addr)
+        .await
+        .context("Failed to bind to address")
 }
 
+/// Waits for shutdown signals (Ctrl+C or SIGTERM)
 async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
 
     #[cfg(unix)]
     let terminate = async {
@@ -45,9 +66,7 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => info!("Received Ctrl+C"),
-        _ = terminate => info!("Received SIGTERM"),
+        _ = ctrl_c => info!("Received Ctrl+C, shutting down..."),
+        _ = terminate => info!("Received SIGTERM, shutting down..."),
     }
-
-    info!("Initiating graceful shutdown...");
 }

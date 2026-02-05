@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use bytesize::ByteSize;
 use clap::Parser;
 use figment::{
@@ -9,13 +10,18 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 use tracing::{info, warn};
 
-const DEFAULT_PORT: u16 = 3142;
-const DEFAULT_PROMETHEUS_PORT: u16 = 9090;
-const DEFAULT_MAX_CACHE_SIZE: u64 = 10 << 30; // 10 GB
+/// Default configuration values
+mod defaults {
+    use std::time::Duration;
 
-const DEFAULT_TTL_SECS: u64 = 86400;      // 1 day
-const DEFAULT_MIN_TTL_SECS: u64 = 3600;   // 1 hour
-const DEFAULT_MAX_TTL_SECS: u64 = 604800; // 7 days
+    pub const PORT: u16 = 3142;
+    pub const PROMETHEUS_PORT: u16 = 9090;
+    pub const MAX_CACHE_SIZE: u64 = 10 << 30; // 10 GB
+
+    pub const TTL: Duration = Duration::from_secs(86400);      // 1 day
+    pub const MIN_TTL: Duration = Duration::from_secs(3600);   // 1 hour
+    pub const MAX_TTL: Duration = Duration::from_secs(604800); // 7 days
+}
 
 #[derive(Parser, Clone, Debug)]
 #[command(author, version, about = "High-performance APT caching proxy")]
@@ -41,41 +47,53 @@ pub struct Args {
     pub prometheus_port: Option<u16>,
 }
 
+/// Compiled TTL rule with validated regex pattern
+#[derive(Debug, Clone)]
+pub struct CompiledTtlRule {
+    pub pattern: Regex,
+    pub ttl: Duration,
+}
+
+/// Raw TTL rule from configuration file
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TtlRule {
     pub pattern: String,
     #[serde(with = "humantime_serde")]
     pub ttl: Duration,
-    #[serde(skip)]
-    regex: Option<Regex>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+impl TtlRule {
+    /// Attempts to compile the pattern into a regex
+    fn compile(&self) -> Option<CompiledTtlRule> {
+        match Regex::new(&self.pattern) {
+            Ok(regex) => Some(CompiledTtlRule {
+                pattern: regex,
+                ttl: self.ttl,
+            }),
+            Err(e) => {
+                warn!(pattern = %self.pattern, error = %e, "Invalid TTL pattern, skipping");
+                None
+            }
+        }
+    }
+}
+
+/// Cache configuration with TTL policies
+#[derive(Debug, Clone)]
 pub struct CacheConfig {
-    #[serde(default = "default_ttl", with = "humantime_serde")]
     pub default_ttl: Duration,
-
-    #[serde(default = "default_min_ttl", with = "humantime_serde")]
     pub min_ttl: Duration,
-
-    #[serde(default = "default_max_ttl", with = "humantime_serde")]
     pub max_ttl: Duration,
-
-    #[serde(default)]
-    pub ttl_rules: Vec<TtlRule>,
+    compiled_rules: Vec<CompiledTtlRule>,
 }
-
-fn default_ttl() -> Duration { Duration::from_secs(DEFAULT_TTL_SECS) }
-fn default_min_ttl() -> Duration { Duration::from_secs(DEFAULT_MIN_TTL_SECS) }
-fn default_max_ttl() -> Duration { Duration::from_secs(DEFAULT_MAX_TTL_SECS) }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            default_ttl: default_ttl(),
-            min_ttl: default_min_ttl(),
-            max_ttl: default_max_ttl(),
-            ttl_rules: Vec::new(),
+            default_ttl: defaults::TTL,
+            min_ttl: defaults::MIN_TTL,
+            max_ttl: defaults::MAX_TTL,
+            compiled_rules: Vec::new(),
         }
     }
 }
@@ -83,36 +101,66 @@ impl Default for CacheConfig {
 impl CacheConfig {
     /// Returns TTL for a path, clamped to min/max bounds
     pub fn ttl_for(&self, path: &str) -> u64 {
-        let ttl = self.ttl_rules
+        let ttl = self
+            .compiled_rules
             .iter()
-            .find(|rule| rule.regex.as_ref().is_some_and(|re| re.is_match(path)))
+            .find(|rule| rule.pattern.is_match(path))
             .map(|rule| rule.ttl.as_secs())
             .unwrap_or(self.default_ttl.as_secs());
 
         ttl.clamp(self.min_ttl.as_secs(), self.max_ttl.as_secs())
     }
 
-    /// Compiles regex patterns, removing invalid ones
-    pub fn compile_patterns(&mut self) {
-        self.ttl_rules.retain_mut(|rule| {
-            match Regex::new(&rule.pattern) {
-                Ok(re) => {
-                    rule.regex = Some(re);
-                    true
-                }
-                Err(e) => {
-                    warn!(pattern = %rule.pattern, error = %e, "Invalid TTL pattern");
-                    false
-                }
-            }
-        });
-    }
+    /// Creates a new CacheConfig from raw configuration
+    fn from_raw(raw: RawCacheConfig) -> Self {
+        let mut config = Self {
+            default_ttl: raw.default_ttl,
+            min_ttl: raw.min_ttl,
+            max_ttl: raw.max_ttl,
+            compiled_rules: raw.ttl_rules.iter().filter_map(TtlRule::compile).collect(),
+        };
 
-    /// Ensures min_ttl <= max_ttl
-    pub fn validate(&mut self) {
-        if self.min_ttl > self.max_ttl {
-            warn!(min = ?self.min_ttl, max = ?self.max_ttl, "min_ttl > max_ttl; swapping");
-            std::mem::swap(&mut self.min_ttl, &mut self.max_ttl);
+        // Ensure min_ttl <= max_ttl
+        if config.min_ttl > config.max_ttl {
+            warn!(
+                min = ?config.min_ttl,
+                max = ?config.max_ttl,
+                "min_ttl > max_ttl; swapping"
+            );
+            std::mem::swap(&mut config.min_ttl, &mut config.max_ttl);
+        }
+
+        config
+    }
+}
+
+/// Raw cache config for deserialization
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RawCacheConfig {
+    #[serde(default = "default_ttl", with = "humantime_serde")]
+    default_ttl: Duration,
+
+    #[serde(default = "default_min_ttl", with = "humantime_serde")]
+    min_ttl: Duration,
+
+    #[serde(default = "default_max_ttl", with = "humantime_serde")]
+    max_ttl: Duration,
+
+    #[serde(default)]
+    ttl_rules: Vec<TtlRule>,
+}
+
+fn default_ttl() -> Duration { defaults::TTL }
+fn default_min_ttl() -> Duration { defaults::MIN_TTL }
+fn default_max_ttl() -> Duration { defaults::MAX_TTL }
+
+impl Default for RawCacheConfig {
+    fn default() -> Self {
+        Self {
+            default_ttl: defaults::TTL,
+            min_ttl: defaults::MIN_TTL,
+            max_ttl: defaults::MAX_TTL,
+            ttl_rules: Vec::new(),
         }
     }
 }
@@ -124,11 +172,12 @@ struct ConfigFile {
     cache_dir: Option<PathBuf>,
     max_cache_size: Option<ByteSize>,
     #[serde(default)]
-    cache: CacheConfig,
+    cache: RawCacheConfig,
     prometheus: Option<bool>,
     prometheus_port: Option<u16>,
 }
 
+/// Application settings with validated configuration
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub port: u16,
@@ -141,9 +190,13 @@ pub struct Settings {
 }
 
 impl Settings {
-    const CONFIG_PATHS: &'static [&'static str] = &["/etc/apt-cacher/config.yaml", "./config.yaml"];
+    const CONFIG_PATHS: &'static [&'static str] = &[
+        "/etc/apt-cacher/config.yaml",
+        "./config.yaml",
+    ];
 
-    pub fn load(args: Args) -> anyhow::Result<Self> {
+    /// Loads settings from config file, environment, and CLI args
+    pub fn load(args: Args) -> Result<Self> {
         let config_path = args.config.clone().or_else(|| {
             Self::CONFIG_PATHS.iter().map(PathBuf::from).find(|p| p.exists())
         });
@@ -157,27 +210,28 @@ impl Settings {
 
         figment = figment.merge(Env::prefixed("APT_CACHER_").split("__"));
 
-        let mut config: ConfigFile = figment.extract()?;
+        let mut config: ConfigFile = figment
+            .extract()
+            .context("Failed to parse configuration")?;
 
         // CLI args override config file
         Self::apply_args(&mut config, &args);
-
-        // Validate and compile
-        config.cache.compile_patterns();
-        config.cache.validate();
 
         if config.repositories.is_empty() {
             warn!("No repositories configured");
         }
 
         Ok(Self {
-            port: config.port.unwrap_or(DEFAULT_PORT),
+            port: config.port.unwrap_or(defaults::PORT),
             repositories: config.repositories,
             cache_dir: config.cache_dir.unwrap_or_else(|| "./apt_cache".into()),
-            max_cache_size: config.max_cache_size.map(|b| b.as_u64()).unwrap_or(DEFAULT_MAX_CACHE_SIZE),
-            cache: config.cache,
+            max_cache_size: config
+                .max_cache_size
+                .map(|b| b.as_u64())
+                .unwrap_or(defaults::MAX_CACHE_SIZE),
+            cache: CacheConfig::from_raw(config.cache),
             prometheus: config.prometheus.unwrap_or(false),
-            prometheus_port: config.prometheus_port.unwrap_or(DEFAULT_PROMETHEUS_PORT),
+            prometheus_port: config.prometheus_port.unwrap_or(defaults::PROMETHEUS_PORT),
         })
     }
 

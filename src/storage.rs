@@ -1,39 +1,50 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
+/// Hash prefix length for directory sharding (2 hex chars = 256 buckets)
+const HASH_PREFIX_LEN: usize = 2;
+
 static INSTANCE_ID: OnceLock<u64> = OnceLock::new();
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Time utilities
+mod time {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    pub fn now_nanos() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos() as u64
+    }
+
+    pub fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs()
+    }
+}
+
 /// Generates a unique instance ID based on PID and timestamp
 fn instance_id() -> u64 {
-    *INSTANCE_ID.get_or_init(|| {
-        std::process::id() as u64 ^ now_nanos()
-    })
+    *INSTANCE_ID.get_or_init(|| std::process::id() as u64 ^ time::now_nanos())
 }
 
-fn now_nanos() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
+/// Generates a unique identifier for temp files
 fn unique_id() -> String {
-    format!("{:016x}_{:016x}", instance_id(), COUNTER.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "{:016x}_{:016x}",
+        instance_id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// File metadata stored alongside cached data
@@ -45,41 +56,77 @@ pub struct Metadata {
     pub key: String,
     pub stored_at: u64,
     pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_modified: Option<String>,
 }
 
 impl Metadata {
     /// Returns age in seconds since stored
+    #[inline]
     pub fn age(&self) -> u64 {
-        now_secs().saturating_sub(self.stored_at)
+        time::now_secs().saturating_sub(self.stored_at)
+    }
+
+    /// Creates new metadata with current timestamp
+    pub fn new(
+        key: impl Into<String>,
+        url: impl Into<String>,
+        size: u64,
+        headers: axum::http::HeaderMap,
+    ) -> Self {
+        Self {
+            headers,
+            url: url.into(),
+            key: key.into(),
+            stored_at: time::now_secs(),
+            size,
+            etag: None,
+            last_modified: None,
+        }
+    }
+
+    /// Sets conditional request headers from response
+    pub fn with_conditionals(
+        mut self,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    ) -> Self {
+        self.etag = etag;
+        self.last_modified = last_modified;
+        self
     }
 }
 
 /// RAII guard for temporary files cleanup on error
 struct TempGuard {
     paths: Vec<PathBuf>,
-    disarmed: bool,
+    committed: bool,
 }
 
 impl TempGuard {
     fn new() -> Self {
-        Self { paths: Vec::with_capacity(2), disarmed: false }
+        Self {
+            paths: Vec::with_capacity(2),
+            committed: false,
+        }
     }
 
     fn track(&mut self, path: PathBuf) {
         self.paths.push(path);
     }
 
-    fn disarm(mut self) {
-        self.disarmed = true;
+    fn commit(mut self) {
+        self.committed = true;
     }
 }
 
 impl Drop for TempGuard {
     fn drop(&mut self) {
-        if !self.disarmed {
+        if !self.committed {
             for path in &self.paths {
+                // Use blocking remove since we're in Drop
                 let _ = std::fs::remove_file(path);
             }
         }
@@ -94,23 +141,29 @@ pub struct Storage {
 }
 
 impl Storage {
-    const HASH_PREFIX_LEN: usize = 2;
-
+    /// Creates a new storage instance at the given base path
     pub async fn new(base: PathBuf) -> Result<Self> {
         let temp = base.join(".tmp");
-        fs::create_dir_all(&base).await?;
-        fs::create_dir_all(&temp).await?;
+
+        fs::create_dir_all(&base)
+            .await
+            .with_context(|| format!("Failed to create cache directory: {}", base.display()))?;
+
+        fs::create_dir_all(&temp)
+            .await
+            .with_context(|| format!("Failed to create temp directory: {}", temp.display()))?;
+
         debug!(path = %base.display(), "Storage initialized");
         Ok(Self { base, temp })
     }
 
-    /// Computes content-addressed path for a key
+    /// Computes content-addressed path for a key using BLAKE3 hash
     fn data_path(&self, key: &str) -> PathBuf {
         let hash = blake3::hash(key.as_bytes()).to_hex();
         let h = hash.as_str();
         self.base
-            .join(&h[..Self::HASH_PREFIX_LEN])
-            .join(&h[Self::HASH_PREFIX_LEN..Self::HASH_PREFIX_LEN * 2])
+            .join(&h[..HASH_PREFIX_LEN])
+            .join(&h[HASH_PREFIX_LEN..HASH_PREFIX_LEN * 2])
             .join(h)
     }
 
@@ -129,13 +182,19 @@ impl Storage {
         let mut entries = match fs::read_dir(&self.temp).await {
             Ok(e) => e,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e).context("Failed to read temp directory"),
         };
 
+        let mut cleaned = 0u32;
         while let Ok(Some(entry)) = entries.next_entry().await {
-            let _ = fs::remove_file(entry.path()).await;
+            if fs::remove_file(entry.path()).await.is_ok() {
+                cleaned += 1;
+            }
         }
-        debug!("Temp directory cleaned");
+
+        if cleaned > 0 {
+            debug!(count = cleaned, "Cleaned temp files");
+        }
         Ok(())
     }
 
@@ -152,14 +211,13 @@ impl Storage {
 
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
-                let Ok(ft) = entry.file_type().await else { continue };
+                let Ok(ft) = entry.file_type().await else {
+                    continue;
+                };
 
                 if ft.is_dir() {
-                    // Skip hidden directories
-                    let dominated = path
-                        .file_name()
-                        .is_some_and(|n| n.to_string_lossy().starts_with('.'));
-                    if !dominated {
+                    // Skip hidden directories (e.g., .tmp)
+                    if !is_hidden_path(&path) {
                         stack.push(path);
                     }
                 } else if path.extension().is_some_and(|e| e == "json") {
@@ -172,7 +230,7 @@ impl Storage {
     }
 
     /// Reads metadata from a specific path
-    pub async fn read_metadata_from_path(&self, path: &PathBuf) -> Result<Option<Metadata>> {
+    pub async fn read_metadata_from_path(&self, path: &Path) -> Result<Option<Metadata>> {
         match self.read_json(path).await {
             Ok(meta) => Ok(Some(meta)),
             Err(e) if is_not_found(&e) => Ok(None),
@@ -181,14 +239,16 @@ impl Storage {
                 let _ = fs::remove_file(path).await;
                 Ok(None)
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e).context("Failed to read metadata"),
         }
     }
 
     /// Creates a new temporary file for writing
     pub async fn create_temp_data(&self) -> Result<(PathBuf, File)> {
         let path = self.temp_path("data");
-        let file = File::create(&path).await?;
+        let file = File::create(&path)
+            .await
+            .with_context(|| format!("Failed to create temp file: {}", path.display()))?;
         Ok((path, file))
     }
 
@@ -205,7 +265,7 @@ impl Storage {
                 let _ = self.delete(key).await;
                 return Ok(None);
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e).context("Failed to read metadata"),
         };
 
         // Verify data file exists and matches expected size
@@ -216,11 +276,16 @@ impl Storage {
                 let _ = fs::remove_file(&meta_path).await;
                 return Ok(None);
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e).context("Failed to stat data file"),
         };
 
         if data_size != meta.size {
-            warn!(key, expected = meta.size, actual = data_size, "Size mismatch, removing");
+            warn!(
+                key,
+                expected = meta.size,
+                actual = data_size,
+                "Size mismatch, removing"
+            );
             let _ = self.delete(key).await;
             return Ok(None);
         }
@@ -228,7 +293,7 @@ impl Storage {
         match File::open(&data_path).await {
             Ok(file) => Ok(Some((file, meta))),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e).context("Failed to open data file"),
         }
     }
 
@@ -242,17 +307,24 @@ impl Storage {
                 let _ = self.delete(key).await;
                 Ok(None)
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e).context("Failed to read metadata"),
         }
     }
 
     /// Commits a temporary data file to permanent storage
-    pub async fn put_from_temp_data(&self, key: &str, temp_data: PathBuf, meta: &Metadata) -> Result<u64> {
+    pub async fn put_from_temp_data(
+        &self,
+        key: &str,
+        temp_data: PathBuf,
+        meta: &Metadata,
+    ) -> Result<u64> {
         let data_path = self.data_path(key);
         let meta_path = self.meta_path(key);
 
         if let Some(parent) = data_path.parent() {
-            fs::create_dir_all(parent).await?;
+            fs::create_dir_all(parent)
+                .await
+                .context("Failed to create cache subdirectory")?;
         }
 
         let mut guard = TempGuard::new();
@@ -260,18 +332,24 @@ impl Storage {
         // Write metadata to temp file first
         let temp_meta = self.temp_path("json");
         guard.track(temp_meta.clone());
-        self.write_json(&temp_meta, meta).await?;
+        self.write_json(&temp_meta, meta)
+            .await
+            .context("Failed to write metadata")?;
 
         // Atomic rename both files
-        fs::rename(&temp_data, &data_path).await?;
-        fs::rename(&temp_meta, &meta_path).await?;
+        fs::rename(&temp_data, &data_path)
+            .await
+            .context("Failed to commit data file")?;
+        fs::rename(&temp_meta, &meta_path)
+            .await
+            .context("Failed to commit metadata")?;
 
-        guard.disarm();
+        guard.commit();
         debug!(key, size = meta.size, "Cached");
         Ok(meta.size)
     }
 
-    /// Updates the stored_at timestamp for a key
+    /// Updates the stored_at timestamp for a key (for 304 responses)
     pub async fn touch(&self, key: &str) -> Result<bool> {
         let meta_path = self.meta_path(key);
 
@@ -281,7 +359,7 @@ impl Storage {
             Err(_) => return Ok(false),
         };
 
-        meta.stored_at = now_secs();
+        meta.stored_at = time::now_secs();
 
         let mut guard = TempGuard::new();
         let temp_meta = self.temp_path("json");
@@ -290,16 +368,20 @@ impl Storage {
         self.write_json(&temp_meta, &meta).await?;
         fs::rename(&temp_meta, &meta_path).await?;
 
-        guard.disarm();
+        guard.commit();
         debug!(key, "Touched");
         Ok(true)
     }
 
     /// Deletes both data and metadata files for a key
     pub async fn delete(&self, key: &str) -> Result<()> {
-        let _ = fs::remove_file(self.data_path(key)).await;
-        let _ = fs::remove_file(self.meta_path(key)).await;
-        debug!(key, "Deleted");
+        let data_result = fs::remove_file(self.data_path(key)).await;
+        let meta_result = fs::remove_file(self.meta_path(key)).await;
+
+        // Only log if at least one file existed
+        if data_result.is_ok() || meta_result.is_ok() {
+            debug!(key, "Deleted");
+        }
         Ok(())
     }
 
@@ -316,10 +398,12 @@ impl Storage {
 
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
-                let Ok(ft) = entry.file_type().await else { continue };
+                let Ok(ft) = entry.file_type().await else {
+                    continue;
+                };
 
                 if ft.is_dir() {
-                    if !path.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
+                    if !is_hidden_path(&path) {
                         stack.push(path);
                     }
                     continue;
@@ -341,12 +425,12 @@ impl Storage {
 
     // ========== Private Helpers ==========
 
-    async fn read_json<T: serde::de::DeserializeOwned>(&self, path: &PathBuf) -> Result<T> {
+    async fn read_json<T: serde::de::DeserializeOwned>(&self, path: &Path) -> Result<T> {
         let bytes = fs::read(path).await?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 
-    async fn write_json<T: serde::Serialize>(&self, path: &PathBuf, data: &T) -> Result<()> {
+    async fn write_json<T: serde::Serialize>(&self, path: &Path, data: &T) -> Result<()> {
         let json = serde_json::to_vec(data)?;
         let mut file = File::create(path).await?;
         file.write_all(&json).await?;
@@ -354,26 +438,40 @@ impl Storage {
         Ok(())
     }
 
-    async fn is_orphan(&self, path: &PathBuf) -> bool {
+    async fn is_orphan(&self, path: &Path) -> bool {
         let ext = path.extension().and_then(|e| e.to_str());
 
         match ext {
             Some("json") => {
-                // Metadata without data file
-                !fs::try_exists(path.with_extension("")).await.unwrap_or(true)
+                // Metadata file - check if data file exists
+                let data_path = path.with_extension("");
+                !fs::try_exists(&data_path).await.unwrap_or(true)
             }
             None => {
-                // Data file - check if it looks like a hash
-                let is_hash = path
+                // Data file - verify it's a valid hash and check for metadata
+                let is_valid_hash = path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.len() == 64 && n.chars().all(|c| c.is_ascii_hexdigit()));
 
-                is_hash && !fs::try_exists(path.with_extension("json")).await.unwrap_or(true)
+                if !is_valid_hash {
+                    return false;
+                }
+
+                let meta_path = path.with_extension("json");
+                !fs::try_exists(&meta_path).await.unwrap_or(true)
             }
             _ => false,
         }
     }
+}
+
+// ========== Helper Functions ==========
+
+fn is_hidden_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('.'))
 }
 
 fn is_not_found(e: &anyhow::Error) -> bool {

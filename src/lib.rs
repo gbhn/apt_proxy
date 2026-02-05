@@ -19,9 +19,9 @@ use downloader::Downloader;
 use error::{ProxyError, Result};
 use percent_encoding::percent_decode_str;
 use std::sync::Arc;
-use std::time::Instant;
-use tower::ServiceBuilder;
+use std::time::{Duration, Instant};
 use tower::limit::ConcurrencyLimitLayer;
+use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
 use tracing::{info, warn};
 
@@ -35,6 +35,16 @@ impl App {
         let storage = Arc::new(storage::Storage::new(settings.cache_dir.clone()).await?);
         let cache_config = Arc::new(settings.cache.clone());
         let cache = CacheManager::new(storage, cache_config, settings.max_cache_size).await?;
+
+        let cache_maintenance = cache.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                cache_maintenance.run_maintenance().await;
+            }
+        });
+
         let downloader = Downloader::new(cache);
 
         Ok(Self { settings, downloader })
@@ -90,10 +100,7 @@ async fn metrics_handler() -> impl IntoResponse {
     }
 }
 
-async fn proxy_handler(
-    Path(path): Path<String>,
-    State(app): State<Arc<App>>,
-) -> Result<Response> {
+async fn proxy_handler(Path(path): Path<String>, State(app): State<Arc<App>>) -> Result<Response> {
     validate_path(&path)?;
 
     let url = app.resolve_url(&path).ok_or(ProxyError::RepositoryNotFound)?;
@@ -101,66 +108,65 @@ async fn proxy_handler(
 }
 
 fn validate_path(path: &str) -> Result<()> {
-    // Length check on raw path
     if path.is_empty() || path.len() > 2048 {
         return Err(ProxyError::InvalidPath("Invalid length".into()));
     }
 
-    // Decode percent-encoding for security checks
+    if !path.contains('/') {
+        return Err(ProxyError::InvalidPath(
+            "Missing repository prefix".into(),
+        ));
+    }
+
     let decoded = percent_decode_str(path)
         .decode_utf8()
         .map_err(|_| ProxyError::InvalidPath("Invalid UTF-8 encoding".into()))?;
 
-    // Check for null bytes
     if decoded.contains('\0') {
         return Err(ProxyError::InvalidPath("Null byte not allowed".into()));
     }
 
-    // Check for backslashes (Windows path separator)
     if decoded.contains('\\') {
         return Err(ProxyError::InvalidPath("Backslashes not allowed".into()));
     }
 
-    // Check for absolute paths
     if decoded.starts_with('/') {
         return Err(ProxyError::InvalidPath("Absolute path not allowed".into()));
     }
 
-    // Check for double slashes
     if decoded.contains("//") {
         return Err(ProxyError::InvalidPath("Double slashes not allowed".into()));
     }
 
-    // Check each path component for traversal attempts
     for component in decoded.split('/') {
-        // Empty components are already caught by // check above, but be safe
         if component.is_empty() {
             continue;
         }
 
-        // Block . and .. explicitly
         if component == "." || component == ".." {
-            return Err(ProxyError::InvalidPath("Path traversal not allowed".into()));
+            return Err(ProxyError::InvalidPath(
+                "Path traversal not allowed".into(),
+            ));
         }
 
-        // Block hidden files except .well-known
         if component.starts_with('.') && component != ".well-known" {
             return Err(ProxyError::InvalidPath("Hidden files not allowed".into()));
         }
     }
 
-    // Final check: normalize path and verify no traversal
     let normalized = path_clean::PathClean::clean(std::path::Path::new(decoded.as_ref()));
     let normalized_str = normalized.to_string_lossy();
 
-    // Check if normalized path escapes
     if normalized_str.starts_with("..") {
-        return Err(ProxyError::InvalidPath("Path traversal detected".into()));
+        return Err(ProxyError::InvalidPath(
+            "Path traversal detected".into(),
+        ));
     }
 
-    // Also check the normalized path doesn't start with /
     if normalized_str.starts_with('/') || normalized_str.starts_with('\\') {
-        return Err(ProxyError::InvalidPath("Path traversal detected".into()));
+        return Err(ProxyError::InvalidPath(
+            "Path traversal detected".into(),
+        ));
     }
 
     Ok(())

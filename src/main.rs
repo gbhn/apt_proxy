@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let settings = Settings::load(args).await?;
+    let settings = Settings::load(args)?;
 
     info!(
         port = settings.port,

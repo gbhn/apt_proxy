@@ -129,7 +129,7 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub async fn load(args: Args) -> anyhow::Result<Self> {
+    pub fn load(args: Args) -> anyhow::Result<Self> {
         let config_path = args.config.clone().or_else(|| {
             ["/etc/apt-cacher/config.yaml", "./config.yaml"]
                 .iter()
@@ -163,6 +163,15 @@ impl Settings {
 
         config.cache.compile_patterns();
 
+        if config.cache.min_ttl > config.cache.max_ttl {
+            warn!(
+                min = ?config.cache.min_ttl,
+                max = ?config.cache.max_ttl,
+                "cache.min_ttl > cache.max_ttl; swapping"
+            );
+            std::mem::swap(&mut config.cache.min_ttl, &mut config.cache.max_ttl);
+        }
+
         if config.repositories.is_empty() {
             warn!("No repositories configured");
         }
@@ -171,7 +180,10 @@ impl Settings {
             port: config.port.unwrap_or(3142),
             repositories: config.repositories,
             cache_dir: config.cache_dir.unwrap_or_else(|| "./apt_cache".into()),
-            max_cache_size: config.max_cache_size.map(|b| b.as_u64()).unwrap_or(10 << 30),
+            max_cache_size: config
+                .max_cache_size
+                .map(|b| b.as_u64())
+                .unwrap_or(10 << 30),
             cache: config.cache,
             prometheus: config.prometheus.unwrap_or(false),
             prometheus_port: config.prometheus_port.unwrap_or(9090),

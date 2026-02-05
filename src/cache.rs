@@ -1,9 +1,12 @@
 use crate::config::CacheConfig;
 use crate::storage::{Metadata, Storage};
 use moka::future::Cache;
+use moka::notification::RemovalCause;
 use moka::Expiry;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::fs::File;
 use tracing::info;
 
 #[derive(Clone)]
@@ -21,10 +24,10 @@ impl TtlExpiry {
     }
 }
 
-impl Expiry<Arc<str>, Entry> for TtlExpiry {
+impl Expiry<String, Entry> for TtlExpiry {
     fn expire_after_create(
         &self,
-        key: &Arc<str>,
+        key: &String,
         _value: &Entry,
         _current_time: Instant,
     ) -> Option<Duration> {
@@ -33,7 +36,7 @@ impl Expiry<Arc<str>, Entry> for TtlExpiry {
 
     fn expire_after_update(
         &self,
-        key: &Arc<str>,
+        key: &String,
         _value: &Entry,
         _current_time: Instant,
         _current_duration: Option<Duration>,
@@ -43,7 +46,7 @@ impl Expiry<Arc<str>, Entry> for TtlExpiry {
 
     fn expire_after_read(
         &self,
-        _key: &Arc<str>,
+        _key: &String,
         _value: &Entry,
         _current_time: Instant,
         duration: Option<Duration>,
@@ -56,7 +59,7 @@ impl Expiry<Arc<str>, Entry> for TtlExpiry {
 #[derive(Clone)]
 pub struct CacheManager {
     storage: Arc<Storage>,
-    index: Cache<Arc<str>, Entry>,
+    index: Cache<String, Entry>,
 }
 
 impl CacheManager {
@@ -67,16 +70,26 @@ impl CacheManager {
     ) -> anyhow::Result<Self> {
         storage.cleanup().await?;
 
-        // Ensure minimum capacity of 1KB
         let max_capacity_kb = (max_size / 1024).max(1);
 
-        let index: Cache<Arc<str>, Entry> = Cache::builder()
+        let storage_for_listener = storage.clone();
+        let index: Cache<String, Entry> = Cache::builder()
             .max_capacity(max_capacity_kb)
             .weigher(|_, e: &Entry| {
                 let size_kb = e.size / 1024;
                 size_kb.max(1).min(u32::MAX as u64) as u32
             })
             .expire_after(TtlExpiry::new(config.clone()))
+            .eviction_listener(move |k: Arc<String>, _v: Entry, cause: RemovalCause| {
+                if !matches!(cause, RemovalCause::Expired | RemovalCause::Size) {
+                    return;
+                }
+                let storage = storage_for_listener.clone();
+                let key = k.as_str().to_owned();
+                tokio::spawn(async move {
+                    let _ = storage.delete(&key).await;
+                });
+            })
             .build();
 
         let entries = storage.list().await?;
@@ -89,9 +102,7 @@ impl CacheManager {
             let age = meta.age();
 
             if age < ttl {
-                index
-                    .insert(Arc::from(key.as_str()), Entry { size: meta.size })
-                    .await;
+                index.insert(key.clone(), Entry { size: meta.size }).await;
                 total += meta.size;
                 loaded += 1;
             } else {
@@ -110,25 +121,19 @@ impl CacheManager {
         Ok(Self { storage, index })
     }
 
-    pub async fn get(&self, key: &str) -> Option<(Vec<u8>, Metadata)> {
-        let key_arc = Arc::from(key);
-
-        // Check index first for fast path
-        if self.index.get(&key_arc).await.is_none() {
+    pub async fn open(&self, key: &str) -> Option<(File, Metadata)> {
+        if self.index.get(key).await.is_none() {
             return None;
         }
 
-        // Fetch from storage - handle race condition gracefully
-        match self.storage.get(key).await {
-            Ok(Some(result)) => Some(result),
+        match self.storage.open(key).await {
+            Ok(Some(v)) => Some(v),
             Ok(None) => {
-                // Storage doesn't have it, remove from index
-                self.index.invalidate(&key_arc).await;
+                self.index.invalidate(key).await;
                 None
             }
             Err(_) => {
-                // Error reading, invalidate to be safe
-                self.index.invalidate(&key_arc).await;
+                self.index.invalidate(key).await;
                 None
             }
         }
@@ -138,10 +143,19 @@ impl CacheManager {
         self.storage.get_metadata(key).await.ok().flatten()
     }
 
-    pub async fn put(&self, key: &str, data: &[u8], meta: &Metadata) -> anyhow::Result<()> {
-        self.storage.put(key, data, meta).await?;
+    pub async fn create_temp_data(&self) -> anyhow::Result<(PathBuf, File)> {
+        Ok(self.storage.create_temp_data().await?)
+    }
+
+    pub async fn commit_temp_data(
+        &self,
+        key: &str,
+        temp_data: PathBuf,
+        meta: &Metadata,
+    ) -> anyhow::Result<()> {
+        self.storage.put_from_temp_data(key, temp_data, meta).await?;
         self.index
-            .insert(Arc::from(key), Entry { size: meta.size })
+            .insert(key.to_owned(), Entry { size: meta.size })
             .await;
         Ok(())
     }
@@ -149,10 +163,9 @@ impl CacheManager {
     pub async fn touch(&self, key: &str) -> anyhow::Result<bool> {
         let touched = self.storage.touch(key).await?;
         if touched {
-            // Re-insert to reset TTL in the index
             if let Some(meta) = self.storage.get_metadata(key).await.ok().flatten() {
                 self.index
-                    .insert(Arc::from(key), Entry { size: meta.size })
+                    .insert(key.to_owned(), Entry { size: meta.size })
                     .await;
             }
         }

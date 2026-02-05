@@ -20,7 +20,8 @@ use error::{ProxyError, Result};
 use std::sync::Arc;
 use std::time::Instant;
 use tower::ServiceBuilder;
-use tower_http::{catch_panic::CatchPanicLayer, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::catch_panic::CatchPanicLayer;
 use tracing::{info, warn};
 
 pub struct App {
@@ -54,8 +55,7 @@ pub fn router(app: Arc<App>) -> Router {
         .layer(
             ServiceBuilder::new()
                 .layer(CatchPanicLayer::new())
-                .layer(ConcurrencyLimitLayer::new(1000))
-                .layer(TimeoutLayer::new(std::time::Duration::from_secs(300))),
+                .layer(ConcurrencyLimitLayer::new(1000)),
         )
         .layer(middleware::from_fn(logging_middleware))
         .with_state(app)
@@ -68,12 +68,12 @@ async fn logging_middleware(req: axum::extract::Request, next: Next) -> Response
     let resp = next.run(req).await;
 
     let status = resp.status().as_u16();
-    let elapsed = start.elapsed();
+    let ms = start.elapsed().as_millis();
 
     if status < 400 {
-        info!(status, path, time_ms = elapsed.as_millis(), "Request");
+        info!(status, path, ms, "");
     } else {
-        warn!(status, path, time_ms = elapsed.as_millis(), "Request");
+        warn!(status, path, ms, "");
     }
 
     resp
@@ -84,7 +84,7 @@ async fn metrics_handler() -> impl IntoResponse {
         Some(m) => ([(axum::http::header::CONTENT_TYPE, "text/plain")], m),
         None => (
             [(axum::http::header::CONTENT_TYPE, "text/plain")],
-            "# Prometheus not enabled\n".to_string(),
+            "# Prometheus disabled\n".to_string(),
         ),
     }
 }
@@ -105,12 +105,12 @@ fn validate_path(path: &str) -> Result<()> {
     }
 
     if memchr::memchr(0, path.as_bytes()).is_some() {
-        return Err(ProxyError::InvalidPath("Null byte in path".into()));
+        return Err(ProxyError::InvalidPath("Null byte".into()));
     }
 
     let clean = path_clean::PathClean::clean(std::path::Path::new(path));
     if clean.to_string_lossy().starts_with("..") {
-        return Err(ProxyError::InvalidPath("Path traversal attempt".into()));
+        return Err(ProxyError::InvalidPath("Path traversal".into()));
     }
 
     Ok(())

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
+#[derive(Clone)]
 struct Entry {
     size: u64,
     stored_at: u64,
@@ -38,10 +39,10 @@ impl Expiry<Arc<str>, Entry> for TtlExpiry {
         _key: &Arc<str>,
         _value: &Entry,
         _current_time: Instant,
-        current_duration: Option<Duration>,
+        duration: Option<Duration>,
         _last_modified_at: Instant,
     ) -> Option<Duration> {
-        current_duration
+        duration
     }
 }
 
@@ -50,7 +51,6 @@ pub struct CacheManager {
     storage: Arc<Storage>,
     config: Arc<CacheConfig>,
     index: Cache<Arc<str>, Entry>,
-    max_size: u64,
 }
 
 impl CacheManager {
@@ -61,15 +61,20 @@ impl CacheManager {
     ) -> anyhow::Result<Self> {
         storage.cleanup().await?;
 
+        // Макс. ёмкость в KB для weigher
+        let max_capacity_kb = max_size / 1024;
+
         let index: Cache<Arc<str>, Entry> = Cache::builder()
-            .max_capacity(100_000)
-            .weigher(|_, e: &Entry| (e.size / 1024).min(u32::MAX as u64) as u32)
+            .max_capacity(max_capacity_kb)
+            .weigher(|_, e: &Entry| ((e.size / 1024).max(1)) as u32)
             .expire_after(TtlExpiry(config.clone()))
             .build();
 
+        // Загружаем существующие записи
         let entries = storage.list().await?;
         let mut total = 0u64;
         let mut loaded = 0usize;
+        let mut expired = 0usize;
 
         for (key, meta) in entries {
             let ttl = config.ttl_for(&key);
@@ -87,27 +92,37 @@ impl CacheManager {
                 loaded += 1;
             } else {
                 let _ = storage.delete(&key).await;
+                expired += 1;
             }
         }
 
-        info!(entries = loaded, size_mb = total / 1024 / 1024, "Cache initialized");
+        info!(
+            loaded,
+            expired,
+            size_mb = total / 1024 / 1024,
+            "Cache initialized"
+        );
 
-        Ok(Self {
-            storage,
-            config,
-            index,
-            max_size,
-        })
+        Ok(Self { storage, config, index })
     }
 
-    pub async fn get(&self, key: &str) -> Option<(cacache::Reader, Metadata)> {
-        if self.index.get(&Arc::from(key)).await.is_some() {
-            if let Ok(Some(result)) = self.storage.get(key).await {
-                return Some(result);
-            }
-            self.index.invalidate(&Arc::from(key)).await;
+    pub async fn get(&self, key: &str) -> Option<(Vec<u8>, Metadata)> {
+        let key_arc = Arc::from(key);
+
+        // Проверяем индекс
+        if self.index.get(&key_arc).await.is_none() {
+            return None;
         }
-        None
+
+        // Читаем из storage
+        match self.storage.get(key).await {
+            Ok(Some(result)) => Some(result),
+            _ => {
+                // Инвалидируем индекс если файл не найден
+                self.index.invalidate(&key_arc).await;
+                None
+            }
+        }
     }
 
     pub async fn get_metadata(&self, key: &str) -> Option<Metadata> {
@@ -116,6 +131,7 @@ impl CacheManager {
 
     pub async fn put(&self, key: &str, data: &[u8], meta: &Metadata) -> anyhow::Result<()> {
         self.storage.put(key, data, meta).await?;
+
         self.index
             .insert(
                 Arc::from(key),
@@ -125,20 +141,10 @@ impl CacheManager {
                 },
             )
             .await;
-        self.maybe_cleanup().await;
-        Ok(())
-    }
 
-    async fn maybe_cleanup(&self) {
+        // Запускаем очистку moka
         self.index.run_pending_tasks().await;
-        let size = self.index.weighted_size() * 1024;
-        if size > self.max_size {
-            debug!(
-                size_mb = size / 1024 / 1024,
-                max_mb = self.max_size / 1024 / 1024,
-                "Cache exceeds limit, running GC"
-            );
-            let _ = self.storage.cleanup().await;
-        }
+
+        Ok(())
     }
 }

@@ -16,16 +16,16 @@ const TIMEOUT: Duration = Duration::from_secs(300);
 #[derive(Clone, Copy, PartialEq)]
 enum Status {
     Pending,
-    Active,
+    Downloading,
     Done(bool),
 }
 
-struct Download {
+struct ActiveDownload {
     tx: watch::Sender<Status>,
     rx: watch::Receiver<Status>,
 }
 
-impl Download {
+impl ActiveDownload {
     fn new() -> Self {
         let (tx, rx) = watch::channel(Status::Pending);
         Self { tx, rx }
@@ -36,7 +36,7 @@ impl Download {
 pub struct Downloader {
     client: reqwest::Client,
     cache: CacheManager,
-    active: Arc<DashMap<String, Arc<Download>>>,
+    active: Arc<DashMap<String, Arc<ActiveDownload>>>,
 }
 
 impl Downloader {
@@ -45,9 +45,9 @@ impl Downloader {
             .user_agent(concat!("apt-cacher-rs/", env!("CARGO_PKG_VERSION")))
             .timeout(TIMEOUT)
             .connect_timeout(Duration::from_secs(10))
-            .pool_max_idle_per_host(16)
+            .pool_max_idle_per_host(32)
             .build()
-            .expect("Failed to build HTTP client");
+            .expect("Failed to create HTTP client");
 
         Self {
             client,
@@ -57,59 +57,56 @@ impl Downloader {
     }
 
     pub async fn fetch(&self, key: &str, url: &str) -> Result<Response> {
-        // Check cache first
-        if let Some((reader, meta)) = self.cache.get(key).await {
+        // 1. Проверяем кэш
+        if let Some((data, meta)) = self.cache.get(key).await {
             metrics::record_hit(meta.size);
-            let stream = tokio_util::io::ReaderStream::with_capacity(reader, 64 * 1024);
-            let mut resp = Response::new(Body::from_stream(stream));
-            resp.headers_mut().extend(meta.headers);
-            return Ok(resp);
+            debug!(key, size = meta.size, "Cache hit");
+            return Ok(self.response_from_data(data, meta));
         }
 
         metrics::record_miss();
 
-        // Coalesce concurrent requests for same key
-        let (dl, is_leader) = self.get_or_create(key);
+        // 2. Coalescing - проверяем активные загрузки
+        let (download, is_leader) = self.get_or_create_download(key);
 
         if !is_leader {
             metrics::record_coalesced();
-            return self.wait_for_download(key, &dl).await;
+            debug!(key, "Waiting for existing download");
+            return self.wait_for_download(key, &download).await;
         }
 
+        // 3. Мы лидер - качаем
         metrics::inc_active();
-        let result = self.do_download(key, url, &dl).await;
+        let result = self.perform_download(key, url, &download).await;
         metrics::dec_active();
-        self.active.remove(key);
 
+        self.active.remove(key);
         result
     }
 
-    fn get_or_create(&self, key: &str) -> (Arc<Download>, bool) {
+    fn get_or_create_download(&self, key: &str) -> (Arc<ActiveDownload>, bool) {
+        use dashmap::mapref::entry::Entry;
+
         match self.active.entry(key.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(e) => (e.get().clone(), false),
-            dashmap::mapref::entry::Entry::Vacant(e) => {
-                let dl = Arc::new(Download::new());
+            Entry::Occupied(e) => (e.get().clone(), false),
+            Entry::Vacant(e) => {
+                let dl = Arc::new(ActiveDownload::new());
                 e.insert(dl.clone());
                 (dl, true)
             }
         }
     }
 
-    async fn wait_for_download(&self, key: &str, dl: &Download) -> Result<Response> {
+    async fn wait_for_download(&self, key: &str, dl: &ActiveDownload) -> Result<Response> {
         let mut rx = dl.rx.clone();
 
         loop {
-            let status = *rx.borrow_and_update();
-            match status {
+            match *rx.borrow_and_update() {
                 Status::Done(true) => {
-                    if let Some((reader, meta)) = self.cache.get(key).await {
-                        let stream =
-                            tokio_util::io::ReaderStream::with_capacity(reader, 64 * 1024);
-                        let mut resp = Response::new(Body::from_stream(stream));
-                        resp.headers_mut().extend(meta.headers);
-                        return Ok(resp);
-                    }
-                    return Err(ProxyError::Download("Cache miss after download".into()));
+                    return match self.cache.get(key).await {
+                        Some((data, meta)) => Ok(self.response_from_data(data, meta)),
+                        None => Err(ProxyError::Download("Not in cache after download".into())),
+                    };
                 }
                 Status::Done(false) => {
                     return Err(ProxyError::Download("Download failed".into()));
@@ -123,10 +120,15 @@ impl Downloader {
         }
     }
 
-    async fn do_download(&self, key: &str, url: &str, dl: &Download) -> Result<Response> {
-        debug!(url, "Fetching from upstream");
+    async fn perform_download(
+        &self,
+        key: &str,
+        url: &str,
+        dl: &ActiveDownload,
+    ) -> Result<Response> {
+        debug!(key, url, "Starting download");
 
-        // Check for conditional request headers
+        // Условный запрос если есть метаданные
         let existing = self.cache.get_metadata(key).await;
         let mut req = self.client.get(url);
 
@@ -142,41 +144,37 @@ impl Downloader {
         let resp = req.send().await?;
         let status = resp.status();
 
-        // Handle 304 Not Modified
+        // 304 Not Modified
         if status == reqwest::StatusCode::NOT_MODIFIED {
             info!(key, "304 Not Modified");
             metrics::record_304();
             let _ = dl.tx.send(Status::Done(true));
 
-            if let Some((reader, meta)) = self.cache.get(key).await {
-                let stream = tokio_util::io::ReaderStream::with_capacity(reader, 64 * 1024);
-                let mut response = Response::new(Body::from_stream(stream));
-                response.headers_mut().extend(meta.headers);
-                return Ok(response);
-            }
-            return Err(ProxyError::Download("Cache miss after 304".into()));
+            return match self.cache.get(key).await {
+                Some((data, meta)) => Ok(self.response_from_data(data, meta)),
+                None => Err(ProxyError::Download("Not in cache after 304".into())),
+            };
         }
 
-        // Handle error responses
+        // Ошибка upstream
         if !status.is_success() {
             warn!(key, %status, "Upstream error");
             metrics::record_error();
             let _ = dl.tx.send(Status::Done(false));
+
             return Err(ProxyError::UpstreamStatus(
                 axum::http::StatusCode::from_u16(status.as_u16())
                     .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
             ));
         }
 
-        let _ = dl.tx.send(Status::Active);
+        let _ = dl.tx.send(Status::Downloading);
 
         let content_len = resp.content_length().unwrap_or(0);
         info!(key, size = content_len, "Downloading");
 
-        let meta = Metadata::from_response(&resp, url, content_len);
-        let headers = meta.headers.clone();
-
-        // Download to buffer
+        // Собираем данные
+        let headers = resp.headers().clone();
         let mut data = Vec::with_capacity(content_len as usize);
         let mut stream = resp.bytes_stream();
 
@@ -184,7 +182,7 @@ impl Downloader {
             match chunk {
                 Ok(bytes) => data.extend_from_slice(&bytes),
                 Err(e) => {
-                    warn!(key, error = %e, "Download failed");
+                    warn!(key, error = %e, "Download error");
                     let _ = dl.tx.send(Status::Done(false));
                     return Err(e.into());
                 }
@@ -192,10 +190,29 @@ impl Downloader {
         }
 
         let size = data.len() as u64;
-        let final_meta = Metadata { size, ..meta };
 
-        // Cache the response
-        if let Err(e) = self.cache.put(key, &data, &final_meta).await {
+        // Создаём метаданные
+        let meta = Metadata {
+            headers: headers.clone(),
+            url: url.into(),
+            key: key.into(),
+            stored_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            size,
+            etag: headers
+                .get(http::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(Into::into),
+            last_modified: headers
+                .get(http::header::LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .map(Into::into),
+        };
+
+        // Сохраняем в кэш
+        if let Err(e) = self.cache.put(key, &data, &meta).await {
             warn!(key, error = %e, "Failed to cache");
         }
 
@@ -204,8 +221,12 @@ impl Downloader {
 
         info!(key, size, "Download complete");
 
+        Ok(self.response_from_data(data, meta))
+    }
+
+    fn response_from_data(&self, data: Vec<u8>, meta: Metadata) -> Response {
         let mut resp = Response::new(Body::from(Bytes::from(data)));
-        resp.headers_mut().extend(headers);
-        Ok(resp)
+        resp.headers_mut().extend(meta.headers);
+        resp
     }
 }

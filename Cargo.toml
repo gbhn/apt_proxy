@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util", "timeout", "limit"] }
-tower-http = { version = "0.6", features = ["catch-panic", "timeout", "limit"] }
+tower-http = { version = "0.6", features = ["catch-panic"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "rustls-tls-native-roots", "hickory-dns"] }
@@ -23,7 +23,6 @@ http-serde = "2"
 figment = { version = "0.10", features = ["yaml", "env"] }
 clap = { version = "4", features = ["derive", "env"] }
 moka = { version = "0.12", features = ["future"] }
-cacache = "13"
 dashmap = "6"
 blake3 = "1"
 regex = "1"
@@ -38,7 +37,6 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tempfile = "3"
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -1,60 +1,33 @@
-use anyhow::{Context, Result};
-use apt_cacher_rs::{
-    config::{Args, Settings},
-    metrics, router, server, App,
-};
+use anyhow::Result;
+use apt_cacher_rs::{config::{Args, Settings}, metrics, router, server, App};
 use clap::Parser;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_logging();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "apt_cacher_rs=info".into()))
+        .with_target(false)
+        .init();
 
-    let start_time = Instant::now();
+    let start = Instant::now();
+    let settings = Settings::load(Args::parse())?;
 
-    let settings = Settings::load(Args::parse()).context("Failed to load configuration")?;
+    info!(port = settings.port, repos = settings.repositories.len(), "Starting v{}", env!("CARGO_PKG_VERSION"));
 
-    info!(
-        port = settings.port,
-        cache_dir = %settings.cache_dir.display(),
-        max_size_gb = settings.max_cache_size / (1024 * 1024 * 1024),
-        repos = settings.repositories.len(),
-        prometheus = settings.prometheus,
-        "Starting apt-cacher-rs v{}",
-        env!("CARGO_PKG_VERSION")
-    );
+    metrics::init(settings.prometheus)?;
+    
+    let app = Arc::new(App::new(settings.clone()).await?);
 
-    metrics::init(settings.prometheus)
-        .context("Failed to initialize metrics")?;
-
-    let app = Arc::new(
-        App::new(settings.clone())
-            .await
-            .context("Failed to initialize application")?,
-    );
-
-    // Start uptime tracker
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
-            interval.tick().await;
-            metrics::update_uptime(start_time);
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            metrics::update_uptime(start);
         }
     });
 
     server::serve(router(app), settings.port).await
-}
-
-fn init_logging() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("apt_cacher_rs=info,tower_http=info")
-    });
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
 }

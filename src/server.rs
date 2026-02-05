@@ -6,74 +6,44 @@ use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tracing::info;
 
-/// Starts the HTTP server with graceful shutdown support
 pub async fn serve(app: Router, port: u16) -> Result<()> {
-    let listener = create_listener(port).await?;
+    let listener = match ListenFd::from_env().take_tcp_listener(0)? {
+        Some(std) => {
+            std.set_nonblocking(true)?;
+            info!("Using systemd socket");
+            TcpListener::from_std(std)?
+        }
+        None => {
+            let addr = SocketAddr::from(([0, 0, 0, 0], port));
+            info!(%addr, "Binding");
+            TcpListener::bind(addr).await?
+        }
+    };
 
-    let local_addr = listener
-        .local_addr()
-        .context("Failed to get local address")?;
-
-    info!(addr = %local_addr, "Server listening");
-
-    // Set health status to healthy once we're listening
+    info!(addr = %listener.local_addr()?, "Listening");
     metrics::set_health_status(true);
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown())
         .await
-        .context("Server error")?;
+        .context("Server error")
+}
 
-    // Set health status to unhealthy during shutdown
-    metrics::set_health_status(false);
+async fn shutdown() {
+    let ctrl_c = tokio::signal::ctrl_c();
     
-    info!("Server stopped gracefully");
-    Ok(())
-}
-
-/// Creates a TCP listener, preferring systemd socket activation
-async fn create_listener(port: u16) -> Result<TcpListener> {
-    // Try systemd socket activation first
-    if let Some(std_listener) = ListenFd::from_env()
-        .take_tcp_listener(0)
-        .context("Failed to take systemd socket")?
-    {
-        std_listener
-            .set_nonblocking(true)
-            .context("Failed to set socket non-blocking")?;
-        info!("Using systemd socket activation");
-        return TcpListener::from_std(std_listener).context("Failed to convert socket");
-    }
-
-    // Fall back to binding directly
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!(%addr, "Binding to address");
-    TcpListener::bind(addr)
-        .await
-        .context("Failed to bind to address")
-}
-
-/// Waits for shutdown signals (Ctrl+C or SIGTERM)
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
-    };
-
     #[cfg(unix)]
-    let terminate = async {
+    let term = async {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler")
+            .expect("SIGTERM handler")
             .recv()
             .await;
     };
-
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let term = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => info!("Received Ctrl+C, shutting down..."),
-        _ = terminate => info!("Received SIGTERM, shutting down..."),
+        _ = ctrl_c => info!("Ctrl+C"),
+        _ = term => info!("SIGTERM"),
     }
 }

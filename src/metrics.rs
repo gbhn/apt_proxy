@@ -1,6 +1,6 @@
 //! Prometheus metrics - simplified
 
-use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
+use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;

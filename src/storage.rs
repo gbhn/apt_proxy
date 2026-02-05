@@ -5,51 +5,33 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
-/// Hash prefix length for directory sharding (2 hex chars = 256 buckets)
 const HASH_PREFIX_LEN: usize = 2;
 
 static INSTANCE_ID: OnceLock<u64> = OnceLock::new();
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Time utilities
-mod time {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs()
+}
 
-    pub fn now_nanos() -> u64 {
-        SystemTime::now()
+fn instance_id() -> u64 {
+    *INSTANCE_ID.get_or_init(|| {
+        std::process::id() as u64 ^ SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_nanos() as u64
-    }
-
-    pub fn now_secs() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs()
-    }
+    })
 }
 
-/// Generates a unique instance ID based on PID and timestamp
-fn instance_id() -> u64 {
-    *INSTANCE_ID.get_or_init(|| std::process::id() as u64 ^ time::now_nanos())
-}
-
-/// Generates a unique identifier for temp files
 fn unique_id() -> String {
-    format!(
-        "{:016x}_{:016x}",
-        instance_id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
+    format!("{:016x}_{:016x}", instance_id(), COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
-/// File metadata stored alongside cached data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     #[serde(with = "http_serde::header_map")]
@@ -65,50 +47,28 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    /// Returns age in seconds since stored
-    #[inline]
-    pub fn age(&self) -> u64 {
-        time::now_secs().saturating_sub(self.stored_at)
+    pub fn new(key: impl Into<String>, url: impl Into<String>, size: u64, headers: axum::http::HeaderMap) -> Self {
+        Self { headers, url: url.into(), key: key.into(), stored_at: now_secs(), size, etag: None, last_modified: None }
     }
 
-    /// Creates new metadata with current timestamp
-    pub fn new(
-        key: impl Into<String>,
-        url: impl Into<String>,
-        size: u64,
-        headers: axum::http::HeaderMap,
-    ) -> Self {
-        Self {
-            headers,
-            url: url.into(),
-            key: key.into(),
-            stored_at: time::now_secs(),
-            size,
-            etag: None,
-            last_modified: None,
-        }
-    }
-
-    /// Sets conditional request headers from response
-    pub fn with_conditionals(
-        mut self,
-        etag: Option<String>,
-        last_modified: Option<String>,
-    ) -> Self {
+    pub fn with_conditionals(mut self, etag: Option<String>, last_modified: Option<String>) -> Self {
         self.etag = etag;
         self.last_modified = last_modified;
         self
     }
 }
 
-/// Helper to cleanup files on error
-async fn cleanup_files(paths: &[&Path]) {
-    for path in paths {
-        let _ = fs::remove_file(path).await;
-    }
+/// Timed storage operation helper
+macro_rules! timed_op {
+    ($op:literal, $body:expr) => {{
+        let start = Instant::now();
+        let result = $body;
+        let success = result.is_ok();
+        metrics::record_storage_operation($op, start.elapsed(), success);
+        result
+    }};
 }
 
-/// Content-addressable file storage with atomic writes
 #[derive(Clone)]
 pub struct Storage {
     base: PathBuf,
@@ -116,402 +76,204 @@ pub struct Storage {
 }
 
 impl Storage {
-    /// Creates a new storage instance at the given base path
     pub async fn new(base: PathBuf) -> Result<Self> {
-        let start = Instant::now();
         let temp = base.join(".tmp");
-
-        fs::create_dir_all(&base)
-            .await
-            .with_context(|| format!("Failed to create cache directory: {}", base.display()))?;
-
-        fs::create_dir_all(&temp)
-            .await
-            .with_context(|| format!("Failed to create temp directory: {}", temp.display()))?;
-
+        fs::create_dir_all(&base).await.context("Failed to create cache dir")?;
+        fs::create_dir_all(&temp).await.context("Failed to create temp dir")?;
         debug!(path = %base.display(), "Storage initialized");
-        metrics::record_storage_operation("init", start.elapsed(), true);
-
         Ok(Self { base, temp })
     }
 
-    /// Computes content-addressed path for a key using BLAKE3 hash
     fn data_path(&self, key: &str) -> PathBuf {
         let hash = blake3::hash(key.as_bytes()).to_hex();
         let h = hash.as_str();
-        self.base
-            .join(&h[..HASH_PREFIX_LEN])
-            .join(&h[HASH_PREFIX_LEN..HASH_PREFIX_LEN * 2])
-            .join(h)
+        self.base.join(&h[..HASH_PREFIX_LEN]).join(&h[HASH_PREFIX_LEN..HASH_PREFIX_LEN * 2]).join(h)
     }
 
-    fn meta_path(&self, key: &str) -> PathBuf {
-        self.data_path(key).with_extension("json")
-    }
+    fn meta_path(&self, key: &str) -> PathBuf { self.data_path(key).with_extension("json") }
+    fn temp_path(&self, ext: &str) -> PathBuf { self.temp.join(format!("{}.{}", unique_id(), ext)) }
 
-    fn temp_path(&self, ext: &str) -> PathBuf {
-        self.temp.join(format!("{}.{}", unique_id(), ext))
-    }
-
-    // ========== Public API ==========
-
-    /// Cleans up temporary files from previous runs
     pub async fn cleanup_temp(&self) -> Result<()> {
-        let start = Instant::now();
-
-        let mut entries = match fs::read_dir(&self.temp).await {
-            Ok(e) => e,
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                metrics::record_storage_operation("cleanup_temp", start.elapsed(), true);
-                return Ok(());
+        timed_op!("cleanup_temp", async {
+            let mut entries = match fs::read_dir(&self.temp).await {
+                Ok(e) => e,
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            let mut count = 0u64;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if fs::remove_file(entry.path()).await.is_ok() { count += 1; }
             }
-            Err(e) => {
-                metrics::record_storage_operation("cleanup_temp", start.elapsed(), false);
-                return Err(e).context("Failed to read temp directory");
-            }
-        };
-
-        let mut cleaned = 0u32;
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if fs::remove_file(entry.path()).await.is_ok() {
-                cleaned += 1;
-            }
-        }
-
-        if cleaned > 0 {
-            debug!(count = cleaned, "Cleaned temp files");
-            metrics::record_temp_cleanup(cleaned as u64);
-        }
-
-        metrics::record_storage_operation("cleanup_temp", start.elapsed(), true);
-        Ok(())
+            if count > 0 { metrics::record_temp_cleanup(count); }
+            Ok(())
+        }.await)
     }
 
-    /// Lists all metadata file paths for bulk loading
     pub async fn list_metadata_paths(&self) -> Result<Vec<PathBuf>> {
-        let start = Instant::now();
         let mut result = Vec::new();
         let mut stack = vec![self.base.clone()];
 
         while let Some(dir) = stack.pop() {
-            let mut entries = match fs::read_dir(&dir).await {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
+            let mut entries = match fs::read_dir(&dir).await { Ok(e) => e, Err(_) => continue };
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
-                let Ok(ft) = entry.file_type().await else {
-                    continue;
-                };
-
-                if ft.is_dir() {
-                    // Skip hidden directories (e.g., .tmp)
-                    if !is_hidden_path(&path) {
-                        stack.push(path);
-                    }
+                let Ok(ft) = entry.file_type().await else { continue };
+                if ft.is_dir() && !path.file_name().is_some_and(|n| n.to_str().is_some_and(|s| s.starts_with('.'))) {
+                    stack.push(path);
                 } else if path.extension().is_some_and(|e| e == "json") {
                     result.push(path);
                 }
             }
         }
-
-        metrics::record_storage_operation("list_metadata", start.elapsed(), true);
         Ok(result)
     }
 
-    /// Reads metadata from a specific path
     pub async fn read_metadata_from_path(&self, path: &Path) -> Result<Option<Metadata>> {
-        let start = Instant::now();
-
-        match self.read_json(path).await {
-            Ok(meta) => {
-                metrics::record_storage_operation("read_metadata", start.elapsed(), true);
-                Ok(Some(meta))
-            }
-            Err(e) if is_not_found(&e) => {
-                metrics::record_storage_operation("read_metadata", start.elapsed(), true);
-                Ok(None)
-            }
-            Err(e) if is_parse_error(&e) => {
-                warn!(path = %path.display(), error = %e, "Corrupted metadata, removing");
-                metrics::record_metadata_parse_error();
-                metrics::record_storage_operation("read_metadata", start.elapsed(), false);
-                let _ = fs::remove_file(path).await;
-                Ok(None)
-            }
-            Err(e) => {
-                metrics::record_storage_operation("read_metadata", start.elapsed(), false);
-                Err(e).context("Failed to read metadata")
-            }
+        match fs::read(path).await {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(meta) => Ok(Some(meta)),
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "Corrupted metadata");
+                    metrics::record_metadata_parse_error();
+                    let _ = fs::remove_file(path).await;
+                    Ok(None)
+                }
+            },
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 
-    /// Creates a new temporary file for writing
     pub async fn create_temp_data(&self) -> Result<(PathBuf, File)> {
-        let start = Instant::now();
         let path = self.temp_path("data");
-
-        let file = File::create(&path)
-            .await
-            .with_context(|| format!("Failed to create temp file: {}", path.display()));
-
-        match file {
-            Ok(f) => {
-                metrics::record_temp_file_created();
-                metrics::record_storage_operation("create_temp", start.elapsed(), true);
-                Ok((path, f))
-            }
-            Err(e) => {
-                metrics::record_storage_operation("create_temp", start.elapsed(), false);
-                metrics::record_storage_error("create_temp");
-                Err(e)
-            }
-        }
+        let file = File::create(&path).await.context("Failed to create temp file")?;
+        metrics::record_temp_file_created();
+        Ok((path, file))
     }
 
-    /// Opens a cached file by key, returns file handle and metadata
     pub async fn open(&self, key: &str) -> Result<Option<(File, Metadata)>> {
-        let start = Instant::now();
         let meta_path = self.meta_path(key);
         let data_path = self.data_path(key);
 
-        let meta: Metadata = match self.read_json(&meta_path).await {
-            Ok(m) => m,
-            Err(e) if is_not_found(&e) => {
-                metrics::record_storage_operation("open", start.elapsed(), true);
-                return Ok(None);
-            }
-            Err(e) if is_parse_error(&e) => {
-                warn!(key, error = %e, "Corrupted metadata, removing");
-                metrics::record_metadata_parse_error();
-                let _ = self.delete(key).await;
-                metrics::record_storage_operation("open", start.elapsed(), false);
-                return Ok(None);
-            }
-            Err(e) => {
-                metrics::record_storage_operation("open", start.elapsed(), false);
-                return Err(e).context("Failed to read metadata");
-            }
+        let meta: Metadata = match self.read_metadata_from_path(&meta_path).await? {
+            Some(m) => m,
+            None => return Ok(None),
         };
 
-        // Verify data file exists and matches expected size
         let data_size = match fs::metadata(&data_path).await {
             Ok(m) => m.len(),
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                warn!(key, "Data file missing, removing metadata");
+                warn!(key, "Data file missing");
                 let _ = fs::remove_file(&meta_path).await;
-                metrics::record_storage_error("missing_data");
-                metrics::record_storage_operation("open", start.elapsed(), false);
                 return Ok(None);
             }
-            Err(e) => {
-                metrics::record_storage_operation("open", start.elapsed(), false);
-                return Err(e).context("Failed to stat data file");
-            }
+            Err(e) => return Err(e.into()),
         };
 
         if data_size != meta.size {
-            warn!(
-                key,
-                expected = meta.size,
-                actual = data_size,
-                "Size mismatch, removing"
-            );
-            metrics::record_storage_error("size_mismatch");
+            warn!(key, expected = meta.size, actual = data_size, "Size mismatch");
             let _ = self.delete(key).await;
-            metrics::record_storage_operation("open", start.elapsed(), false);
             return Ok(None);
         }
 
         match File::open(&data_path).await {
             Ok(file) => {
                 metrics::record_storage_read(meta.size);
-                metrics::record_storage_operation("open", start.elapsed(), true);
                 Ok(Some((file, meta)))
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                metrics::record_storage_operation("open", start.elapsed(), true);
-                Ok(None)
-            }
-            Err(e) => {
-                metrics::record_storage_operation("open", start.elapsed(), false);
-                Err(e).context("Failed to open data file")
-            }
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 
-    /// Returns metadata for a key without opening the data file
     pub async fn get_metadata(&self, key: &str) -> Result<Option<Metadata>> {
-        let start = Instant::now();
-
-        match self.read_json(&self.meta_path(key)).await {
-            Ok(meta) => {
-                metrics::record_storage_operation("get_metadata", start.elapsed(), true);
-                Ok(Some(meta))
-            }
-            Err(e) if is_not_found(&e) => {
-                metrics::record_storage_operation("get_metadata", start.elapsed(), true);
-                Ok(None)
-            }
-            Err(e) if is_parse_error(&e) => {
-                warn!(key, error = %e, "Corrupted metadata");
-                metrics::record_metadata_parse_error();
-                let _ = self.delete(key).await;
-                metrics::record_storage_operation("get_metadata", start.elapsed(), false);
-                Ok(None)
-            }
-            Err(e) => {
-                metrics::record_storage_operation("get_metadata", start.elapsed(), false);
-                Err(e).context("Failed to read metadata")
-            }
-        }
+        self.read_metadata_from_path(&self.meta_path(key)).await
     }
 
-    /// Commits a temporary data file to permanent storage
-    ///
-    /// This function is atomic: either both data and metadata are committed,
-    /// or nothing is changed. All temporary files are cleaned up on error.
-    pub async fn put_from_temp_data(
-        &self,
-        key: &str,
-        temp_data: PathBuf,
-        meta: &Metadata,
-    ) -> Result<u64> {
-        let start = Instant::now();
+    pub async fn put_from_temp_data(&self, key: &str, temp_data: PathBuf, meta: &Metadata) -> Result<u64> {
         let data_path = self.data_path(key);
         let meta_path = self.meta_path(key);
 
-        // Create parent directories
         if let Some(parent) = data_path.parent() {
-            if let Err(e) = fs::create_dir_all(parent).await {
-                // Cleanup temp_data on error
-                let _ = fs::remove_file(&temp_data).await;
-                metrics::record_storage_operation("put", start.elapsed(), false);
-                metrics::record_storage_error("create_dir");
-                return Err(e).context("Failed to create cache subdirectory");
-            }
+            fs::create_dir_all(parent).await?;
         }
 
-        // Write metadata to temp file first
         let temp_meta = self.temp_path("json");
+        let json = serde_json::to_vec(meta)?;
+        let mut file = File::create(&temp_meta).await?;
+        file.write_all(&json).await?;
+        file.sync_all().await?;
 
-        if let Err(e) = self.write_json(&temp_meta, meta).await {
-            // Cleanup all temp files
-            cleanup_files(&[&temp_data, &temp_meta]).await;
-            metrics::record_storage_operation("put", start.elapsed(), false);
-            metrics::record_storage_error("write_metadata");
-            return Err(e).context("Failed to write metadata");
-        }
-
-        // Atomic rename: data file first
         if let Err(e) = fs::rename(&temp_data, &data_path).await {
-            // Cleanup all temp files
-            cleanup_files(&[&temp_data, &temp_meta]).await;
-            metrics::record_storage_operation("put", start.elapsed(), false);
-            metrics::record_storage_error("rename_data");
-            return Err(e).context("Failed to commit data file");
-        }
-
-        // Atomic rename: metadata file
-        if let Err(e) = fs::rename(&temp_meta, &meta_path).await {
-            // Rollback: remove already committed data file
-            let _ = fs::remove_file(&data_path).await;
-            // Cleanup temp metadata (temp_data already renamed, so skip it)
+            let _ = fs::remove_file(&temp_data).await;
             let _ = fs::remove_file(&temp_meta).await;
-            metrics::record_storage_operation("put", start.elapsed(), false);
-            metrics::record_storage_error("rename_metadata");
-            return Err(e).context("Failed to commit metadata");
-        }
-
-        metrics::record_storage_write(meta.size);
-        metrics::record_storage_operation("put", start.elapsed(), true);
-        debug!(key, size = meta.size, "Cached");
-
-        Ok(meta.size)
-    }
-
-    /// Updates the stored_at timestamp for a key (for 304 responses)
-    pub async fn touch(&self, key: &str) -> Result<bool> {
-        let start = Instant::now();
-        let meta_path = self.meta_path(key);
-
-        let mut meta: Metadata = match self.read_json(&meta_path).await {
-            Ok(m) => m,
-            Err(e) if is_not_found(&e) => {
-                metrics::record_storage_operation("touch", start.elapsed(), true);
-                return Ok(false);
-            }
-            Err(_) => {
-                metrics::record_storage_operation("touch", start.elapsed(), false);
-                return Ok(false);
-            }
-        };
-
-        meta.stored_at = time::now_secs();
-
-        let temp_meta = self.temp_path("json");
-
-        if let Err(e) = self.write_json(&temp_meta, &meta).await {
-            let _ = fs::remove_file(&temp_meta).await;
-            metrics::record_storage_operation("touch", start.elapsed(), false);
-            return Err(e);
-        }
-
-        if let Err(e) = fs::rename(&temp_meta, &meta_path).await {
-            let _ = fs::remove_file(&temp_meta).await;
-            metrics::record_storage_operation("touch", start.elapsed(), false);
             return Err(e.into());
         }
 
-        metrics::record_storage_operation("touch", start.elapsed(), true);
+        if let Err(e) = fs::rename(&temp_meta, &meta_path).await {
+            let _ = fs::remove_file(&data_path).await;
+            let _ = fs::remove_file(&temp_meta).await;
+            return Err(e.into());
+        }
+
+        metrics::record_storage_write(meta.size);
+        debug!(key, size = meta.size, "Cached");
+        Ok(meta.size)
+    }
+
+    pub async fn touch(&self, key: &str) -> Result<bool> {
+        let meta_path = self.meta_path(key);
+        let mut meta: Metadata = match self.read_metadata_from_path(&meta_path).await? {
+            Some(m) => m,
+            None => return Ok(false),
+        };
+
+        meta.stored_at = now_secs();
+
+        let temp_meta = self.temp_path("json");
+        let json = serde_json::to_vec(&meta)?;
+        let mut file = File::create(&temp_meta).await?;
+        file.write_all(&json).await?;
+        file.sync_all().await?;
+        fs::rename(&temp_meta, &meta_path).await?;
+
         debug!(key, "Touched");
         Ok(true)
     }
 
-    /// Deletes both data and metadata files for a key
     pub async fn delete(&self, key: &str) -> Result<()> {
-        let start = Instant::now();
-
-        let data_result = fs::remove_file(self.data_path(key)).await;
-        let meta_result = fs::remove_file(self.meta_path(key)).await;
-
-        // Only log if at least one file existed
-        if data_result.is_ok() || meta_result.is_ok() {
-            debug!(key, "Deleted");
-        }
-
-        metrics::record_storage_operation("delete", start.elapsed(), true);
+        let _ = fs::remove_file(self.data_path(key)).await;
+        let _ = fs::remove_file(self.meta_path(key)).await;
+        debug!(key, "Deleted");
         Ok(())
     }
 
-    /// Removes orphaned files (data without metadata or vice versa)
     pub async fn cleanup_orphans(&self) -> Result<usize> {
-        let start = Instant::now();
         let mut stack = vec![self.base.clone()];
         let mut removed = 0usize;
 
         while let Some(dir) = stack.pop() {
-            let mut entries = match fs::read_dir(&dir).await {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
+            let mut entries = match fs::read_dir(&dir).await { Ok(e) => e, Err(_) => continue };
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
-                let Ok(ft) = entry.file_type().await else {
-                    continue;
-                };
+                let Ok(ft) = entry.file_type().await else { continue };
 
                 if ft.is_dir() {
-                    if !is_hidden_path(&path) {
+                    if !path.file_name().is_some_and(|n| n.to_str().is_some_and(|s| s.starts_with('.'))) {
                         stack.push(path);
                     }
                     continue;
                 }
 
-                if self.is_orphan(&path).await {
-                    debug!(path = %path.display(), "Removing orphan");
+                let is_orphan = match path.extension().and_then(|e| e.to_str()) {
+                    Some("json") => !fs::try_exists(path.with_extension("")).await.unwrap_or(true),
+                    None if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.len() == 64) => {
+                        !fs::try_exists(path.with_extension("json")).await.unwrap_or(true)
+                    }
+                    _ => false,
+                };
+
+                if is_orphan {
                     let _ = fs::remove_file(&path).await;
                     removed += 1;
                 }
@@ -519,89 +281,9 @@ impl Storage {
         }
 
         if removed > 0 {
-            debug!(removed, "Removed orphaned files");
+            debug!(removed, "Removed orphans");
             metrics::record_orphans_removed(removed as u64);
         }
-
-        metrics::record_storage_operation("cleanup_orphans", start.elapsed(), true);
         Ok(removed)
     }
-
-    /// Checks available disk space in bytes
-    #[allow(dead_code)]
-    pub async fn available_space(&self) -> Result<u64> {
-        let base = self.base.clone();
-        tokio::task::spawn_blocking(move || {
-            #[cfg(unix)]
-            {
-                let stat = nix::sys::statvfs::statvfs(&base)?;
-                Ok(stat.blocks_available() * stat.block_size())
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = base;
-                Ok(u64::MAX)
-            }
-        })
-        .await?
-    }
-
-    // ========== Private Helpers ==========
-
-    async fn read_json<T: serde::de::DeserializeOwned>(&self, path: &Path) -> Result<T> {
-        let bytes = fs::read(path).await?;
-        Ok(serde_json::from_slice(&bytes)?)
-    }
-
-    async fn write_json<T: serde::Serialize>(&self, path: &Path, data: &T) -> Result<()> {
-        let json = serde_json::to_vec(data)?;
-        let mut file = File::create(path).await?;
-        file.write_all(&json).await?;
-        file.sync_all().await?;
-        Ok(())
-    }
-
-    async fn is_orphan(&self, path: &Path) -> bool {
-        let ext = path.extension().and_then(|e| e.to_str());
-
-        match ext {
-            Some("json") => {
-                // Metadata file - check if data file exists
-                let data_path = path.with_extension("");
-                !fs::try_exists(&data_path).await.unwrap_or(true)
-            }
-            None => {
-                // Data file - verify it's a valid hash and check for metadata
-                let is_valid_hash = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.len() == 64 && n.chars().all(|c| c.is_ascii_hexdigit()));
-
-                if !is_valid_hash {
-                    return false;
-                }
-
-                let meta_path = path.with_extension("json");
-                !fs::try_exists(&meta_path).await.unwrap_or(true)
-            }
-            _ => false,
-        }
-    }
-}
-
-// ========== Helper Functions ==========
-
-fn is_hidden_path(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with('.'))
-}
-
-fn is_not_found(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<std::io::Error>()
-        .is_some_and(|io| io.kind() == ErrorKind::NotFound)
-}
-
-fn is_parse_error(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<serde_json::Error>().is_some()
 }

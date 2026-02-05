@@ -1,75 +1,51 @@
 [package]
 name = "apt-cacher-rs"
-version = "3.1.2"
+version = "3.1.3"
 edition = "2024"
 description = "A high-performance caching proxy for APT repositories"
 license = "MIT"
 
 [dependencies]
-# Web framework
 axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util", "limit"] }
 tower-http = { version = "0.6", features = ["catch-panic"] }
-
-# HTTP client/server
 hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-native-roots", "hickory-dns"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-native-roots"] }
 http = "1"
-
-# Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "fs", "sync", "signal", "macros", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
-
-# Data types
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 http-serde = "2"
-
-# Configuration
 figment = { version = "0.10", features = ["yaml", "env"] }
 clap = { version = "4", features = ["derive", "env"] }
 humantime-serde = "1"
 bytesize = { version = "1", features = ["serde"] }
-
-# Caching
 moka = { version = "0.12", features = ["future"] }
 dashmap = "6"
 blake3 = "1"
-
-# Utilities
 regex = "1"
 path-clean = "1"
 anyhow = "1"
 thiserror = "2"
 percent-encoding = "2"
 async-stream = "0.3"
-
-# Server
 listenfd = "1"
-
-# Metrics
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
-
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Unix-specific
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["fs"] }
-
-[dev-dependencies]
-tokio-test = "0.4"
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = true
 
 [package.metadata.deb]

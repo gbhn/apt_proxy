@@ -89,6 +89,7 @@ impl Drop for TempFileGuard {
     }
 }
 
+#[derive(Clone)]
 pub struct Storage {
     base_path: PathBuf,
     temp_dir: PathBuf,
@@ -117,6 +118,70 @@ impl Storage {
         let mut p = self.data_path(key);
         p.set_extension("json");
         p
+    }
+
+    /// Quick cleanup of temp files only - for fast startup
+    pub async fn cleanup_temp(&self) -> Result<()> {
+        if let Ok(mut entries) = fs::read_dir(&self.temp_dir).await {
+            while let Ok(Some(e)) = entries.next_entry().await {
+                let _ = fs::remove_file(e.path()).await;
+            }
+        }
+        debug!("Temp directory cleaned");
+        Ok(())
+    }
+
+    /// List all metadata file paths without reading contents
+    pub async fn list_metadata_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut result = Vec::new();
+        let mut stack = vec![self.base_path.clone()];
+
+        while let Some(dir) = stack.pop() {
+            let mut entries = match fs::read_dir(&dir).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                let file_type = match entry.file_type().await {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+
+                if file_type.is_dir() {
+                    if !path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().starts_with('.'))
+                        .unwrap_or(false)
+                    {
+                        stack.push(path);
+                    }
+                } else if path.extension().map(|e| e == "json").unwrap_or(false) {
+                    result.push(path);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Read metadata from a specific path
+    pub async fn read_metadata_from_path(&self, path: &PathBuf) -> Result<Option<Metadata>> {
+        let bytes = match fs::read(path).await {
+            Ok(b) => b,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        match serde_json::from_slice(&bytes) {
+            Ok(meta) => Ok(Some(meta)),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "Corrupted metadata, removing");
+                let _ = fs::remove_file(path).await;
+                Ok(None)
+            }
+        }
     }
 
     pub async fn create_temp_data(&self) -> Result<(PathBuf, File)> {
@@ -251,7 +316,12 @@ impl Storage {
         Ok(data.len() as u64)
     }
 
-    pub async fn put_from_temp_data(&self, key: &str, temp_data: PathBuf, meta: &Metadata) -> Result<u64> {
+    pub async fn put_from_temp_data(
+        &self,
+        key: &str,
+        temp_data: PathBuf,
+        meta: &Metadata,
+    ) -> Result<u64> {
         let data_path = self.data_path(key);
         let meta_path = self.meta_path(key);
 
@@ -327,19 +397,13 @@ impl Storage {
     }
 
     pub async fn cleanup(&self) -> Result<()> {
-        if let Ok(mut entries) = fs::read_dir(&self.temp_dir).await {
-            while let Ok(Some(e)) = entries.next_entry().await {
-                let _ = fs::remove_file(e.path()).await;
-            }
-        }
-
+        self.cleanup_temp().await?;
         self.cleanup_orphans().await?;
-
         debug!("Cleanup completed");
         Ok(())
     }
 
-    async fn cleanup_orphans(&self) -> Result<()> {
+    pub async fn cleanup_orphans(&self) -> Result<()> {
         let mut stack = vec![self.base_path.clone()];
         let mut removed = 0usize;
 

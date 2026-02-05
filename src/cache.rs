@@ -1,9 +1,11 @@
 use crate::config::CacheConfig;
 use crate::storage::{Metadata, Storage};
+use futures::StreamExt;
 use moka::future::Cache;
 use moka::notification::RemovalCause;
 use moka::Expiry;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::File;
@@ -60,6 +62,8 @@ impl Expiry<String, Entry> for TtlExpiry {
 pub struct CacheManager {
     storage: Arc<Storage>,
     index: Cache<String, Entry>,
+    #[allow(dead_code)]
+    loading: Arc<AtomicBool>,
 }
 
 impl CacheManager {
@@ -68,7 +72,8 @@ impl CacheManager {
         config: Arc<CacheConfig>,
         max_size: u64,
     ) -> anyhow::Result<Self> {
-        storage.cleanup().await?;
+        // Quick cleanup of temp files only - don't block on orphan cleanup
+        storage.cleanup_temp().await?;
 
         let max_capacity_kb = (max_size / 1024).max(1);
 
@@ -92,37 +97,116 @@ impl CacheManager {
             })
             .build();
 
-        let entries = storage.list().await?;
-        let mut total = 0u64;
+        let loading = Arc::new(AtomicBool::new(true));
+
+        let manager = Self {
+            storage: storage.clone(),
+            index: index.clone(),
+            loading: loading.clone(),
+        };
+
+        // Spawn background loading task
+        let bg_storage = storage.clone();
+        let bg_config = config.clone();
+        let bg_index = index.clone();
+
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+
+            match Self::load_entries_parallel(&bg_storage, &bg_config, &bg_index).await {
+                Ok((loaded, expired, total_size)) => {
+                    info!(
+                        loaded,
+                        expired,
+                        size_mb = total_size / 1024 / 1024,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "Cache index loaded"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to load cache entries");
+                }
+            }
+
+            // Orphan cleanup in background after loading
+            let _ = bg_storage.cleanup_orphans().await;
+
+            loading.store(false, Ordering::Release);
+        });
+
+        info!("Cache manager started, loading index in background");
+        Ok(manager)
+    }
+
+    async fn load_entries_parallel(
+        storage: &Storage,
+        config: &CacheConfig,
+        index: &Cache<String, Entry>,
+    ) -> anyhow::Result<(usize, usize, u64)> {
+        // Get list of metadata file paths (fast directory scan)
+        let paths = storage.list_metadata_paths().await?;
+        let total_files = paths.len();
+
+        if total_files == 0 {
+            return Ok((0, 0, 0));
+        }
+
+        // Process files with parallel I/O
+        const CONCURRENCY: usize = 64;
+
+        let results: Vec<Option<Metadata>> = futures::stream::iter(paths)
+            .map(|path| {
+                let storage = storage.clone();
+                async move { storage.read_metadata_from_path(&path).await.ok().flatten() }
+            })
+            .buffer_unordered(CONCURRENCY)
+            .collect()
+            .await;
+
+        // Batch insert into index
         let mut loaded = 0usize;
         let mut expired = 0usize;
+        let mut total_size = 0u64;
 
-        for (key, meta) in entries {
-            let ttl = config.ttl_for(&key);
-            let age = meta.age();
+        // Collect valid entries first
+        let mut valid_entries = Vec::with_capacity(results.len());
 
-            if age < ttl {
-                index.insert(key.clone(), Entry { size: meta.size }).await;
-                total += meta.size;
+        for meta in results.into_iter().flatten() {
+            let ttl = config.ttl_for(&meta.key);
+            if meta.age() < ttl {
+                valid_entries.push((meta.key, meta.size));
                 loaded += 1;
             } else {
-                let _ = storage.delete(&key).await;
                 expired += 1;
             }
         }
 
-        info!(
-            loaded,
-            expired,
-            size_mb = total / 1024 / 1024,
-            "Cache initialized"
-        );
+        // Batch insert - moka handles this efficiently
+        for (key, size) in valid_entries {
+            total_size += size;
+            index.insert(key, Entry { size }).await;
+        }
 
-        Ok(Self { storage, index })
+        // Run pending tasks to ensure insertions are processed
+        index.run_pending_tasks().await;
+
+        Ok((loaded, expired, total_size))
     }
 
     pub async fn open(&self, key: &str) -> Option<(File, Metadata)> {
+        // Check index first (fast path)
         if self.index.get(key).await.is_none() {
+            // If still loading, also check storage directly
+            if self.loading.load(Ordering::Acquire) {
+                // Fallback to direct storage check during loading
+                if let Ok(Some((file, meta))) = self.storage.open(key).await {
+                    // Insert into index for future lookups
+                    self.index
+                        .insert(key.to_owned(), Entry { size: meta.size })
+                        .await;
+                    return Some((file, meta));
+                }
+            }
             return None;
         }
 

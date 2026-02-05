@@ -1,6 +1,6 @@
 [package]
 name = "apt-cacher-rs"
-version = "3.0.2"
+version = "3.0.3"
 edition = "2024"
 description = "A high-performance caching proxy for APT repositories"
 license = "MIT"
@@ -37,6 +37,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+percent-encoding = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"

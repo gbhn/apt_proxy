@@ -17,6 +17,7 @@ use cache::CacheManager;
 use config::Settings;
 use downloader::Downloader;
 use error::{ProxyError, Result};
+use percent_encoding::percent_decode_str;
 use std::sync::Arc;
 use std::time::Instant;
 use tower::ServiceBuilder;
@@ -100,48 +101,65 @@ async fn proxy_handler(
 }
 
 fn validate_path(path: &str) -> Result<()> {
+    // Length check on raw path
     if path.is_empty() || path.len() > 2048 {
         return Err(ProxyError::InvalidPath("Invalid length".into()));
     }
 
-    if memchr::memchr(0, path.as_bytes()).is_some() {
-        return Err(ProxyError::InvalidPath("Null byte".into()));
+    // Decode percent-encoding for security checks
+    let decoded = percent_decode_str(path)
+        .decode_utf8()
+        .map_err(|_| ProxyError::InvalidPath("Invalid UTF-8 encoding".into()))?;
+
+    // Check for null bytes
+    if decoded.contains('\0') {
+        return Err(ProxyError::InvalidPath("Null byte not allowed".into()));
     }
 
-    if path.starts_with('/') {
-        return Err(ProxyError::InvalidPath("Absolute path not allowed".into()));
-    }
-
-    let path_lower = path.to_lowercase();
-    if path_lower.contains("%2e") || path_lower.contains("%00") {
-        return Err(ProxyError::InvalidPath("Encoded special characters".into()));
-    }
-
-    if path.contains("//") {
-        return Err(ProxyError::InvalidPath("Double slashes not allowed".into()));
-    }
-
-    if path.contains('\\') {
+    // Check for backslashes (Windows path separator)
+    if decoded.contains('\\') {
         return Err(ProxyError::InvalidPath("Backslashes not allowed".into()));
     }
 
-    for component in path.split('/') {
-        if component == ".." || component == "." {
-            return Err(ProxyError::InvalidPath("Path traversal".into()));
+    // Check for absolute paths
+    if decoded.starts_with('/') {
+        return Err(ProxyError::InvalidPath("Absolute path not allowed".into()));
+    }
+
+    // Check for double slashes
+    if decoded.contains("//") {
+        return Err(ProxyError::InvalidPath("Double slashes not allowed".into()));
+    }
+
+    // Check each path component for traversal attempts
+    for component in decoded.split('/') {
+        // Empty components are already caught by // check above, but be safe
+        if component.is_empty() {
+            continue;
         }
 
-        if component.starts_with('.') && component != ".well-known" && !component.is_empty() {
-            if component.contains("..") {
-                return Err(ProxyError::InvalidPath("Path traversal".into()));
-            }
+        // Block . and .. explicitly
+        if component == "." || component == ".." {
+            return Err(ProxyError::InvalidPath("Path traversal not allowed".into()));
+        }
+
+        // Block hidden files except .well-known
+        if component.starts_with('.') && component != ".well-known" {
+            return Err(ProxyError::InvalidPath("Hidden files not allowed".into()));
         }
     }
 
-    let normalized = path.replace('\\', "/");
-    let clean = path_clean::PathClean::clean(std::path::Path::new(&normalized));
-    let clean_str = clean.to_string_lossy();
+    // Final check: normalize path and verify no traversal
+    let normalized = path_clean::PathClean::clean(std::path::Path::new(decoded.as_ref()));
+    let normalized_str = normalized.to_string_lossy();
 
-    if clean_str.starts_with("..") || clean_str.contains("..") {
+    // Check if normalized path escapes
+    if normalized_str.starts_with("..") {
+        return Err(ProxyError::InvalidPath("Path traversal detected".into()));
+    }
+
+    // Also check the normalized path doesn't start with /
+    if normalized_str.starts_with('/') || normalized_str.starts_with('\\') {
         return Err(ProxyError::InvalidPath("Path traversal detected".into()));
     }
 

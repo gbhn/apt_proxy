@@ -38,6 +38,10 @@ impl Metadata {
     pub fn age(&self) -> u64 {
         now_secs().saturating_sub(self.stored_at)
     }
+
+    pub fn remaining_ttl(&self, max_ttl: u64) -> u64 {
+        max_ttl.saturating_sub(self.age())
+    }
 }
 
 fn now_secs() -> u64 {
@@ -79,10 +83,8 @@ impl Drop for TempFileGuard {
     fn drop(&mut self) {
         if !self.committed {
             for path in &self.paths {
-                let path = path.clone();
-                tokio::spawn(async move {
-                    let _ = fs::remove_file(&path).await;
-                });
+                // Use std::fs for sync cleanup in Drop to avoid runtime issues
+                let _ = std::fs::remove_file(path);
             }
         }
     }
@@ -212,6 +214,38 @@ impl Storage {
 
         debug!(key, size = data.len(), "Cached");
         Ok(data.len() as u64)
+    }
+
+    pub async fn touch(&self, key: &str) -> Result<bool> {
+        let meta_path = self.meta_path(key);
+
+        let meta_bytes = match fs::read(&meta_path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut meta: Metadata = match serde_json::from_slice(&meta_bytes) {
+            Ok(m) => m,
+            Err(_) => return Ok(false),
+        };
+
+        meta.stored_at = now_secs();
+
+        let meta_json = serde_json::to_vec(&meta)?;
+        
+        let id = unique_id();
+        let temp_meta = self.temp_dir.join(format!("{}.json", id));
+        
+        let mut file = File::create(&temp_meta).await?;
+        file.write_all(&meta_json).await?;
+        file.sync_all().await?;
+        drop(file);
+
+        fs::rename(&temp_meta, &meta_path).await?;
+
+        debug!(key, "Touched");
+        Ok(true)
     }
 
     pub async fn delete(&self, key: &str) -> Result<()> {

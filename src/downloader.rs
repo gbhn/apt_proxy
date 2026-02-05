@@ -57,13 +57,16 @@ impl<'a> DownloadGuard<'a> {
         key: String,
         download: &'a ActiveDownload,
     ) -> Self {
-        metrics::inc_active();
         Self {
             active,
             key,
             download,
             completed: false,
         }
+    }
+
+    fn start(&self) {
+        metrics::inc_active();
     }
 
     fn complete(&mut self, success: bool) {
@@ -174,6 +177,7 @@ impl Downloader {
         dl: &ActiveDownload,
     ) -> Result<Response> {
         let mut guard = DownloadGuard::new(&self.active, key.to_string(), dl);
+        guard.start();
 
         debug!(key, url, "Starting download");
 
@@ -195,6 +199,12 @@ impl Downloader {
         if status == reqwest::StatusCode::NOT_MODIFIED {
             info!(key, "304 Not Modified");
             metrics::record_304();
+            
+            // Touch the cache entry to reset its TTL
+            if let Err(e) = self.cache.touch(key).await {
+                warn!(key, error = %e, "Failed to touch cache entry");
+            }
+            
             guard.complete(true);
 
             return match self.cache.get(key).await {
@@ -278,16 +288,21 @@ impl Downloader {
                 .map(Into::into),
         };
 
-        if let Err(e) = self.cache.put(key, &data, &meta).await {
-            warn!(key, error = %e, "Failed to cache");
+        // Only complete successfully if cache.put succeeds
+        match self.cache.put(key, &data, &meta).await {
+            Ok(_) => {
+                metrics::record_download(size);
+                guard.complete(true);
+                info!(key, size, "Download complete");
+                Ok(self.response_from_data(data, meta))
+            }
+            Err(e) => {
+                warn!(key, error = %e, "Failed to cache");
+                guard.complete(false);
+                // Still return the data even if caching failed
+                Ok(self.response_from_data(data, meta))
+            }
         }
-
-        metrics::record_download(size);
-        guard.complete(true);
-
-        info!(key, size, "Download complete");
-
-        Ok(self.response_from_data(data, meta))
     }
 
     fn filter_headers(&self, headers: &reqwest::header::HeaderMap) -> axum::http::HeaderMap {

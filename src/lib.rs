@@ -77,7 +77,7 @@ impl AppState {
     }
 
     #[inline]
-    pub fn resolve_upstream<'s, 'p>(&'s self, path: &'p str) -> Option<(&'s str, &'p str)> {
+    pub fn resolve_upstream(&self, path: &str) -> Option<(&str, &str)> {
         let (prefix, remainder) = path.split_once('/')?;
         let repo_url = self.settings.repositories.get(prefix)?;
         Some((repo_url.as_str(), remainder))
@@ -165,30 +165,25 @@ async fn proxy_handler(
         .resolve_upstream(&path)
         .ok_or(ProxyError::RepositoryNotFound)?;
 
-    if state.cache.contains(&path).await {
-        info!(
-            path = %logging::fields::path(&path),
-            "Cache HIT"
-        );
+    if let Ok(Some(stored)) = state.storage.open(&path).await {
+        if state.cache.contains(&path).await {
+            info!(
+                path = %logging::fields::path(&path),
+                "Cache HIT"
+            );
 
-        let stored = state
-            .storage
-            .open(&path)
-            .await
-            .map_err(|e| ProxyError::Cache(std::io::Error::new(std::io::ErrorKind::Other, e)))?
-            .ok_or(ProxyError::RepositoryNotFound)?;
+            let meta_size = state.storage.metadata_size(&path).await.unwrap_or(0);
+            
+            state.cache.mark_used(&path, stored.size, meta_size, stored.metadata.clone()).await;
 
-        let meta_size = state.storage.metadata_size(&path).await.unwrap_or(0);
-        
-        state.cache.mark_used(&path, stored.size, meta_size, stored.metadata.clone()).await;
+            let stream = tokio_util::io::ReaderStream::with_capacity(stored.file, 256 * 1024);
+            let mut response = Response::new(axum::body::Body::from_stream(stream));
+            response
+                .headers_mut()
+                .extend(stored.metadata.headers.clone());
 
-        let stream = tokio_util::io::ReaderStream::with_capacity(stored.file, 256 * 1024);
-        let mut response = Response::new(axum::body::Body::from_stream(stream));
-        response
-            .headers_mut()
-            .extend(stored.metadata.headers.clone());
-
-        return Ok(response);
+            return Ok(response);
+        }
     }
 
     let existing_metadata = state.storage.open(&path).await.ok().flatten().map(|s| s.metadata);

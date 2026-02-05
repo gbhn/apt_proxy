@@ -1,11 +1,11 @@
-use crate::cache_policy::{is_cache_valid, CachedEntry};
+use crate::cache_policy::is_cache_valid;
 use crate::config::CacheSettings;
 use crate::logging::fields::{self, size};
 use crate::storage::{CacheMetadata, Storage};
 use std::{
     num::NonZeroUsize,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -32,6 +32,7 @@ pub struct CacheManager {
     lru: Arc<RwLock<lru::LruCache<Arc<str>, CacheEntry>>>,
     total_size: Arc<AtomicU64>,
     max_size: u64,
+    cleanup_running: AtomicBool,
 }
 
 impl CacheManager {
@@ -49,6 +50,7 @@ impl CacheManager {
             ))),
             total_size: Arc::new(AtomicU64::new(0)),
             max_size,
+            cleanup_running: AtomicBool::new(false),
         };
         manager.initialize().await?;
         Ok(manager)
@@ -156,15 +158,26 @@ impl CacheManager {
     }
 
     pub fn spawn_cleanup(&self) {
+        if self.cleanup_running.compare_exchange(
+            false,
+            true,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ).is_err() {
+            return;
+        }
+
         let storage = self.storage.clone();
         let settings = self.settings.clone();
         let lru = self.lru.clone();
         let total_size = self.total_size.clone();
         let max_size = self.max_size;
+        let cleanup_running = self.cleanup_running.clone();
 
         tokio::spawn(
             async move {
                 Self::cleanup_task(storage, settings, lru, total_size, max_size).await;
+                cleanup_running.store(false, Ordering::Release);
             }
             .instrument(info_span!("cache_cleanup")),
         );
@@ -335,6 +348,19 @@ impl CacheManager {
             size: self.total_size.load(Ordering::Acquire),
             max_size: self.max_size,
             entries: self.lru.read().await.len(),
+        }
+    }
+}
+
+impl Clone for CacheManager {
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            settings: self.settings.clone(),
+            lru: self.lru.clone(),
+            total_size: self.total_size.clone(),
+            max_size: self.max_size,
+            cleanup_running: AtomicBool::new(self.cleanup_running.load(Ordering::Acquire)),
         }
     }
 }

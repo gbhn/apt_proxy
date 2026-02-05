@@ -536,6 +536,7 @@ struct StreamingReader {
     state: Arc<DownloadState>,
     buffer: Box<[u8]>,
     position: u64,
+    waiter_removed: bool,
 }
 
 impl StreamingReader {
@@ -545,6 +546,14 @@ impl StreamingReader {
             state,
             buffer: vec![0u8; READ_BUFFER_SIZE].into_boxed_slice(),
             position: 0,
+            waiter_removed: false,
+        }
+    }
+
+    fn remove_waiter_once(&mut self) {
+        if !self.waiter_removed {
+            self.waiter_removed = true;
+            self.state.remove_waiter();
         }
     }
 }
@@ -566,7 +575,7 @@ impl Stream for StreamingReader {
 
                 let status = this.state.status();
                 if status.is_finished() {
-                    this.state.remove_waiter();
+                    this.remove_waiter_once();
                     return if status.is_success() {
                         Poll::Ready(None)
                     } else {
@@ -577,18 +586,18 @@ impl Stream for StreamingReader {
                     };
                 }
 
+                let notified = this.state.notify_data.notified();
                 let waker = cx.waker().clone();
-                let state = this.state.clone();
 
                 tokio::spawn(async move {
-                    state.notify_data.notified().await;
+                    notified.await;
                     waker.wake();
                 });
 
                 Poll::Pending
             }
             Poll::Ready(Err(e)) => {
-                this.state.remove_waiter();
+                this.remove_waiter_once();
                 Poll::Ready(Some(Err(e)))
             }
             Poll::Pending => Poll::Pending,
@@ -598,6 +607,6 @@ impl Stream for StreamingReader {
 
 impl Drop for StreamingReader {
     fn drop(&mut self) {
-        self.state.remove_waiter();
+        self.remove_waiter_once();
     }
 }

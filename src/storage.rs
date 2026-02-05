@@ -3,9 +3,11 @@ use crate::utils;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncWriteExt, BufWriter},
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 use tracing::{debug, info, warn};
 
@@ -53,7 +55,7 @@ impl CacheMetadata {
 
 pub struct Storage {
     base_dir: PathBuf,
-    write_semaphore: tokio::sync::Semaphore,
+    write_semaphore: Arc<Semaphore>,
 }
 
 impl Storage {
@@ -65,7 +67,7 @@ impl Storage {
         );
         Ok(Self {
             base_dir,
-            write_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_WRITES),
+            write_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_WRITES)),
         })
     }
 
@@ -117,7 +119,7 @@ impl Storage {
     }
 
     pub async fn create(&self, key: &str) -> Result<StorageWriter> {
-        let _permit = self.write_semaphore.acquire().await?;
+        let permit = self.write_semaphore.clone().acquire_owned().await?;
         
         let final_path = self.path_for(key);
         let temp_path = self.temp_path_for(key);
@@ -140,6 +142,7 @@ impl Storage {
             temp_path,
             final_path,
             bytes_written: 0,
+            _permit: permit,
         })
     }
 
@@ -292,6 +295,7 @@ pub struct StorageWriter {
     temp_path: PathBuf,
     final_path: PathBuf,
     bytes_written: u64,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl StorageWriter {
@@ -312,6 +316,7 @@ impl StorageWriter {
         metadata: CacheMetadata,
     ) -> Result<(u64, u64)> {
         self.writer.flush().await?;
+        self.writer.get_ref().sync_all().await?;
         drop(self.writer);
 
         fs::rename(&self.temp_path, &self.final_path).await?;

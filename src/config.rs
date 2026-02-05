@@ -109,7 +109,7 @@ impl CacheSettings {
     }
 
     #[inline]
-    fn clamp_ttl(&self, ttl: u64) -> u64 {
+    pub fn clamp_ttl(&self, ttl: u64) -> u64 {
         ttl.clamp(self.min_ttl, self.max_ttl)
     }
 

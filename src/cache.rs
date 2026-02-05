@@ -4,12 +4,11 @@ use moka::future::Cache;
 use moka::Expiry;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::info;
 
 #[derive(Clone)]
 struct Entry {
     size: u64,
-    stored_at: u64,
 }
 
 struct TtlExpiry(Arc<CacheConfig>);
@@ -49,7 +48,6 @@ impl Expiry<Arc<str>, Entry> for TtlExpiry {
 #[derive(Clone)]
 pub struct CacheManager {
     storage: Arc<Storage>,
-    config: Arc<CacheConfig>,
     index: Cache<Arc<str>, Entry>,
 }
 
@@ -61,7 +59,6 @@ impl CacheManager {
     ) -> anyhow::Result<Self> {
         storage.cleanup().await?;
 
-        // Макс. ёмкость в KB для weigher
         let max_capacity_kb = max_size / 1024;
 
         let index: Cache<Arc<str>, Entry> = Cache::builder()
@@ -70,7 +67,6 @@ impl CacheManager {
             .expire_after(TtlExpiry(config.clone()))
             .build();
 
-        // Загружаем существующие записи
         let entries = storage.list().await?;
         let mut total = 0u64;
         let mut loaded = 0usize;
@@ -80,13 +76,7 @@ impl CacheManager {
             let ttl = config.ttl_for(&key);
             if meta.age() < ttl {
                 index
-                    .insert(
-                        Arc::from(key.as_str()),
-                        Entry {
-                            size: meta.size,
-                            stored_at: meta.stored_at,
-                        },
-                    )
+                    .insert(Arc::from(key.as_str()), Entry { size: meta.size })
                     .await;
                 total += meta.size;
                 loaded += 1;
@@ -103,22 +93,19 @@ impl CacheManager {
             "Cache initialized"
         );
 
-        Ok(Self { storage, config, index })
+        Ok(Self { storage, index })
     }
 
     pub async fn get(&self, key: &str) -> Option<(Vec<u8>, Metadata)> {
         let key_arc = Arc::from(key);
 
-        // Проверяем индекс
         if self.index.get(&key_arc).await.is_none() {
             return None;
         }
 
-        // Читаем из storage
         match self.storage.get(key).await {
             Ok(Some(result)) => Some(result),
             _ => {
-                // Инвалидируем индекс если файл не найден
                 self.index.invalidate(&key_arc).await;
                 None
             }
@@ -131,20 +118,10 @@ impl CacheManager {
 
     pub async fn put(&self, key: &str, data: &[u8], meta: &Metadata) -> anyhow::Result<()> {
         self.storage.put(key, data, meta).await?;
-
         self.index
-            .insert(
-                Arc::from(key),
-                Entry {
-                    size: meta.size,
-                    stored_at: meta.stored_at,
-                },
-            )
+            .insert(Arc::from(key), Entry { size: meta.size })
             .await;
-
-        // Запускаем очистку moka
         self.index.run_pending_tasks().await;
-
         Ok(())
     }
 }

@@ -101,7 +101,13 @@ impl Downloader {
         let mut rx = dl.rx.clone();
 
         loop {
-            match *rx.borrow_and_update() {
+            // Сначала читаем текущее значение
+            let status = {
+                let borrowed = rx.borrow_and_update();
+                *borrowed
+            }; // borrowed дропается здесь
+
+            match status {
                 Status::Done(true) => {
                     return match self.cache.get(key).await {
                         Some((data, meta)) => Ok(self.response_from_data(data, meta)),
@@ -111,7 +117,7 @@ impl Downloader {
                 Status::Done(false) => {
                     return Err(ProxyError::Download("Download failed".into()));
                 }
-                _ => {
+                Status::Pending | Status::Downloading => {
                     if rx.changed().await.is_err() {
                         return Err(ProxyError::Download("Download cancelled".into()));
                     }

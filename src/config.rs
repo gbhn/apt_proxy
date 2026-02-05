@@ -24,8 +24,8 @@ pub struct Args {
     #[arg(long, env = "APT_CACHER_PROMETHEUS", default_value = "false")]
     pub prometheus: bool,
 
-    #[arg(long, env = "APT_CACHER_PROMETHEUS_PORT", default_value = "9090")]
-    pub prometheus_port: u16,
+    #[arg(long, env = "APT_CACHER_PROMETHEUS_PORT")]
+    pub prometheus_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -144,10 +144,14 @@ impl Settings {
             figment = figment.merge(Yaml::file(path));
         }
 
-        figment = figment.merge(Env::prefixed("APT_CACHER_").split("_"));
+        // Используем двойное подчёркивание как разделитель для вложенных полей
+        // APT_CACHER_CACHE__DEFAULT_TTL -> cache.default_ttl
+        // APT_CACHER_CACHE_DIR -> cache_dir (остаётся как есть)
+        figment = figment.merge(Env::prefixed("APT_CACHER_").split("__"));
 
         let mut config: ConfigFile = figment.extract()?;
 
+        // Применяем аргументы командной строки (наивысший приоритет)
         if let Some(port) = args.port {
             config.port = Some(port);
         }
@@ -156,6 +160,9 @@ impl Settings {
         }
         if args.prometheus {
             config.prometheus = Some(true);
+        }
+        if let Some(port) = args.prometheus_port {
+            config.prometheus_port = Some(port);
         }
 
         config.cache.compile_patterns();
@@ -171,7 +178,7 @@ impl Settings {
             max_cache_size: config.max_cache_size.map(|b| b.as_u64()).unwrap_or(10 << 30),
             cache: config.cache,
             prometheus: config.prometheus.unwrap_or(false),
-            prometheus_port: config.prometheus_port.unwrap_or(args.prometheus_port),
+            prometheus_port: config.prometheus_port.unwrap_or(9090),
         })
     }
 }

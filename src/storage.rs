@@ -1,10 +1,11 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
-use tracing::debug;
+use tracing::{debug, warn};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -21,19 +22,6 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    pub fn from_response(resp: &reqwest::Response, url: &str, key: &str, size: u64) -> Self {
-        let h = resp.headers();
-        Self {
-            headers: h.clone(),
-            url: url.into(),
-            key: key.into(),
-            stored_at: now_secs(),
-            size,
-            etag: header_str(h, http::header::ETAG),
-            last_modified: header_str(h, http::header::LAST_MODIFIED),
-        }
-    }
-
     pub fn age(&self) -> u64 {
         now_secs().saturating_sub(self.stored_at)
     }
@@ -46,12 +34,42 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn header_str(h: &reqwest::header::HeaderMap, name: http::header::HeaderName) -> Option<String> {
-    h.get(name).and_then(|v| v.to_str().ok()).map(Into::into)
-}
-
 fn unique_id() -> u64 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Guard для очистки временных файлов при ошибках
+struct TempFileGuard {
+    paths: Vec<PathBuf>,
+    committed: bool,
+}
+
+impl TempFileGuard {
+    fn new() -> Self {
+        Self {
+            paths: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn add(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            for path in &self.paths {
+                // Используем блокирующий вызов т.к. Drop синхронный
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 }
 
 pub struct Storage {
@@ -87,17 +105,45 @@ impl Storage {
         let data_path = self.data_path(key);
         let meta_path = self.meta_path(key);
 
-        // Проверяем существование обоих файлов
-        if !fs::try_exists(&data_path).await.unwrap_or(false) {
-            return Ok(None);
-        }
-        if !fs::try_exists(&meta_path).await.unwrap_or(false) {
-            return Ok(None);
-        }
+        // Сначала читаем метаданные
+        let meta_bytes = match fs::read(&meta_path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
 
-        let meta_bytes = fs::read(&meta_path).await?;
-        let meta: Metadata = serde_json::from_slice(&meta_bytes)?;
-        let data = fs::read(&data_path).await?;
+        let meta: Metadata = match serde_json::from_slice(&meta_bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(key, error = %e, "Corrupted metadata, removing");
+                let _ = self.delete(key).await;
+                return Ok(None);
+            }
+        };
+
+        // Затем читаем данные
+        let data = match fs::read(&data_path).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                // Метаданные есть, а данных нет — inconsistent state
+                warn!(key, "Data file missing, removing metadata");
+                let _ = fs::remove_file(&meta_path).await;
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // Проверка целостности: размер должен совпадать
+        if data.len() as u64 != meta.size {
+            warn!(
+                key,
+                expected = meta.size,
+                actual = data.len(),
+                "Size mismatch, removing"
+            );
+            let _ = self.delete(key).await;
+            return Ok(None);
+        }
 
         Ok(Some((data, meta)))
     }
@@ -105,13 +151,20 @@ impl Storage {
     pub async fn get_metadata(&self, key: &str) -> Result<Option<Metadata>> {
         let meta_path = self.meta_path(key);
 
-        if !fs::try_exists(&meta_path).await.unwrap_or(false) {
-            return Ok(None);
-        }
+        let meta_bytes = match fs::read(&meta_path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
 
-        let meta_bytes = fs::read(&meta_path).await?;
-        let meta: Metadata = serde_json::from_slice(&meta_bytes)?;
-        Ok(Some(meta))
+        match serde_json::from_slice(&meta_bytes) {
+            Ok(meta) => Ok(Some(meta)),
+            Err(e) => {
+                warn!(key, error = %e, "Corrupted metadata");
+                let _ = self.delete(key).await;
+                Ok(None)
+            }
+        }
     }
 
     pub async fn put(&self, key: &str, data: &[u8], meta: &Metadata) -> Result<u64> {
@@ -123,10 +176,16 @@ impl Storage {
             fs::create_dir_all(parent).await?;
         }
 
+        // Guard для очистки временных файлов при ошибках
+        let mut guard = TempFileGuard::new();
+
         // Атомарная запись через временные файлы
         let id = unique_id();
         let temp_data = self.temp_dir.join(format!("{}.data", id));
         let temp_meta = self.temp_dir.join(format!("{}.json", id));
+
+        guard.add(temp_data.clone());
+        guard.add(temp_meta.clone());
 
         // Записываем данные
         let mut file = File::create(&temp_data).await?;
@@ -142,8 +201,13 @@ impl Storage {
         drop(file);
 
         // Атомарное переименование
-        fs::rename(&temp_data, &data_path).await?;
+        // Сначала метаданные — если упадёт, данные можно переписать
+        // При следующем запуске cleanup удалит осиротевшие файлы
         fs::rename(&temp_meta, &meta_path).await?;
+        fs::rename(&temp_data, &data_path).await?;
+
+        // Успешно — не удаляем временные файлы (они уже переименованы)
+        guard.commit();
 
         debug!(key, size = data.len(), "Cached");
         Ok(data.len() as u64)
@@ -167,7 +231,56 @@ impl Storage {
                 let _ = fs::remove_file(e.path()).await;
             }
         }
-        debug!("Temp files cleaned");
+
+        // Проверяем консистентность: удаляем метаданные без данных
+        self.cleanup_orphans().await?;
+
+        debug!("Cleanup completed");
+        Ok(())
+    }
+
+    /// Удаляет осиротевшие метаданные (без соответствующих данных)
+    async fn cleanup_orphans(&self) -> Result<()> {
+        let mut stack = vec![self.base_path.clone()];
+        let mut orphaned = 0usize;
+
+        while let Some(dir) = stack.pop() {
+            let mut entries = match fs::read_dir(&dir).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                let file_type = match entry.file_type().await {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+
+                if file_type.is_dir() {
+                    if path.file_name()
+                        .map(|n| n.to_string_lossy().starts_with('.'))
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if path.extension().map(|e| e == "json").unwrap_or(false) {
+                    // Это файл метаданных — проверяем есть ли данные
+                    let data_path = path.with_extension("");
+                    if !fs::try_exists(&data_path).await.unwrap_or(false) {
+                        debug!(path = %path.display(), "Removing orphaned metadata");
+                        let _ = fs::remove_file(&path).await;
+                        orphaned += 1;
+                    }
+                }
+            }
+        }
+
+        if orphaned > 0 {
+            debug!(orphaned, "Removed orphaned metadata files");
+        }
+
         Ok(())
     }
 
@@ -189,8 +302,11 @@ impl Storage {
                 };
 
                 if file_type.is_dir() {
-                    // Пропускаем .tmp
-                    if path.file_name().map(|n| n.to_string_lossy().starts_with('.')).unwrap_or(false) {
+                    // Пропускаем .tmp и другие скрытые директории
+                    if path.file_name()
+                        .map(|n| n.to_string_lossy().starts_with('.'))
+                        .unwrap_or(false)
+                    {
                         continue;
                     }
                     stack.push(path);
@@ -205,14 +321,5 @@ impl Storage {
         }
 
         Ok(result)
-    }
-
-    /// Возвращает общий размер кэша
-    pub async fn total_size(&self) -> u64 {
-        let entries = match self.list().await {
-            Ok(e) => e,
-            Err(_) => return 0,
-        };
-        entries.iter().map(|(_, m)| m.size).sum()
     }
 }

@@ -1,9 +1,11 @@
 use metrics::{counter, describe_counter, describe_gauge, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use tracing::info;
 
 static PROMETHEUS: OnceLock<PrometheusHandle> = OnceLock::new();
+static ACTIVE_DOWNLOADS: AtomicU64 = AtomicU64::new(0);
 
 pub fn init(prometheus_port: Option<u16>) -> anyhow::Result<()> {
     if let Some(port) = prometheus_port {
@@ -52,11 +54,16 @@ pub fn record_error() {
 }
 
 pub fn inc_active() {
-    gauge!("active_downloads").increment(1.0);
+    let prev = ACTIVE_DOWNLOADS.fetch_add(1, Ordering::Relaxed);
+    gauge!("active_downloads").set((prev + 1) as f64);
 }
 
 pub fn dec_active() {
-    gauge!("active_downloads").decrement(1.0);
+    // Защита от переполнения снизу
+    let prev = ACTIVE_DOWNLOADS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(1))
+    }).unwrap_or(0);
+    gauge!("active_downloads").set(prev.saturating_sub(1) as f64);
 }
 
 pub fn render() -> Option<String> {

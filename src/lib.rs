@@ -4,6 +4,7 @@ pub mod config;
 pub mod download_manager;
 pub mod error;
 pub mod logging;
+pub mod metrics;
 pub mod server;
 pub mod storage;
 pub mod utils;
@@ -25,12 +26,14 @@ use cache_manager::CacheManager;
 use config::Settings;
 use download_manager::DownloadManager;
 use error::{ProxyError, Result};
+use metrics::Metrics;
 use storage::Storage;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct AppState {
     pub settings: Settings,
+    pub metrics: Arc<Metrics>,
     cache: CacheManager,
     downloader: DownloadManager,
     storage: Arc<Storage>,
@@ -51,13 +54,15 @@ impl AppState {
             .build()?;
 
         let cache_settings = Arc::new(settings.cache.clone());
-        
+        let metrics = Arc::new(Metrics::new());
+
         let downloader = DownloadManager::new(
-            http_client, 
+            http_client,
             storage.clone(),
             cache_settings.clone(),
+            metrics.clone(),
         );
-        
+
         let cache = CacheManager::new(
             storage.clone(),
             cache_settings,
@@ -70,14 +75,17 @@ impl AppState {
 
         Ok(Self {
             settings,
+            metrics,
             cache,
             downloader,
             storage,
         })
     }
 
+    /// Разрешает upstream URL для заданного пути
+    /// Возвращает (base_url, remainder) где оба имеют lifetime входного path
     #[inline]
-    pub fn resolve_upstream(&self, path: &str) -> Option<(&str, &str)> {
+    pub fn resolve_upstream<'a>(&'a self, path: &'a str) -> Option<(&'a str, &'a str)> {
         let (prefix, remainder) = path.split_once('/')?;
         let repo_url = self.settings.repositories.get(prefix)?;
         Some((repo_url.as_str(), remainder))
@@ -104,11 +112,7 @@ async fn request_logging_middleware(request: Request, next: Next) -> Response {
 
     let start = Instant::now();
 
-    let span = info_span!(
-        "request",
-        id = request_id,
-        method = %method,
-    );
+    let span = info_span!("request", id = request_id, method = %method);
 
     let response = next.run(request).instrument(span).await;
 
@@ -149,9 +153,13 @@ async fn health_check() -> &'static str {
 }
 
 async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let stats = state.cache.stats().await;
+    let cache_stats = state.cache.stats().await;
+    let metrics = state.metrics.snapshot();
     let active = state.downloader.active_count();
-    format!("{}\nActive Downloads: {}", stats, active)
+    format!(
+        "{}\n{}\nActive Downloads: {}",
+        cache_stats, metrics, active
+    )
 }
 
 async fn proxy_handler(
@@ -165,18 +173,21 @@ async fn proxy_handler(
         .resolve_upstream(&path)
         .ok_or(ProxyError::RepositoryNotFound)?;
 
-    if let Ok(Some(stored)) = state.storage.open(&path).await {
-        if state.cache.contains(&path).await {
-            info!(
-                path = %logging::fields::path(&path),
-                "Cache HIT"
-            );
+    // Проверяем кэш
+    if state.cache.contains(&path).await {
+        if let Ok(Some(stored)) = state.storage.open(&path).await {
+            info!(path = %logging::fields::path(&path), "Cache HIT");
 
             let meta_size = state.storage.metadata_size(&path).await.unwrap_or(0);
-            
-            state.cache.mark_used(&path, stored.size, meta_size, stored.metadata.clone()).await;
+            state
+                .cache
+                .mark_used(&path, stored.size, meta_size, stored.metadata.clone())
+                .await;
 
-            let stream = tokio_util::io::ReaderStream::with_capacity(stored.file, 256 * 1024);
+            state.metrics.record_cache_hit(stored.size);
+
+            let stream =
+                tokio_util::io::ReaderStream::with_capacity(stored.file, 256 * 1024);
             let mut response = Response::new(axum::body::Body::from_stream(stream));
             response
                 .headers_mut()
@@ -186,7 +197,15 @@ async fn proxy_handler(
         }
     }
 
-    let existing_metadata = state.storage.open(&path).await.ok().flatten().map(|s| s.metadata);
+    // Для revalidation нужны только метаданные
+    let existing_metadata = state
+        .storage
+        .get_metadata(&path)
+        .await
+        .ok()
+        .flatten();
+
+    state.metrics.record_cache_miss();
 
     info!(
         path = %logging::fields::path(&path),
@@ -206,7 +225,10 @@ async fn proxy_handler(
         .get_or_download(&path, full_url, existing_metadata)
         .await?;
 
-    state.cache.mark_used(&path, file_size, meta_size, metadata).await;
+    state
+        .cache
+        .mark_used(&path, file_size, meta_size, metadata)
+        .await;
 
     if state.cache.needs_cleanup() {
         state.cache.spawn_cleanup();

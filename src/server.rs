@@ -11,17 +11,11 @@ use tracing::{error, info, warn};
 
 pub async fn serve_tcp(app: Router, port: u16) -> anyhow::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!(
-        address = %addr,
-        "Starting TCP server"
-    );
+    info!(address = %addr, "Starting TCP server");
 
     let listener = TcpListener::bind(addr).await?;
 
-    info!(
-        address = %addr,
-        "Server listening"
-    );
+    info!(address = %addr, "Server listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -32,10 +26,7 @@ pub async fn serve_tcp(app: Router, port: u16) -> anyhow::Result<()> {
 }
 
 pub async fn serve_unix(app: Router, socket_path: &Path) -> anyhow::Result<()> {
-    info!(
-        socket = %socket_path.display(),
-        "Starting Unix socket server"
-    );
+    info!(socket = %socket_path.display(), "Starting Unix socket server");
 
     if socket_path.exists() {
         warn!(
@@ -53,10 +44,7 @@ pub async fn serve_unix(app: Router, socket_path: &Path) -> anyhow::Result<()> {
         fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660)).await?;
     }
 
-    info!(
-        socket = %socket_path.display(),
-        "Server listening"
-    );
+    info!(socket = %socket_path.display(), "Server listening");
 
     loop {
         tokio::select! {

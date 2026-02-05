@@ -26,13 +26,14 @@ impl CacheEntry {
     }
 }
 
+#[derive(Clone)]
 pub struct CacheManager {
     storage: Arc<Storage>,
     settings: Arc<CacheSettings>,
     lru: Arc<RwLock<lru::LruCache<Arc<str>, CacheEntry>>>,
     total_size: Arc<AtomicU64>,
     max_size: u64,
-    cleanup_running: AtomicBool,
+    cleanup_running: Arc<AtomicBool>,
 }
 
 impl CacheManager {
@@ -50,7 +51,7 @@ impl CacheManager {
             ))),
             total_size: Arc::new(AtomicU64::new(0)),
             max_size,
-            cleanup_running: AtomicBool::new(false),
+            cleanup_running: Arc::new(AtomicBool::new(false)),
         };
         manager.initialize().await?;
         Ok(manager)
@@ -108,19 +109,40 @@ impl CacheManager {
     }
 
     pub async fn contains(&self, key: &str) -> bool {
-        if let Some(entry) = self.lru.read().await.peek(&Arc::from(key)) {
-            if is_cache_valid(&entry.metadata, &self.settings) {
-                return true;
+        let key_arc = Arc::from(key);
+
+        // Сначала проверяем LRU
+        {
+            let lru = self.lru.read().await;
+            if let Some(entry) = lru.peek(&key_arc) {
+                if is_cache_valid(&entry.metadata, &self.settings) {
+                    return true;
+                }
+                debug!(
+                    key = %fields::path(key),
+                    "Entry found in LRU but expired"
+                );
+                return false;
             }
-            debug!(
-                key = %fields::path(key),
-                "Entry found but expired"
-            );
-            return false;
         }
 
+        // Проверяем storage и восстанавливаем LRU если найдено
         if let Ok(Some(stored)) = self.storage.open(key).await {
             if is_cache_valid(&stored.metadata, &self.settings) {
+                // Восстанавливаем запись в LRU
+                let meta_size = self.storage.metadata_size(key).await.unwrap_or(0);
+                let entry = CacheEntry {
+                    data_size: stored.size,
+                    meta_size,
+                    metadata: Arc::new(stored.metadata),
+                };
+
+                self.lru_insert(key_arc, entry).await;
+
+                debug!(
+                    key = %fields::path(key),
+                    "Restored entry to LRU from storage"
+                );
                 return true;
             }
         }
@@ -128,29 +150,85 @@ impl CacheManager {
         false
     }
 
-    pub async fn mark_used(&self, key: &str, data_size: u64, meta_size: u64, metadata: CacheMetadata) {
+    /// Добавляет или обновляет запись в LRU, корректно отслеживая размер
+    async fn lru_insert(&self, key: Arc<str>, entry: CacheEntry) {
+        let mut lru = self.lru.write().await;
+        let new_size = entry.total_size();
+
+        // Проверяем существующий размер
+        let old_size = lru.peek(&key).map(|e| e.total_size()).unwrap_or(0);
+
+        // push возвращает вытесненную запись, если есть
+        if let Some((evicted_key, evicted_entry)) = lru.push(key.clone(), entry) {
+            let evicted_size = evicted_entry.total_size();
+
+            if evicted_key != key {
+                // Вытеснен другой ключ из-за capacity limit
+                self.total_size.fetch_sub(evicted_size, Ordering::AcqRel);
+                debug!(
+                    evicted = %fields::path(&evicted_key),
+                    size = %size(evicted_size),
+                    "LRU evicted entry due to capacity"
+                );
+            }
+        }
+
+        // Обновляем total_size
+        if new_size > old_size {
+            self.total_size.fetch_add(new_size - old_size, Ordering::AcqRel);
+        } else if old_size > new_size {
+            self.total_size.fetch_sub(old_size - new_size, Ordering::AcqRel);
+        }
+    }
+
+    pub async fn mark_used(
+        &self,
+        key: &str,
+        data_size: u64,
+        meta_size: u64,
+        metadata: CacheMetadata,
+    ) {
         let entry = CacheEntry {
             data_size,
             meta_size,
             metadata: Arc::new(metadata),
         };
-        let mut lru = self.lru.write().await;
+        self.lru_insert(Arc::from(key), entry).await;
+    }
+
+    /// Получает или загружает метаданные, гарантируя синхронизацию LRU
+    pub async fn get_or_load(&self, key: &str) -> Option<Arc<CacheMetadata>> {
         let key_arc = Arc::from(key);
 
-        if let Some(existing) = lru.get(&key_arc) {
-            let diff = entry.total_size() as i64 - existing.total_size() as i64;
-            if diff != 0 {
-                lru.put(key_arc, entry);
-                if diff > 0 {
-                    self.total_size.fetch_add(diff as u64, Ordering::AcqRel);
-                } else {
-                    self.total_size.fetch_sub(diff.unsigned_abs(), Ordering::AcqRel);
+        // Быстрый путь - проверяем LRU
+        {
+            let mut lru = self.lru.write().await;
+            if let Some(entry) = lru.get(&key_arc) {
+                if is_cache_valid(&entry.metadata, &self.settings) {
+                    return Some(entry.metadata.clone());
                 }
             }
-        } else {
-            lru.put(key_arc, entry.clone());
-            self.total_size.fetch_add(entry.total_size(), Ordering::AcqRel);
         }
+
+        // Загружаем из storage
+        let stored = self.storage.open(key).await.ok()??;
+
+        if !is_cache_valid(&stored.metadata, &self.settings) {
+            return None;
+        }
+
+        // Добавляем в LRU
+        let meta_size = self.storage.metadata_size(key).await.unwrap_or(0);
+        let metadata = Arc::new(stored.metadata);
+        let entry = CacheEntry {
+            data_size: stored.size,
+            meta_size,
+            metadata: metadata.clone(),
+        };
+
+        self.lru_insert(key_arc, entry).await;
+
+        Some(metadata)
     }
 
     pub fn needs_cleanup(&self) -> bool {
@@ -158,12 +236,11 @@ impl CacheManager {
     }
 
     pub fn spawn_cleanup(&self) {
-        if self.cleanup_running.compare_exchange(
-            false,
-            true,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ).is_err() {
+        if self
+            .cleanup_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
 
@@ -214,16 +291,13 @@ impl CacheManager {
                 }
             }
 
-            for (key, size) in expired_keys {
+            for (key, entry_size) in expired_keys {
                 lru.pop(&key);
-                list.push((key.to_string(), size));
-                current_size = current_size.saturating_sub(size);
+                list.push((key.to_string(), entry_size));
+                current_size = current_size.saturating_sub(entry_size);
             }
 
-            debug!(
-                expired = list.len(),
-                "Removed expired entries"
-            );
+            debug!(expired = list.len(), "Removed expired entries");
 
             while current_size > target {
                 if let Some((key, entry)) = lru.pop_lru() {
@@ -293,10 +367,17 @@ impl CacheManager {
 
         tokio::spawn(
             async move {
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+                let mut interval =
+                    tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
                 loop {
                     interval.tick().await;
-                    Self::check_expired_entries(storage.clone(), settings.clone(), lru.clone(), total_size.clone()).await;
+                    Self::check_expired_entries(
+                        storage.clone(),
+                        settings.clone(),
+                        lru.clone(),
+                        total_size.clone(),
+                    )
+                    .await;
                 }
             }
             .instrument(info_span!("expiry_checker")),
@@ -352,19 +433,6 @@ impl CacheManager {
     }
 }
 
-impl Clone for CacheManager {
-    fn clone(&self) -> Self {
-        Self {
-            storage: self.storage.clone(),
-            settings: self.settings.clone(),
-            lru: self.lru.clone(),
-            total_size: self.total_size.clone(),
-            max_size: self.max_size,
-            cleanup_running: AtomicBool::new(self.cleanup_running.load(Ordering::Acquire)),
-        }
-    }
-}
-
 pub struct CacheStats {
     pub size: u64,
     pub max_size: u64,
@@ -373,7 +441,11 @@ pub struct CacheStats {
 
 impl std::fmt::Display for CacheStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let usage_percent = (self.size as f64 / self.max_size as f64 * 100.0) as u32;
+        let usage_percent = if self.max_size > 0 {
+            (self.size as f64 / self.max_size as f64 * 100.0) as u32
+        } else {
+            0
+        };
         write!(
             f,
             "Cache: {}/{} ({}%) │ {} entries",

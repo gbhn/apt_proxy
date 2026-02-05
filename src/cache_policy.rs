@@ -1,92 +1,112 @@
 use crate::config::CacheSettings;
 use crate::storage::CacheMetadata;
+use http::{Request, Response};
 use http_cache_semantics::CachePolicy;
 use std::time::{Duration, SystemTime};
 use tracing::debug;
-use http::{Request, Response};
 
-#[derive(Clone)]
-pub struct CachedEntry {
-    pub metadata: CacheMetadata,
-    pub policy: CachePolicy,
-    pub stored_at: SystemTime,
+/// Единая структура для проверки валидности кэша
+pub struct CacheValidity<'a> {
+    metadata: &'a CacheMetadata,
+    settings: &'a CacheSettings,
+    now: u64,
 }
 
-impl CachedEntry {
-    pub fn new(metadata: CacheMetadata) -> Option<Self> {
-        let request = Request::builder()
-            .method("GET")
-            .uri(&metadata.original_url)
-            .body(())
-            .ok()?;
-
-        let mut response_builder = Response::builder()
-            .status(200);
-
-        if let Some(headers) = response_builder.headers_mut() {
-            *headers = metadata.headers.clone();
-        }
-
-        let response = response_builder.body(()).ok()?;
-        let policy = CachePolicy::new(&request, &response);
-
-        Some(Self {
-            metadata,
-            policy,
-            stored_at: SystemTime::UNIX_EPOCH + Duration::from_secs(metadata.stored_at),
-        })
+impl<'a> CacheValidity<'a> {
+    pub fn new(metadata: &'a CacheMetadata, settings: &'a CacheSettings) -> Self {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self { metadata, settings, now }
     }
 
+    /// Возраст записи в секундах
+    #[inline]
+    pub fn age(&self) -> u64 {
+        self.now.saturating_sub(self.metadata.stored_at)
+    }
+
+    /// TTL для этой записи
+    #[inline]
+    pub fn ttl(&self) -> u64 {
+        calculate_ttl(
+            &self.metadata.headers,
+            self.metadata.key.as_deref().unwrap_or(""),
+            self.settings,
+        )
+    }
+
+    /// Запись ещё свежая (не истёк TTL)
+    #[inline]
     pub fn is_fresh(&self) -> bool {
-        !self.policy.is_stale(SystemTime::now())
+        self.age() < self.ttl()
     }
 
-    pub fn can_serve_stale(&self, settings: &CacheSettings) -> bool {
+    /// Запись устарела, но может быть использована (stale-while-revalidate)
+    #[inline]
+    pub fn is_stale_but_usable(&self) -> bool {
         if self.is_fresh() {
             return true;
         }
-
-        let now = SystemTime::now();
-        let age = now.duration_since(self.stored_at).unwrap_or_default();
-        
-        let ttl_secs = calculate_ttl(
-            &self.metadata.headers,
-            self.metadata.key.as_deref().unwrap_or(""),
-            settings
-        );
-        let ttl = Duration::from_secs(ttl_secs);
-
-        let stale_duration = age.saturating_sub(ttl);
-        stale_duration.as_secs() <= settings.stale_while_revalidate
+        let stale_duration = self.age().saturating_sub(self.ttl());
+        stale_duration <= self.settings.stale_while_revalidate
     }
 
-    pub fn ttl(&self) -> Duration {
-        self.policy.time_to_live(SystemTime::now())
-    }
-
-    pub fn needs_revalidation(&self, settings: &CacheSettings) -> bool {
-        if settings.validation.always_revalidate {
+    /// Требуется ревалидация
+    #[inline]
+    pub fn needs_revalidation(&self) -> bool {
+        if self.settings.validation.always_revalidate {
             return true;
         }
         !self.is_fresh()
     }
 
-    pub fn get_validation_headers(&self, settings: &CacheSettings) -> Vec<(String, String)> {
+    /// Заголовки для условного запроса
+    pub fn validation_headers(&self) -> Vec<(String, String)> {
         let mut headers = Vec::new();
 
-        if settings.validation.use_etag {
-            if let Some(etag) = &self.metadata.etag {
-                headers.push(("if-none-match".to_string(), etag.clone()));
+        if self.settings.validation.use_etag {
+            if let Some(ref etag) = self.metadata.etag {
+                headers.push(("If-None-Match".to_string(), etag.clone()));
             }
         }
 
-        if settings.validation.use_last_modified {
-            if let Some(last_modified) = &self.metadata.last_modified {
-                headers.push(("if-modified-since".to_string(), last_modified.clone()));
+        if self.settings.validation.use_last_modified {
+            if let Some(ref last_modified) = self.metadata.last_modified {
+                headers.push(("If-Modified-Since".to_string(), last_modified.clone()));
             }
         }
 
         headers
+    }
+
+    /// Создаёт CachePolicy для более сложной логики HTTP кэширования
+    pub fn as_policy(&self) -> Option<CachePolicy> {
+        let request = Request::builder()
+            .method("GET")
+            .uri(&self.metadata.original_url)
+            .body(())
+            .ok()?;
+
+        let mut response_builder = Response::builder().status(200);
+        if let Some(headers) = response_builder.headers_mut() {
+            *headers = self.metadata.headers.clone();
+        }
+        let response = response_builder.body(()).ok()?;
+
+        Some(CachePolicy::new(&request, &response))
+    }
+
+    /// Оставшееся время жизни
+    pub fn time_to_live(&self) -> Duration {
+        let ttl = self.ttl();
+        let age = self.age();
+        if age >= ttl {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(ttl - age)
+        }
     }
 }
 
@@ -112,9 +132,8 @@ pub fn calculate_ttl(
         .body(())
         .unwrap();
 
-    let mut response_builder = Response::builder()
-        .status(200);
-        
+    let mut response_builder = Response::builder().status(200);
+
     if let Some(h) = response_builder.headers_mut() {
         *h = headers.clone();
     }
@@ -139,21 +158,31 @@ pub fn calculate_ttl(
     ttl
 }
 
-pub fn is_cache_valid(
-    metadata: &CacheMetadata,
-    settings: &CacheSettings,
-) -> bool {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let age = now.saturating_sub(metadata.stored_at);
-    let ttl = calculate_ttl(&metadata.headers, metadata.key.as_deref().unwrap_or(""), settings);
-
-    age < ttl
+/// Проверяет, валидна ли запись кэша
+#[inline]
+pub fn is_cache_valid(metadata: &CacheMetadata, settings: &CacheSettings) -> bool {
+    CacheValidity::new(metadata, settings).is_fresh()
 }
 
+/// Проверяет, можно ли использовать устаревшую запись
+#[inline]
+pub fn can_serve_stale(metadata: &CacheMetadata, settings: &CacheSettings) -> bool {
+    CacheValidity::new(metadata, settings).is_stale_but_usable()
+}
+
+/// Проверяет, требуется ли ревалидация
+#[inline]
+pub fn needs_revalidation(metadata: &CacheMetadata, settings: &CacheSettings) -> bool {
+    CacheValidity::new(metadata, settings).needs_revalidation()
+}
+
+/// Получает заголовки для условного запроса
+#[inline]
+pub fn get_validation_headers(metadata: &CacheMetadata, settings: &CacheSettings) -> Vec<(String, String)> {
+    CacheValidity::new(metadata, settings).validation_headers()
+}
+
+#[inline]
 pub fn is_not_modified_response(status: u16) -> bool {
     status == 304
 }
@@ -174,10 +203,7 @@ mod tests {
     #[test]
     fn test_calculate_ttl_with_cache_control() {
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            "cache-control",
-            "max-age=3600".parse().unwrap(),
-        );
+        headers.insert("cache-control", "max-age=3600".parse().unwrap());
 
         let settings = CacheSettings::default();
         let ttl = calculate_ttl(&headers, "test/file.deb", &settings);
@@ -189,7 +215,7 @@ mod tests {
     fn test_calculate_ttl_pattern_override() {
         let headers = axum::http::HeaderMap::new();
         let mut settings = CacheSettings::default();
-        
+
         settings.ttl_overrides.push(crate::config::TtlOverride {
             pattern: r"\.deb$".to_string(),
             ttl: 2592000,
@@ -197,7 +223,30 @@ mod tests {
         });
 
         let ttl = calculate_ttl(&headers, "ubuntu/pool/main/test_1.0_amd64.deb", &settings);
-        
+
         assert_eq!(ttl, settings.max_ttl.min(2592000));
+    }
+
+    #[test]
+    fn test_cache_validity() {
+        let settings = CacheSettings::default();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let metadata = CacheMetadata {
+            headers: axum::http::HeaderMap::new(),
+            original_url: "http://example.com/test".to_string(),
+            key: Some("test".to_string()),
+            stored_at: now - 100, // 100 seconds ago
+            content_length: 1000,
+            etag: Some("\"abc123\"".to_string()),
+            last_modified: None,
+        };
+
+        let validity = CacheValidity::new(&metadata, &settings);
+        assert!(validity.is_fresh()); // default_ttl is 86400
+        assert_eq!(validity.age(), 100);
     }
 }

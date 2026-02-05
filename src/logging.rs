@@ -47,8 +47,10 @@ pub struct LogGuard {
 }
 
 pub fn init(config: LogConfig) -> LogGuard {
-    let use_colors = config.colors.unwrap_or_else(|| std::io::stderr().is_terminal());
-    
+    let use_colors = config
+        .colors
+        .unwrap_or_else(|| std::io::stderr().is_terminal());
+
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&config.level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
@@ -62,12 +64,12 @@ pub fn init(config: LogConfig) -> LogGuard {
                 .json()
                 .with_writer(file_writer)
                 .with_ansi(false);
-            let console_layer = tracing_subscriber::fmt::layer()
-                .json()
-                .with_ansi(false);
-            
+            let console_layer = tracing_subscriber::fmt::layer().json().with_ansi(false);
+
             registry.with(console_layer).with(file_layer).init();
-            LogGuard { _file_guard: Some(guard) }
+            LogGuard {
+                _file_guard: Some(guard),
+            }
         }
         (Some(path), LogFormat::Compact) => {
             let (file_writer, guard) = create_file_appender(path);
@@ -78,9 +80,11 @@ pub fn init(config: LogConfig) -> LogGuard {
             let console_layer = tracing_subscriber::fmt::layer()
                 .compact()
                 .with_ansi(use_colors);
-            
+
             registry.with(console_layer).with(file_layer).init();
-            LogGuard { _file_guard: Some(guard) }
+            LogGuard {
+                _file_guard: Some(guard),
+            }
         }
         (Some(path), LogFormat::Pretty) => {
             let (file_writer, guard) = create_file_appender(path);
@@ -90,15 +94,15 @@ pub fn init(config: LogConfig) -> LogGuard {
             let console_layer = tracing_subscriber::fmt::layer()
                 .event_format(PrettyFormatter::new(use_colors))
                 .with_ansi(use_colors);
-            
+
             registry.with(console_layer).with(file_layer).init();
-            LogGuard { _file_guard: Some(guard) }
+            LogGuard {
+                _file_guard: Some(guard),
+            }
         }
         (None, LogFormat::Json) => {
-            let console_layer = tracing_subscriber::fmt::layer()
-                .json()
-                .with_ansi(false);
-            
+            let console_layer = tracing_subscriber::fmt::layer().json().with_ansi(false);
+
             registry.with(console_layer).init();
             LogGuard { _file_guard: None }
         }
@@ -106,7 +110,7 @@ pub fn init(config: LogConfig) -> LogGuard {
             let console_layer = tracing_subscriber::fmt::layer()
                 .compact()
                 .with_ansi(use_colors);
-            
+
             registry.with(console_layer).init();
             LogGuard { _file_guard: None }
         }
@@ -114,14 +118,16 @@ pub fn init(config: LogConfig) -> LogGuard {
             let console_layer = tracing_subscriber::fmt::layer()
                 .event_format(PrettyFormatter::new(use_colors))
                 .with_ansi(use_colors);
-            
+
             registry.with(console_layer).init();
             LogGuard { _file_guard: None }
         }
     }
 }
 
-fn create_file_appender(path: &Path) -> (tracing_appender::non_blocking::NonBlocking, WorkerGuard) {
+fn create_file_appender(
+    path: &Path,
+) -> (tracing_appender::non_blocking::NonBlocking, WorkerGuard) {
     let file_appender = tracing_appender::rolling::daily(
         path.parent().unwrap_or(Path::new(".")),
         path.file_name().unwrap_or_default(),
@@ -206,7 +212,11 @@ where
         let level = *metadata.level();
 
         let now = chrono::Local::now();
-        write!(writer, "{} ", self.dim(&now.format("%H:%M:%S%.3f").to_string()))?;
+        write!(
+            writer,
+            "{} ",
+            self.dim(&now.format("%H:%M:%S%.3f").to_string())
+        )?;
 
         write!(writer, "{} ", self.style_level(level))?;
 

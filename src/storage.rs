@@ -61,10 +61,7 @@ pub struct Storage {
 impl Storage {
     pub async fn new(base_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&base_dir).await?;
-        debug!(
-            path = %base_dir.display(),
-            "Storage directory initialized"
-        );
+        debug!(path = %base_dir.display(), "Storage directory initialized");
         Ok(Self {
             base_dir,
             write_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_WRITES)),
@@ -93,10 +90,26 @@ impl Storage {
     pub async fn metadata_size(&self, key: &str) -> Result<u64> {
         let path = self.path_for(key);
         let meta_path = self.metadata_path_for(&path);
-        
+
         match fs::metadata(&meta_path).await {
             Ok(meta) => Ok(meta.len()),
             Err(_) => Ok(0),
+        }
+    }
+
+    /// Получает только метаданные без открытия файла
+    pub async fn get_metadata(&self, key: &str) -> Result<Option<CacheMetadata>> {
+        let path = self.path_for(key);
+        match self.load_metadata(&path).await {
+            Ok(meta) => Ok(Some(meta)),
+            Err(e) => {
+                if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                    if io_err.kind() == std::io::ErrorKind::NotFound {
+                        return Ok(None);
+                    }
+                }
+                Err(e)
+            }
         }
     }
 
@@ -112,7 +125,7 @@ impl Storage {
                     metadata,
                     size: file_size,
                 }))
-            },
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -120,7 +133,7 @@ impl Storage {
 
     pub async fn create(&self, key: &str) -> Result<StorageWriter> {
         let permit = self.write_semaphore.clone().acquire_owned().await?;
-        
+
         let final_path = self.path_for(key);
         let temp_path = self.temp_path_for(key);
 
@@ -138,11 +151,12 @@ impl Storage {
         debug!(path = %temp_path.display(), "Created temp file");
 
         Ok(StorageWriter {
-            writer: BufWriter::with_capacity(WRITE_BUFFER_SIZE, file),
+            writer: Some(BufWriter::with_capacity(WRITE_BUFFER_SIZE, file)),
             temp_path,
             final_path,
             bytes_written: 0,
             _permit: permit,
+            finalized: false,
         })
     }
 
@@ -244,8 +258,11 @@ impl Storage {
                     dirs.push(path);
                     continue;
                 }
-                
-                if path.extension().map_or(false, |e| e == "meta" || e == "tmp" || e == "part") {
+
+                if path
+                    .extension()
+                    .map_or(false, |e| e == "meta" || e == "tmp" || e == "part")
+                {
                     continue;
                 }
 
@@ -258,18 +275,13 @@ impl Storage {
                         .clone()
                         .unwrap_or_else(|| cache_meta.original_url.clone());
 
-                    files.push((
-                        effective_key,
-                        meta.len(),
-                        meta_size,
-                        cache_meta,
-                    ));
+                    files.push((effective_key, meta.len(), meta_size, cache_meta));
                 }
             }
         }
         Ok(files)
     }
-    
+
     pub async fn stats(&self) -> StorageStats {
         let available_permits = self.write_semaphore.available_permits();
         StorageStats {
@@ -291,17 +303,20 @@ pub struct StoredFile {
 }
 
 pub struct StorageWriter {
-    writer: BufWriter<File>,
+    writer: Option<BufWriter<File>>,
     temp_path: PathBuf,
     final_path: PathBuf,
     bytes_written: u64,
     _permit: OwnedSemaphorePermit,
+    finalized: bool,
 }
 
 impl StorageWriter {
     pub async fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.writer.write_all(data).await?;
-        self.bytes_written += data.len() as u64;
+        if let Some(ref mut writer) = self.writer {
+            writer.write_all(data).await?;
+            self.bytes_written += data.len() as u64;
+        }
         Ok(())
     }
 
@@ -315,9 +330,13 @@ impl StorageWriter {
         storage: &Storage,
         metadata: CacheMetadata,
     ) -> Result<(u64, u64)> {
-        self.writer.flush().await?;
-        self.writer.get_ref().sync_all().await?;
-        drop(self.writer);
+        self.finalized = true;
+
+        if let Some(mut writer) = self.writer.take() {
+            writer.flush().await?;
+            writer.get_ref().sync_all().await?;
+            drop(writer);
+        }
 
         fs::rename(&self.temp_path, &self.final_path).await?;
         debug!(
@@ -330,13 +349,48 @@ impl StorageWriter {
         Ok((self.bytes_written, meta_size))
     }
 
-    pub async fn abort(self) -> Result<()> {
-        drop(self.writer);
-        fs::remove_file(&self.temp_path).await.ok();
-        warn!(
+    pub async fn abort(mut self) -> Result<()> {
+        self.finalized = true;
+
+        if let Some(writer) = self.writer.take() {
+            drop(writer);
+        }
+
+        if let Err(e) = fs::remove_file(&self.temp_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    path = %self.temp_path.display(),
+                    error = %e,
+                    "Failed to remove temp file during abort"
+                );
+            }
+        }
+
+        debug!(
             path = %self.temp_path.display(),
+            bytes = self.bytes_written,
             "Aborted write operation"
         );
+
         Ok(())
+    }
+}
+
+impl Drop for StorageWriter {
+    fn drop(&mut self) {
+        // Если finalize/abort не был вызван, удаляем temp файл
+        if !self.finalized {
+            let path = self.temp_path.clone();
+            tokio::spawn(async move {
+                if let Err(e) = fs::remove_file(&path).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!(
+                            path = %path.display(),
+                            "Failed to cleanup temp file on drop"
+                        );
+                    }
+                }
+            });
+        }
     }
 }

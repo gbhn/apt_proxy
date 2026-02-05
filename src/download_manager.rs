@@ -1,6 +1,7 @@
 use crate::cache_policy::is_not_modified_response;
 use crate::config::CacheSettings;
 use crate::logging::fields::{self, size};
+use crate::metrics::Metrics;
 use crate::storage::{CacheMetadata, Storage};
 use axum::{body::Body, response::Response};
 use bytes::Bytes;
@@ -18,9 +19,10 @@ use std::{
 use tokio::{
     fs::File,
     io::{AsyncRead, ReadBuf},
-    sync::{watch, Notify},
+    sync::{watch, RwLock},
     time::timeout,
 };
+use tokio_stream::wrappers::WatchStream;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
 const HEADER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -52,21 +54,18 @@ impl DownloadStatus {
     }
 
     pub fn is_success(&self) -> bool {
-        matches!(
-            self,
-            Self::Completed { success: true } | Self::NotModified
-        )
+        matches!(self, Self::Completed { success: true } | Self::NotModified)
     }
 }
 
 struct DownloadState {
     status_tx: watch::Sender<DownloadStatus>,
     status_rx: watch::Receiver<DownloadStatus>,
-    notify_file_ready: Notify,
+    notify_file_ready: tokio::sync::Notify,
     is_file_ready: AtomicBool,
-    notify_data: Notify,
+    notify_data: tokio::sync::Notify,
     bytes_written: AtomicU64,
-    metadata: tokio::sync::OnceCell<Arc<CacheMetadata>>,
+    metadata: RwLock<Option<Arc<CacheMetadata>>>,
     waiters: AtomicU64,
     file_size: AtomicU64,
     meta_size: AtomicU64,
@@ -78,11 +77,11 @@ impl DownloadState {
         Self {
             status_tx,
             status_rx,
-            notify_file_ready: Notify::new(),
+            notify_file_ready: tokio::sync::Notify::new(),
             is_file_ready: AtomicBool::new(false),
-            notify_data: Notify::new(),
+            notify_data: tokio::sync::Notify::new(),
             bytes_written: AtomicU64::new(0),
-            metadata: tokio::sync::OnceCell::new(),
+            metadata: RwLock::new(None),
             waiters: AtomicU64::new(0),
             file_size: AtomicU64::new(0),
             meta_size: AtomicU64::new(0),
@@ -155,6 +154,23 @@ impl DownloadState {
         self.notify_data.notify_waiters();
     }
 
+    async fn set_metadata(&self, metadata: CacheMetadata) {
+        *self.metadata.write().await = Some(Arc::new(metadata));
+    }
+
+    async fn update_content_length(&self, actual_size: u64) {
+        let mut guard = self.metadata.write().await;
+        if let Some(ref mut meta_arc) = *guard {
+            let mut meta = (**meta_arc).clone();
+            meta.content_length = actual_size;
+            *meta_arc = Arc::new(meta);
+        }
+    }
+
+    async fn get_metadata(&self) -> Option<Arc<CacheMetadata>> {
+        self.metadata.read().await.clone()
+    }
+
     fn add_waiter(&self) {
         self.waiters.fetch_add(1, Ordering::Relaxed);
     }
@@ -179,6 +195,7 @@ pub struct DownloadManager {
     client: reqwest::Client,
     storage: Arc<Storage>,
     settings: Arc<CacheSettings>,
+    metrics: Arc<Metrics>,
     active: Arc<DashMap<Arc<str>, Arc<DownloadState>>>,
 }
 
@@ -187,11 +204,13 @@ impl DownloadManager {
         client: reqwest::Client,
         storage: Arc<Storage>,
         settings: Arc<CacheSettings>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             client,
             storage,
             settings,
+            metrics,
             active: Arc::new(DashMap::with_capacity(128)),
         }
     }
@@ -212,6 +231,8 @@ impl DownloadManager {
                 state.clone(),
                 existing_metadata,
             );
+        } else {
+            self.metrics.record_coalesced_request();
         }
 
         let status_code = timeout(HEADER_WAIT_TIMEOUT, state.wait_for_status())
@@ -220,11 +241,13 @@ impl DownloadManager {
 
         if status_code == 304 {
             state.remove_waiter();
+            self.metrics.record_304();
             return self.serve_from_storage(key, &state).await;
         }
 
         if status_code != 200 {
             state.remove_waiter();
+            self.metrics.record_upstream_error();
             return Err(crate::error::ProxyError::UpstreamError(
                 axum::http::StatusCode::from_u16(status_code)
                     .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
@@ -249,15 +272,15 @@ impl DownloadManager {
             Ok(file) => {
                 let stream = StreamingReader::new(file, state.clone());
                 let mut response = Response::new(Body::from_stream(stream));
-                if let Some(meta) = state.metadata.get() {
+                if let Some(meta) = state.get_metadata().await {
                     response.headers_mut().extend(meta.headers.clone());
                 }
 
                 let (file_size, meta_size) = state.get_sizes();
                 let metadata = state
-                    .metadata
-                    .get()
-                    .map(|m| (**m).clone())
+                    .get_metadata()
+                    .await
+                    .map(|m| (*m).clone())
                     .unwrap_or_else(|| CacheMetadata {
                         headers: Default::default(),
                         original_url: String::new(),
@@ -294,10 +317,7 @@ impl DownloadManager {
             .open(key)
             .await
             .map_err(|e| {
-                crate::error::ProxyError::Cache(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e,
-                ))
+                crate::error::ProxyError::Cache(std::io::Error::new(std::io::ErrorKind::Other, e))
             })?
             .ok_or_else(|| crate::error::ProxyError::Download("Not found in storage".into()))?;
 
@@ -315,17 +335,11 @@ impl DownloadManager {
         let key_arc: Arc<str> = Arc::from(key);
         match self.active.entry(key_arc.clone()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
-                debug!(
-                    path = %fields::path(key),
-                    "Joining existing download"
-                );
+                debug!(path = %fields::path(key), "Joining existing download");
                 (entry.get().clone(), false)
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
-                info!(
-                    path = %fields::path(key),
-                    "Starting new download"
-                );
+                info!(path = %fields::path(key), "Starting new download");
                 let state = Arc::new(DownloadState::new());
                 entry.insert(state.clone());
                 (state, true)
@@ -343,13 +357,11 @@ impl DownloadManager {
         let client = self.client.clone();
         let storage = self.storage.clone();
         let settings = self.settings.clone();
+        let metrics = self.metrics.clone();
         let active = self.active.clone();
         let key_arc = Arc::from(key.as_str());
 
-        let span = info_span!(
-            "download",
-            path = %fields::path(&key),
-        );
+        let span = info_span!("download", path = %fields::path(&key));
 
         tokio::spawn(
             async move {
@@ -368,6 +380,7 @@ impl DownloadManager {
                     Ok((downloaded_size, meta_size)) => {
                         let elapsed = start.elapsed();
                         if downloaded_size > 0 {
+                            metrics.record_download(downloaded_size);
                             let speed = downloaded_size as f64 / elapsed.as_secs_f64();
                             info!(
                                 size = %size(downloaded_size),
@@ -441,7 +454,7 @@ async fn download_file(
 
     if status == 304 {
         info!("Upstream returned 304 Not Modified");
-        if let Some(_metadata) = existing_metadata {
+        if existing_metadata.is_some() {
             let meta_size = storage.metadata_size(key).await.unwrap_or(0);
             let file_size = storage
                 .open(key)
@@ -457,11 +470,7 @@ async fn download_file(
     }
 
     if !response.status().is_success() {
-        warn!(
-            status = status,
-            url = %url,
-            "Upstream returned error"
-        );
+        warn!(status = status, url = %url, "Upstream returned error");
         state.mark_finished(false, 0, 0);
         return Ok((0, 0));
     }
@@ -480,7 +489,7 @@ async fn download_file(
     let etag = header_to_string(&response_headers, reqwest::header::ETAG);
     let last_modified = header_to_string(&response_headers, reqwest::header::LAST_MODIFIED);
 
-    let mut metadata = CacheMetadata {
+    let metadata = CacheMetadata {
         headers: response_headers,
         original_url: url.clone(),
         key: Some(key.to_string()),
@@ -492,41 +501,91 @@ async fn download_file(
         last_modified,
     };
 
-    state.metadata.set(Arc::new(metadata.clone())).ok();
+    state.set_metadata(metadata.clone()).await;
 
     let mut writer = storage.create(key).await?;
     state.mark_file_ready();
 
     let mut stream = response.bytes_stream();
     let mut last_log_bytes = 0u64;
+    let mut download_error: Option<anyhow::Error> = None;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        writer.write(&chunk).await?;
-        let bytes = writer.bytes_written();
-        state.notify_progress(bytes);
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(chunk) => {
+                if let Err(e) = writer.write(&chunk).await {
+                    download_error = Some(e.into());
+                    break;
+                }
+                let bytes = writer.bytes_written();
+                state.notify_progress(bytes);
 
-        if content_length > PROGRESS_LOG_INTERVAL && bytes - last_log_bytes >= PROGRESS_LOG_INTERVAL
-        {
-            let percent = if content_length > 0 {
-                (bytes as f64 / content_length as f64 * 100.0) as u32
-            } else {
-                0
-            };
-            debug!(
-                downloaded = %size(bytes),
-                total = %size(content_length),
-                percent = percent,
-                "Download progress"
-            );
-            last_log_bytes = bytes;
+                if content_length > PROGRESS_LOG_INTERVAL
+                    && bytes - last_log_bytes >= PROGRESS_LOG_INTERVAL
+                {
+                    let percent = if content_length > 0 {
+                        (bytes as f64 / content_length as f64 * 100.0) as u32
+                    } else {
+                        0
+                    };
+                    debug!(
+                        downloaded = %size(bytes),
+                        total = %size(content_length),
+                        percent = percent,
+                        "Download progress"
+                    );
+                    last_log_bytes = bytes;
+                }
+            }
+            Err(e) => {
+                download_error = Some(e.into());
+                break;
+            }
         }
     }
 
-    let total = writer.bytes_written();
-    metadata.content_length = total;
+    // Обработка ошибки
+    if let Some(error) = download_error {
+        warn!(
+            key = %fields::path(key),
+            bytes_written = writer.bytes_written(),
+            error = %error,
+            "Download failed mid-stream, aborting"
+        );
 
-    let (file_size, meta_size) = writer.finalize(&storage, metadata).await?;
+        writer.abort().await?;
+        state.mark_finished(false, 0, 0);
+
+        return Err(error);
+    }
+
+    let total = writer.bytes_written();
+
+    // Проверяем, что размер совпадает с ожидаемым
+    if content_length > 0 && total != content_length {
+        warn!(
+            key = %fields::path(key),
+            expected = content_length,
+            actual = total,
+            "Content length mismatch"
+        );
+    }
+
+    // Обновляем content_length актуальным значением
+    state.update_content_length(total).await;
+
+    // Получаем обновлённые метаданные для сохранения
+    let final_metadata = state
+        .get_metadata()
+        .await
+        .map(|m| (*m).clone())
+        .unwrap_or_else(|| {
+            let mut m = metadata;
+            m.content_length = total;
+            m
+        });
+
+    let (file_size, meta_size) = writer.finalize(&storage, final_metadata).await?;
     state.mark_finished(true, file_size, meta_size);
     Ok((file_size, meta_size))
 }
@@ -537,16 +596,19 @@ struct StreamingReader {
     buffer: Box<[u8]>,
     position: u64,
     waiter_removed: bool,
+    status_stream: WatchStream<DownloadStatus>,
 }
 
 impl StreamingReader {
     fn new(file: File, state: Arc<DownloadState>) -> Self {
+        let status_stream = WatchStream::new(state.status_rx.clone());
         Self {
             file,
             state,
             buffer: vec![0u8; READ_BUFFER_SIZE].into_boxed_slice(),
             position: 0,
             waiter_removed: false,
+            status_stream,
         }
     }
 
@@ -586,13 +648,18 @@ impl Stream for StreamingReader {
                     };
                 }
 
-                let notified = this.state.notify_data.notified();
-                let waker = cx.waker().clone();
-
-                tokio::spawn(async move {
-                    notified.await;
-                    waker.wake();
-                });
+                // Подписываемся на изменения через watch stream
+                match Pin::new(&mut this.status_stream).poll_next(cx) {
+                    Poll::Ready(Some(_)) => {
+                        // Получили обновление, пробуем читать снова
+                        cx.waker().wake_by_ref();
+                    }
+                    Poll::Ready(None) => {
+                        this.remove_waiter_once();
+                        return Poll::Ready(None);
+                    }
+                    Poll::Pending => {}
+                }
 
                 Poll::Pending
             }

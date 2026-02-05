@@ -1,6 +1,6 @@
 [package]
 name = "apt-cacher-rs"
-version = "2.5.0"
+version = "2.5.1"
 edition = "2024"
 rust-version = "1.85"
 description = "A high-performance caching proxy for APT repositories"
@@ -27,6 +27,7 @@ http-cache-semantics = "2.1"
 httpdate = "1.0"
 
 tokio = { version = "1.49", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
 

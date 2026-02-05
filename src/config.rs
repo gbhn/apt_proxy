@@ -35,6 +35,9 @@ pub struct Args {
 
     #[arg(long, env = "APT_CACHER_MAX_LRU_ENTRIES")]
     pub max_lru_entries: Option<usize>,
+
+    #[arg(long, env = "APT_CACHER_STRICT_PATTERNS", default_value = "false")]
+    pub strict_patterns: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,6 +99,12 @@ fn default_stale_while_revalidate() -> u64 {
     DEFAULT_STALE_WHILE_REVALIDATE
 }
 
+#[derive(Debug, Clone)]
+pub struct PatternCompilationResult {
+    pub successful: usize,
+    pub failed: Vec<(String, String)>,
+}
+
 impl CacheSettings {
     pub fn get_ttl_for_path(&self, path: &str) -> u64 {
         for override_rule in &self.ttl_overrides {
@@ -113,7 +122,11 @@ impl CacheSettings {
         ttl.clamp(self.min_ttl, self.max_ttl)
     }
 
-    pub fn compile_patterns(&mut self) -> anyhow::Result<()> {
+    /// Компилирует паттерны, пропуская невалидные
+    pub fn compile_patterns(&mut self) -> PatternCompilationResult {
+        let mut successful = 0;
+        let mut failed = Vec::new();
+
         for override_rule in &mut self.ttl_overrides {
             match Regex::new(&override_rule.pattern) {
                 Ok(regex) => {
@@ -123,15 +136,45 @@ impl CacheSettings {
                         ttl = override_rule.ttl,
                         "Compiled TTL override pattern"
                     );
+                    successful += 1;
                 }
                 Err(e) => {
+                    let error_msg = e.to_string();
                     warn!(
                         pattern = %override_rule.pattern,
-                        error = %e,
-                        "Failed to compile TTL pattern, skipping"
+                        error = %error_msg,
+                        "Failed to compile TTL pattern"
                     );
+                    failed.push((override_rule.pattern.clone(), error_msg));
                 }
             }
+        }
+
+        // Удаляем правила с невалидными паттернами
+        self.ttl_overrides.retain(|r| r.regex.is_some());
+
+        if !failed.is_empty() {
+            warn!(
+                failed = failed.len(),
+                "Some TTL patterns failed to compile and were skipped"
+            );
+        }
+
+        PatternCompilationResult { successful, failed }
+    }
+
+    /// Строгая версия - возвращает ошибку если любой паттерн невалиден
+    pub fn compile_patterns_strict(&mut self) -> anyhow::Result<()> {
+        for override_rule in &mut self.ttl_overrides {
+            let regex = Regex::new(&override_rule.pattern).map_err(|e| {
+                anyhow::anyhow!("Invalid TTL pattern '{}': {}", override_rule.pattern, e)
+            })?;
+            override_rule.regex = Some(regex);
+            info!(
+                pattern = %override_rule.pattern,
+                ttl = override_rule.ttl,
+                "Compiled TTL override pattern"
+            );
         }
         Ok(())
     }
@@ -155,19 +198,62 @@ pub struct ConfigFile {
 impl ConfigFile {
     pub fn parse_size(s: &str) -> Option<u64> {
         let s = s.trim();
-        if s.is_empty() { return None; }
-        if let Ok(n) = s.parse::<u64>() { return Some(n); }
-        let end = s.find(|c: char| !c.is_ascii_digit() && c != ' ').unwrap_or(s.len());
-        let (num_str, suffix) = s.split_at(end);
-        let num: u64 = num_str.trim().parse().ok()?;
-        let mul = match suffix.trim().to_ascii_uppercase().as_str() {
+        if s.is_empty() {
+            return None;
+        }
+
+        // Чистое число без суффикса
+        if let Ok(n) = s.parse::<u64>() {
+            return Some(n);
+        }
+
+        // Находим границу между числом и суффиксом
+        let mut num_end = 0;
+        let mut has_dot = false;
+
+        for (i, c) in s.char_indices() {
+            if c.is_ascii_digit() {
+                num_end = i + c.len_utf8();
+            } else if c == '.' && !has_dot {
+                has_dot = true;
+                num_end = i + c.len_utf8();
+            } else if c == ' ' {
+                continue;
+            } else {
+                break;
+            }
+        }
+
+        if num_end == 0 {
+            return None;
+        }
+
+        let (num_str, suffix) = s.split_at(num_end);
+        let suffix = suffix.trim().to_ascii_uppercase();
+
+        let multiplier: u64 = match suffix.as_str() {
+            "TB" | "T" | "TIB" => 1 << 40,
             "GB" | "G" | "GIB" => 1 << 30,
             "MB" | "M" | "MIB" => 1 << 20,
             "KB" | "K" | "KIB" => 1 << 10,
             "B" | "" => 1,
             _ => return None,
         };
-        Some(num * mul)
+
+        // Парсим как float чтобы поддержать "1.5GB"
+        let num: f64 = num_str.trim().parse().ok()?;
+
+        if num < 0.0 || num.is_nan() || num.is_infinite() {
+            return None;
+        }
+
+        let result = num * multiplier as f64;
+
+        if result > u64::MAX as f64 {
+            return None;
+        }
+
+        Some(result as u64)
     }
 
     #[inline]
@@ -195,7 +281,19 @@ impl Settings {
         let mut config = Self::load_config_file(&args.config).await?;
         let config_max_cache_size = config.max_cache_size();
 
-        config.cache.compile_patterns()?;
+        // Выбираем режим компиляции паттернов
+        if args.strict_patterns {
+            config.cache.compile_patterns_strict()?;
+        } else {
+            let result = config.cache.compile_patterns();
+            if !result.failed.is_empty() {
+                info!(
+                    successful = result.successful,
+                    failed = result.failed.len(),
+                    "Pattern compilation completed with some failures"
+                );
+            }
+        }
 
         Ok(Self {
             port: args.port.or(config.port).unwrap_or(DEFAULT_PORT),
@@ -294,5 +392,34 @@ fn format_duration(seconds: u64) -> String {
         format!("{}h", seconds / 3600)
     } else {
         format!("{}d", seconds / 86400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_size() {
+        assert_eq!(ConfigFile::parse_size("1024"), Some(1024));
+        assert_eq!(ConfigFile::parse_size("1KB"), Some(1024));
+        assert_eq!(ConfigFile::parse_size("1 KB"), Some(1024));
+        assert_eq!(ConfigFile::parse_size("1.5GB"), Some(1610612736));
+        assert_eq!(ConfigFile::parse_size("1.5 GB"), Some(1610612736));
+        assert_eq!(
+            ConfigFile::parse_size("10gb"),
+            Some(10 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(ConfigFile::parse_size("0.5MB"), Some(524288));
+        assert_eq!(ConfigFile::parse_size(""), None);
+        assert_eq!(ConfigFile::parse_size("abc"), None);
+    }
+
+    #[test]
+    fn test_parse_size_edge_cases() {
+        assert_eq!(ConfigFile::parse_size("0"), Some(0));
+        assert_eq!(ConfigFile::parse_size("1B"), Some(1));
+        assert_eq!(ConfigFile::parse_size("1TB"), Some(1 << 40));
+        assert_eq!(ConfigFile::parse_size("  10  MB  "), Some(10 * 1024 * 1024));
     }
 }

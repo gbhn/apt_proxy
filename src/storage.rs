@@ -10,6 +10,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
 };
 use tracing::{debug, info, warn};
+use walkdir::WalkDir;
 
 const WRITE_BUFFER_SIZE: usize = 512 * 1024;
 const MAX_CONCURRENT_WRITES: usize = 64;
@@ -97,7 +98,6 @@ impl Storage {
         }
     }
 
-    /// Получает только метаданные без открытия файла
     pub async fn get_metadata(&self, key: &str) -> Result<Option<CacheMetadata>> {
         let path = self.path_for(key);
         match self.load_metadata(&path).await {
@@ -200,32 +200,34 @@ impl Storage {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
+    /// Очищает временные файлы используя walkdir для надёжного обхода
     pub async fn cleanup_temp_files(&self) -> Result<()> {
-        let mut dirs = vec![self.base_dir.clone()];
-        let mut count = 0u32;
-        let mut total_size = 0u64;
+        let base_dir = self.base_dir.clone();
 
-        while let Some(dir) = dirs.pop() {
-            let mut entries = match fs::read_dir(&dir).await {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+        let (count, total_size) = tokio::task::spawn_blocking(move || {
+            let mut count = 0u32;
+            let mut total_size = 0u64;
 
-            while let Ok(Some(entry)) = entries.next_entry().await {
+            for entry in WalkDir::new(&base_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+            {
                 let path = entry.path();
-                if path.is_dir() {
-                    dirs.push(path);
-                } else if let Some(ext) = path.extension() {
+                if let Some(ext) = path.extension() {
                     if ext == "tmp" || ext == "part" {
-                        if let Ok(meta) = fs::metadata(&path).await {
+                        if let Ok(meta) = std::fs::metadata(path) {
                             total_size += meta.len();
                         }
-                        let _ = fs::remove_file(&path).await;
+                        let _ = std::fs::remove_file(path);
                         count += 1;
                     }
                 }
             }
-        }
+
+            (count, total_size)
+        })
+        .await?;
 
         if count > 0 {
             info!(
@@ -237,28 +239,21 @@ impl Storage {
         Ok(())
     }
 
+    /// Перечисляет все файлы в кэше используя walkdir
     pub async fn list_all(&self) -> Result<Vec<(String, u64, u64, CacheMetadata)>> {
-        let mut files = Vec::with_capacity(1024);
-        let mut dirs = vec![self.base_dir.clone()];
+        let base_dir = self.base_dir.clone();
 
-        while let Some(dir) = dirs.pop() {
-            let mut entries = match fs::read_dir(&dir).await {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+        tokio::task::spawn_blocking(move || {
+            let mut files = Vec::with_capacity(1024);
 
-            while let Ok(Some(entry)) = entries.next_entry().await {
+            for entry in WalkDir::new(&base_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+            {
                 let path = entry.path();
-                let meta = match entry.metadata().await {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
 
-                if meta.is_dir() {
-                    dirs.push(path);
-                    continue;
-                }
-
+                // Пропускаем служебные файлы
                 if path
                     .extension()
                     .map_or(false, |e| e == "meta" || e == "tmp" || e == "part")
@@ -266,20 +261,36 @@ impl Storage {
                     continue;
                 }
 
-                if let Ok(cache_meta) = self.load_metadata(&path).await {
-                    let meta_path = self.metadata_path_for(&path);
-                    let meta_size = fs::metadata(&meta_path).await.map(|m| m.len()).unwrap_or(0);
+                let file_size = match entry.metadata() {
+                    Ok(m) => m.len(),
+                    Err(_) => continue,
+                };
 
-                    let effective_key = cache_meta
-                        .key
-                        .clone()
-                        .unwrap_or_else(|| cache_meta.original_url.clone());
+                // Загружаем метаданные
+                let meta_path = path.with_extension("meta");
+                let cache_meta = match std::fs::read(&meta_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                {
+                    Some(meta) => meta,
+                    None => continue,
+                };
 
-                    files.push((effective_key, meta.len(), meta_size, cache_meta));
-                }
+                let meta_size = std::fs::metadata(&meta_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+
+                let effective_key: String = match &cache_meta {
+                    CacheMetadata { key: Some(k), .. } => k.clone(),
+                    CacheMetadata { original_url, .. } => original_url.clone(),
+                };
+
+                files.push((effective_key, file_size, meta_size, cache_meta));
             }
-        }
-        Ok(files)
+
+            Ok(files)
+        })
+        .await?
     }
 
     pub async fn stats(&self) -> StorageStats {
@@ -378,7 +389,6 @@ impl StorageWriter {
 
 impl Drop for StorageWriter {
     fn drop(&mut self) {
-        // Если finalize/abort не был вызван, удаляем temp файл
         if !self.finalized {
             let path = self.temp_path.clone();
             tokio::spawn(async move {

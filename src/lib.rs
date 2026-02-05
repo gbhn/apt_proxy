@@ -26,14 +26,12 @@ use cache_manager::CacheManager;
 use config::Settings;
 use download_manager::DownloadManager;
 use error::{ProxyError, Result};
-use metrics::Metrics;
 use storage::Storage;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct AppState {
     pub settings: Settings,
-    pub metrics: Arc<Metrics>,
     cache: CacheManager,
     downloader: DownloadManager,
     storage: Arc<Storage>,
@@ -54,13 +52,11 @@ impl AppState {
             .build()?;
 
         let cache_settings = Arc::new(settings.cache.clone());
-        let metrics = Arc::new(Metrics::new());
 
         let downloader = DownloadManager::new(
             http_client,
             storage.clone(),
             cache_settings.clone(),
-            metrics.clone(),
         );
 
         let cache = CacheManager::new(
@@ -75,15 +71,12 @@ impl AppState {
 
         Ok(Self {
             settings,
-            metrics,
             cache,
             downloader,
             storage,
         })
     }
 
-    /// Разрешает upstream URL для заданного пути
-    /// Возвращает (base_url, remainder) где оба имеют lifetime входного path
     #[inline]
     pub fn resolve_upstream<'a>(&'a self, path: &'a str) -> Option<(&'a str, &'a str)> {
         let (prefix, remainder) = path.split_once('/')?;
@@ -154,11 +147,10 @@ async fn health_check() -> &'static str {
 
 async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cache_stats = state.cache.stats().await;
-    let metrics = state.metrics.snapshot();
     let active = state.downloader.active_count();
     format!(
-        "{}\n{}\nActive Downloads: {}",
-        cache_stats, metrics, active
+        "{}\nActive Downloads: {}",
+        cache_stats, active
     )
 }
 
@@ -184,7 +176,7 @@ async fn proxy_handler(
                 .mark_used(&path, stored.size, meta_size, stored.metadata.clone())
                 .await;
 
-            state.metrics.record_cache_hit(stored.size);
+            metrics::record_cache_hit(stored.size);
 
             let stream =
                 tokio_util::io::ReaderStream::with_capacity(stored.file, 256 * 1024);
@@ -197,7 +189,6 @@ async fn proxy_handler(
         }
     }
 
-    // Для revalidation нужны только метаданные
     let existing_metadata = state
         .storage
         .get_metadata(&path)
@@ -205,7 +196,7 @@ async fn proxy_handler(
         .ok()
         .flatten();
 
-    state.metrics.record_cache_miss();
+    metrics::record_cache_miss();
 
     info!(
         path = %logging::fields::path(&path),

@@ -1,7 +1,7 @@
 use crate::cache_policy::is_not_modified_response;
 use crate::config::CacheSettings;
 use crate::logging::fields::{self, size};
-use crate::metrics::Metrics;
+use crate::metrics;
 use crate::storage::{CacheMetadata, Storage};
 use axum::{body::Body, response::Response};
 use bytes::Bytes;
@@ -195,7 +195,6 @@ pub struct DownloadManager {
     client: reqwest::Client,
     storage: Arc<Storage>,
     settings: Arc<CacheSettings>,
-    metrics: Arc<Metrics>,
     active: Arc<DashMap<Arc<str>, Arc<DownloadState>>>,
 }
 
@@ -204,13 +203,11 @@ impl DownloadManager {
         client: reqwest::Client,
         storage: Arc<Storage>,
         settings: Arc<CacheSettings>,
-        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             client,
             storage,
             settings,
-            metrics,
             active: Arc::new(DashMap::with_capacity(128)),
         }
     }
@@ -225,6 +222,7 @@ impl DownloadManager {
         state.add_waiter();
 
         if is_new {
+            metrics::increment_active_downloads();
             self.spawn_download_task(
                 key.to_string(),
                 upstream_url,
@@ -232,7 +230,7 @@ impl DownloadManager {
                 existing_metadata,
             );
         } else {
-            self.metrics.record_coalesced_request();
+            metrics::record_coalesced_request();
         }
 
         let status_code = timeout(HEADER_WAIT_TIMEOUT, state.wait_for_status())
@@ -241,13 +239,13 @@ impl DownloadManager {
 
         if status_code == 304 {
             state.remove_waiter();
-            self.metrics.record_304();
+            metrics::record_304();
             return self.serve_from_storage(key, &state).await;
         }
 
         if status_code != 200 {
             state.remove_waiter();
-            self.metrics.record_upstream_error();
+            metrics::record_upstream_error();
             return Err(crate::error::ProxyError::UpstreamError(
                 axum::http::StatusCode::from_u16(status_code)
                     .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
@@ -357,7 +355,6 @@ impl DownloadManager {
         let client = self.client.clone();
         let storage = self.storage.clone();
         let settings = self.settings.clone();
-        let metrics = self.metrics.clone();
         let active = self.active.clone();
         let key_arc = Arc::from(key.as_str());
 
@@ -377,14 +374,13 @@ impl DownloadManager {
                 )
                 .await
                 {
-                    Ok((downloaded_size, meta_size)) => {
+                    Ok((downloaded_size, _meta_size)) => {
                         let elapsed = start.elapsed();
                         if downloaded_size > 0 {
-                            metrics.record_download(downloaded_size);
+                            metrics::record_download(downloaded_size);
                             let speed = downloaded_size as f64 / elapsed.as_secs_f64();
                             info!(
                                 size = %size(downloaded_size),
-                                meta_size = %size(meta_size),
                                 time = %fields::duration(elapsed),
                                 speed = %format!("{}/s", size(speed as u64)),
                                 "Download completed"
@@ -397,6 +393,7 @@ impl DownloadManager {
                         error!(error = %e, "Download failed");
                     }
                 }
+                metrics::decrement_active_downloads();
                 active.remove(&key_arc);
             }
             .instrument(span),
@@ -544,7 +541,6 @@ async fn download_file(
         }
     }
 
-    // Обработка ошибки
     if let Some(error) = download_error {
         warn!(
             key = %fields::path(key),
@@ -561,7 +557,6 @@ async fn download_file(
 
     let total = writer.bytes_written();
 
-    // Проверяем, что размер совпадает с ожидаемым
     if content_length > 0 && total != content_length {
         warn!(
             key = %fields::path(key),
@@ -571,10 +566,8 @@ async fn download_file(
         );
     }
 
-    // Обновляем content_length актуальным значением
     state.update_content_length(total).await;
 
-    // Получаем обновлённые метаданные для сохранения
     let final_metadata = state
         .get_metadata()
         .await
@@ -648,10 +641,8 @@ impl Stream for StreamingReader {
                     };
                 }
 
-                // Подписываемся на изменения через watch stream
                 match Pin::new(&mut this.status_stream).poll_next(cx) {
                     Poll::Ready(Some(_)) => {
-                        // Получили обновление, пробуем читать снова
                         cx.waker().wake_by_ref();
                     }
                     Poll::Ready(None) => {

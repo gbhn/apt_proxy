@@ -3,6 +3,7 @@ use apt_cacher_rs::{
     build_router,
     config::{Args, Settings},
     logging::{self, LogConfig, LogFormat},
+    metrics,
     server, AppState,
 };
 use clap::Parser;
@@ -32,6 +33,9 @@ async fn main() -> Result<()> {
     };
 
     let _guard = logging::init(log_config);
+
+    // Инициализируем метрики
+    metrics::init();
 
     if log_format == LogFormat::Pretty {
         logging::print_banner();

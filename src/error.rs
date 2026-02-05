@@ -11,10 +11,10 @@ pub enum ProxyError {
     #[error("Repository not configured")]
     RepositoryNotFound,
 
-    #[error("Cache error: {0}")]
+    #[error("Cache I/O error: {0}")]
     Cache(#[from] std::io::Error),
 
-    #[error("Upstream error: {0}")]
+    #[error("Upstream request failed: {0}")]
     Upstream(#[from] reqwest::Error),
 
     #[error("Upstream returned {0}")]
@@ -23,8 +23,8 @@ pub enum ProxyError {
     #[error("Download failed: {0}")]
     Download(String),
 
-    #[error("Timeout: {0}")]
-    Timeout(String),
+    #[error("Request timed out")]
+    Timeout,
 }
 
 impl ProxyError {
@@ -35,7 +35,7 @@ impl ProxyError {
             Self::UpstreamStatus(code) => *code,
             Self::Upstream(_) | Self::Download(_) => StatusCode::BAD_GATEWAY,
             Self::Cache(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
         }
     }
 }
@@ -48,6 +48,6 @@ impl IntoResponse for ProxyError {
 
 impl From<tokio::time::error::Elapsed> for ProxyError {
     fn from(_: tokio::time::error::Elapsed) -> Self {
-        Self::Timeout("Operation timed out".into())
+        Self::Timeout
     }
 }

@@ -5,19 +5,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 pub async fn serve(app: Router, port: u16) -> anyhow::Result<()> {
-    let listener = match ListenFd::from_env().take_tcp_listener(0)? {
-        Some(std_listener) => {
-            std_listener.set_nonblocking(true)?;
-            info!("Using systemd socket activation");
-            TcpListener::from_std(std_listener)?
-        }
-        None => {
-            let addr = SocketAddr::from(([0, 0, 0, 0], port));
-            info!(%addr, "Binding to address");
-            TcpListener::bind(addr).await?
-        }
-    };
-
+    let listener = create_listener(port).await?;
     info!(addr = %listener.local_addr()?, "Server listening");
 
     axum::serve(listener, app)
@@ -26,6 +14,20 @@ pub async fn serve(app: Router, port: u16) -> anyhow::Result<()> {
 
     info!("Server stopped gracefully");
     Ok(())
+}
+
+async fn create_listener(port: u16) -> anyhow::Result<TcpListener> {
+    // Try systemd socket activation first
+    if let Some(std_listener) = ListenFd::from_env().take_tcp_listener(0)? {
+        std_listener.set_nonblocking(true)?;
+        info!("Using systemd socket activation");
+        return Ok(TcpListener::from_std(std_listener)?);
+    }
+
+    // Fall back to binding directly
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    info!(%addr, "Binding to address");
+    Ok(TcpListener::bind(addr).await?)
 }
 
 async fn shutdown_signal() {

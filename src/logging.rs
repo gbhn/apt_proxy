@@ -1,14 +1,10 @@
-use nu_ansi_term::{Color, Style};
-use std::{fmt, io::IsTerminal, path::Path};
-use tracing::{Event, Level, Subscriber};
+//! Упрощённый модуль логирования на основе стандартных форматов tracing-subscriber
+
+use std::{io::IsTerminal, path::Path};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{
-    fmt::{
-        format::{self, FormatEvent, FormatFields},
-        FmtContext, FormattedFields,
-    },
+    fmt::{self, format::FmtSpan},
     layer::SubscriberExt,
-    registry::LookupSpan,
     util::SubscriberInitExt,
     EnvFilter,
 };
@@ -60,66 +56,68 @@ pub fn init(config: LogConfig) -> LogGuard {
     match (&config.file, config.format) {
         (Some(path), LogFormat::Json) => {
             let (file_writer, guard) = create_file_appender(path);
-            let file_layer = tracing_subscriber::fmt::layer()
-                .json()
-                .with_writer(file_writer)
-                .with_ansi(false);
-            let console_layer = tracing_subscriber::fmt::layer().json().with_ansi(false);
-
-            registry.with(console_layer).with(file_layer).init();
+            registry
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_writer(file_writer)
+                        .with_ansi(false),
+                )
+                .with(fmt::layer().json().with_ansi(false))
+                .init();
             LogGuard {
                 _file_guard: Some(guard),
             }
         }
         (Some(path), LogFormat::Compact) => {
             let (file_writer, guard) = create_file_appender(path);
-            let file_layer = tracing_subscriber::fmt::layer()
-                .compact()
-                .with_writer(file_writer)
-                .with_ansi(false);
-            let console_layer = tracing_subscriber::fmt::layer()
-                .compact()
-                .with_ansi(use_colors);
-
-            registry.with(console_layer).with(file_layer).init();
+            registry
+                .with(
+                    fmt::layer()
+                        .compact()
+                        .with_writer(file_writer)
+                        .with_ansi(false),
+                )
+                .with(fmt::layer().compact().with_ansi(use_colors))
+                .init();
             LogGuard {
                 _file_guard: Some(guard),
             }
         }
         (Some(path), LogFormat::Pretty) => {
             let (file_writer, guard) = create_file_appender(path);
-            let file_layer = tracing_subscriber::fmt::layer()
-                .with_writer(file_writer)
-                .with_ansi(false);
-            let console_layer = tracing_subscriber::fmt::layer()
-                .event_format(PrettyFormatter::new(use_colors))
-                .with_ansi(use_colors);
-
-            registry.with(console_layer).with(file_layer).init();
+            registry
+                .with(fmt::layer().with_writer(file_writer).with_ansi(false))
+                .with(
+                    fmt::layer()
+                        .pretty()
+                        .with_ansi(use_colors)
+                        .with_span_events(FmtSpan::CLOSE),
+                )
+                .init();
             LogGuard {
                 _file_guard: Some(guard),
             }
         }
         (None, LogFormat::Json) => {
-            let console_layer = tracing_subscriber::fmt::layer().json().with_ansi(false);
-
-            registry.with(console_layer).init();
+            registry.with(fmt::layer().json().with_ansi(false)).init();
             LogGuard { _file_guard: None }
         }
         (None, LogFormat::Compact) => {
-            let console_layer = tracing_subscriber::fmt::layer()
-                .compact()
-                .with_ansi(use_colors);
-
-            registry.with(console_layer).init();
+            registry
+                .with(fmt::layer().compact().with_ansi(use_colors))
+                .init();
             LogGuard { _file_guard: None }
         }
         (None, LogFormat::Pretty) => {
-            let console_layer = tracing_subscriber::fmt::layer()
-                .event_format(PrettyFormatter::new(use_colors))
-                .with_ansi(use_colors);
-
-            registry.with(console_layer).init();
+            registry
+                .with(
+                    fmt::layer()
+                        .pretty()
+                        .with_ansi(use_colors)
+                        .with_span_events(FmtSpan::CLOSE),
+                )
+                .init();
             LogGuard { _file_guard: None }
         }
     }
@@ -135,129 +133,8 @@ fn create_file_appender(
     tracing_appender::non_blocking(file_appender)
 }
 
-struct PrettyFormatter {
-    colors: bool,
-}
-
-impl PrettyFormatter {
-    fn new(colors: bool) -> Self {
-        Self { colors }
-    }
-
-    fn style_level(&self, level: Level) -> StyledLevel {
-        StyledLevel {
-            level,
-            colors: self.colors,
-        }
-    }
-
-    fn dim(&self, text: &str) -> String {
-        if self.colors {
-            Style::new().dimmed().paint(text).to_string()
-        } else {
-            text.to_string()
-        }
-    }
-
-    fn cyan(&self, text: &str) -> String {
-        if self.colors {
-            Color::Cyan.paint(text).to_string()
-        } else {
-            text.to_string()
-        }
-    }
-}
-
-struct StyledLevel {
-    level: Level,
-    colors: bool,
-}
-
-impl fmt::Display for StyledLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.colors {
-            let (color, text) = match self.level {
-                Level::ERROR => (Color::Red, "ERROR"),
-                Level::WARN => (Color::Yellow, "WARN "),
-                Level::INFO => (Color::Green, "INFO "),
-                Level::DEBUG => (Color::Blue, "DEBUG"),
-                Level::TRACE => (Color::Purple, "TRACE"),
-            };
-            write!(f, "{}", color.bold().paint(text))
-        } else {
-            let text = match self.level {
-                Level::ERROR => "ERROR",
-                Level::WARN => "WARN ",
-                Level::INFO => "INFO ",
-                Level::DEBUG => "DEBUG",
-                Level::TRACE => "TRACE",
-            };
-            write!(f, "{}", text)
-        }
-    }
-}
-
-impl<S, N> FormatEvent<S, N> for PrettyFormatter
-where
-    S: Subscriber + for<'a> LookupSpan<'a>,
-    N: for<'a> FormatFields<'a> + 'static,
-{
-    fn format_event(
-        &self,
-        ctx: &FmtContext<'_, S, N>,
-        mut writer: format::Writer<'_>,
-        event: &Event<'_>,
-    ) -> fmt::Result {
-        let metadata = event.metadata();
-        let level = *metadata.level();
-
-        let now = chrono::Local::now();
-        write!(
-            writer,
-            "{} ",
-            self.dim(&now.format("%H:%M:%S%.3f").to_string())
-        )?;
-
-        write!(writer, "{} ", self.style_level(level))?;
-
-        let target = metadata.target();
-        let short_target = if target.starts_with("apt_cacher_rs") {
-            target.strip_prefix("apt_cacher_rs::").unwrap_or(target)
-        } else if target.len() > 20 {
-            &target[target.len() - 20..]
-        } else {
-            target
-        };
-        write!(writer, "{} ", self.cyan(&format!("{:>12}", short_target)))?;
-
-        write!(writer, "{} ", self.dim("│"))?;
-
-        if let Some(scope) = ctx.event_scope() {
-            let mut seen = false;
-            for span in scope.from_root() {
-                let exts = span.extensions();
-                if let Some(fields) = exts.get::<FormattedFields<N>>() {
-                    if !fields.is_empty() {
-                        if seen {
-                            write!(writer, "{}", self.dim(":"))?;
-                        }
-                        write!(writer, "{}", fields)?;
-                        seen = true;
-                    }
-                }
-            }
-            if seen {
-                write!(writer, " ")?;
-            }
-        }
-
-        ctx.field_format().format_fields(writer.by_ref(), event)?;
-
-        writeln!(writer)
-    }
-}
-
 pub fn print_banner() {
+    let is_terminal = std::io::stderr().is_terminal();
     let banner = format!(
         r#"
 ╔════════════════════════════════════════════════════════╗
@@ -269,13 +146,14 @@ pub fn print_banner() {
         VERSION
     );
 
-    if std::io::stderr().is_terminal() {
-        eprintln!("{}", Color::Cyan.paint(banner));
+    if is_terminal {
+        eprintln!("\x1b[36m{}\x1b[0m", banner);
     } else {
         eprintln!("{}", banner);
     }
 }
 
+/// Вспомогательные функции для форматирования полей логов
 pub mod fields {
     use crate::utils;
 

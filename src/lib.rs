@@ -90,6 +90,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/", get(health_check))
         .route("/health", get(health_check))
         .route("/stats", get(stats_handler))
+        .route("/metrics", get(prometheus_handler))
         .route("/{*path}", get(proxy_handler))
         .layer(middleware::from_fn(request_logging_middleware))
         .layer(PropagateRequestIdLayer::x_request_id())
@@ -152,6 +153,20 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         "{}\nActive Downloads: {}",
         cache_stats, active
     )
+}
+
+/// Endpoint для Prometheus метрик
+async fn prometheus_handler() -> impl IntoResponse {
+    match metrics::render_prometheus() {
+        Some(metrics) => (
+            [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+            metrics,
+        ),
+        None => (
+            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+            "# Prometheus exporter not enabled\n".to_string(),
+        ),
+    }
 }
 
 async fn proxy_handler(

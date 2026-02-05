@@ -1,15 +1,12 @@
-//! Модуль метрик использует стандартный `metrics` crate
-//!
-//! Преимущества:
-//! - Стандартный интерфейс, совместимый с Prometheus, StatsD и др.
-//! - Низкий overhead
-//! - Атомарные операции под капотом
+//! Метрики с поддержкой Prometheus exporter
 
-use metrics::{counter, gauge, describe_counter, describe_gauge, Counter, Gauge};
+use metrics::{counter, describe_counter, describe_gauge, gauge, Counter, Gauge};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::sync::OnceLock;
+use tracing::info;
 
-/// Глобальные метрики
 static METRICS: OnceLock<AppMetrics> = OnceLock::new();
+static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
 struct AppMetrics {
     cache_hits: Counter,
@@ -22,10 +19,31 @@ struct AppMetrics {
     active_downloads: Gauge,
 }
 
-/// Инициализирует метрики с описаниями
+/// Инициализирует метрики без Prometheus
 pub fn init() {
+    init_metrics();
+}
+
+/// Инициализирует метрики с Prometheus exporter на указанном порту
+pub fn init_with_prometheus(port: u16) -> anyhow::Result<()> {
+    let builder = PrometheusBuilder::new();
+    let handle = builder
+        .with_http_listener(([0, 0, 0, 0], port))
+        .install_recorder()?;
+
+    let _ = PROMETHEUS_HANDLE.set(handle);
+    info!(port = port, endpoint = "/metrics", "Prometheus exporter started");
+
+    init_metrics();
+    Ok(())
+}
+
+fn init_metrics() {
     describe_counter!("apt_cacher_cache_hits_total", "Total number of cache hits");
-    describe_counter!("apt_cacher_cache_misses_total", "Total number of cache misses");
+    describe_counter!(
+        "apt_cacher_cache_misses_total",
+        "Total number of cache misses"
+    );
     describe_counter!(
         "apt_cacher_bytes_served_from_cache_total",
         "Total bytes served from cache"
@@ -38,10 +56,7 @@ pub fn init() {
         "apt_cacher_requests_coalesced_total",
         "Total requests that were coalesced"
     );
-    describe_counter!(
-        "apt_cacher_upstream_errors_total",
-        "Total upstream errors"
-    );
+    describe_counter!("apt_cacher_upstream_errors_total", "Total upstream errors");
     describe_counter!(
         "apt_cacher_validation_304s_total",
         "Total 304 responses from upstream"
@@ -65,6 +80,11 @@ pub fn init() {
 
 fn metrics() -> &'static AppMetrics {
     METRICS.get().expect("Metrics not initialized")
+}
+
+/// Получить Prometheus handle для рендеринга метрик
+pub fn prometheus_handle() -> Option<&'static PrometheusHandle> {
+    PROMETHEUS_HANDLE.get()
 }
 
 #[inline]
@@ -114,7 +134,12 @@ pub fn decrement_active_downloads() {
     metrics().active_downloads.decrement(1.0);
 }
 
-/// Снимок метрик для отображения (для совместимости)
+/// Рендерит метрики в формате Prometheus
+pub fn render_prometheus() -> Option<String> {
+    prometheus_handle().map(|h| h.render())
+}
+
+/// Снимок метрик для отображения
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MetricsSnapshot {
     pub cache_hits: u64,
@@ -151,54 +176,5 @@ impl std::fmt::Display for MetricsSnapshot {
             self.validation_304s,
             self.upstream_errors,
         )
-    }
-}
-
-/// Совместимый API для существующего кода
-#[derive(Default)]
-pub struct Metrics;
-
-impl Metrics {
-    pub fn new() -> Self {
-        Self
-    }
-
-    #[inline]
-    pub fn record_cache_hit(&self, bytes: u64) {
-        record_cache_hit(bytes);
-    }
-
-    #[inline]
-    pub fn record_cache_miss(&self) {
-        record_cache_miss();
-    }
-
-    #[inline]
-    pub fn record_download(&self, bytes: u64) {
-        record_download(bytes);
-    }
-
-    #[inline]
-    pub fn record_coalesced_request(&self) {
-        record_coalesced_request();
-    }
-
-    #[inline]
-    pub fn record_304(&self) {
-        record_304();
-    }
-
-    #[inline]
-    pub fn record_upstream_error(&self) {
-        record_upstream_error();
-    }
-
-    /// Snapshot для отображения - в данной реализации недоступен
-    /// так как metrics crate не предоставляет способ прочитать значения
-    /// Для полноценного решения нужен metrics-exporter
-    pub fn snapshot(&self) -> MetricsSnapshot {
-        // С metrics crate мы не можем напрямую читать значения
-        // Для этого нужен recorder (например metrics-exporter-prometheus)
-        MetricsSnapshot::default()
     }
 }

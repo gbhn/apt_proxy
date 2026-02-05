@@ -34,15 +34,19 @@ async fn main() -> Result<()> {
 
     let _guard = logging::init(log_config);
 
-    // Инициализируем метрики
-    metrics::init();
-
     if log_format == LogFormat::Pretty {
         logging::print_banner();
     }
 
-    let settings = Settings::load(args).await?;
+    let settings = Settings::load(args.clone()).await?;
     settings.display_info();
+
+    // Инициализируем метрики (с или без Prometheus)
+    if settings.prometheus {
+        metrics::init_with_prometheus(settings.prometheus_port)?;
+    } else {
+        metrics::init();
+    }
 
     let state = Arc::new(AppState::new(settings.clone()).await?);
     let app = build_router(state.clone());

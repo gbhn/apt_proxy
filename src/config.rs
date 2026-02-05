@@ -1,9 +1,12 @@
 use crate::utils::{format_duration_secs, format_size};
 use bytesize::ByteSize;
 use clap::Parser;
+use figment::{
+    providers::{Env, Format, Serialized, Yaml},
+    Figment,
+};
 use regex::Regex;
-use serde::Deserialize;
-use serde_yml as serde_yaml;
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 use tracing::{info, warn};
 
@@ -16,7 +19,7 @@ const DEFAULT_MIN_TTL: u64 = 3600;
 const DEFAULT_MAX_TTL: u64 = 604800;
 const DEFAULT_STALE_WHILE_REVALIDATE: u64 = 3600;
 
-#[derive(Parser, Clone)]
+#[derive(Parser, Clone, Debug)]
 #[command(author, version, about = "High-performance APT caching proxy")]
 pub struct Args {
     #[arg(long, short, env = "APT_CACHER_CONFIG")]
@@ -39,9 +42,17 @@ pub struct Args {
 
     #[arg(long, env = "APT_CACHER_STRICT_PATTERNS", default_value = "false")]
     pub strict_patterns: bool,
+
+    /// Enable Prometheus metrics endpoint
+    #[arg(long, env = "APT_CACHER_PROMETHEUS", default_value = "false")]
+    pub prometheus: bool,
+
+    /// Prometheus metrics port
+    #[arg(long, env = "APT_CACHER_PROMETHEUS_PORT", default_value = "9090")]
+    pub prometheus_port: u16,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TtlOverride {
     pub pattern: String,
@@ -57,7 +68,7 @@ impl TtlOverride {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationSettings {
     #[serde(default = "default_true")]
@@ -66,6 +77,16 @@ pub struct ValidationSettings {
     pub use_last_modified: bool,
     #[serde(default)]
     pub always_revalidate: bool,
+}
+
+impl Default for ValidationSettings {
+    fn default() -> Self {
+        Self {
+            use_etag: true,
+            use_last_modified: true,
+            always_revalidate: false,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -88,7 +109,7 @@ fn default_stale_while_revalidate() -> Duration {
     Duration::from_secs(DEFAULT_STALE_WHILE_REVALIDATE)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheSettings {
     #[serde(default = "default_ttl", with = "humantime_serde")]
@@ -128,7 +149,6 @@ pub struct PatternCompilationResult {
 }
 
 impl CacheSettings {
-    /// Возвращает TTL в секундах для обратной совместимости
     #[inline]
     pub fn default_ttl_secs(&self) -> u64 {
         self.default_ttl.as_secs()
@@ -165,7 +185,6 @@ impl CacheSettings {
         ttl.clamp(self.min_ttl_secs(), self.max_ttl_secs())
     }
 
-    /// Компилирует паттерны, пропуская невалидные
     pub fn compile_patterns(&mut self) -> PatternCompilationResult {
         let mut successful = 0;
         let mut failed = Vec::new();
@@ -193,7 +212,6 @@ impl CacheSettings {
             }
         }
 
-        // Удаляем правила с невалидными паттернами
         self.ttl_overrides.retain(|r| r.regex.is_some());
 
         if !failed.is_empty() {
@@ -206,7 +224,6 @@ impl CacheSettings {
         PatternCompilationResult { successful, failed }
     }
 
-    /// Строгая версия - возвращает ошибку если любой паттерн невалиден
     pub fn compile_patterns_strict(&mut self) -> anyhow::Result<()> {
         for override_rule in &mut self.ttl_overrides {
             let regex = Regex::new(&override_rule.pattern).map_err(|e| {
@@ -223,25 +240,28 @@ impl CacheSettings {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+/// Конфигурация из файла, совместимая с figment
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
+    #[serde(default)]
     pub port: Option<u16>,
+    #[serde(default)]
     pub socket: Option<PathBuf>,
-    pub repositories: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub repositories: HashMap<String, String>,
+    #[serde(default)]
     pub cache_dir: Option<PathBuf>,
     #[serde(default)]
     pub max_cache_size: Option<ByteSize>,
+    #[serde(default)]
     pub max_lru_entries: Option<usize>,
     #[serde(default)]
     pub cache: CacheSettings,
-}
-
-impl ConfigFile {
-    #[inline]
-    fn max_cache_size_bytes(&self) -> Option<u64> {
-        self.max_cache_size.map(|bs| bs.as_u64())
-    }
+    #[serde(default)]
+    pub prometheus: Option<bool>,
+    #[serde(default)]
+    pub prometheus_port: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -253,14 +273,65 @@ pub struct Settings {
     pub max_cache_size: u64,
     pub max_lru_entries: usize,
     pub cache: CacheSettings,
+    pub prometheus: bool,
+    pub prometheus_port: u16,
 }
 
 impl Settings {
+    /// Загружает конфигурацию с использованием figment
+    /// Приоритет: CLI args > ENV > config file > defaults
     pub async fn load(args: Args) -> anyhow::Result<Self> {
-        let mut config = Self::load_config_file(&args.config).await?;
-        let config_max_cache_size = config.max_cache_size_bytes();
+        // Определяем путь к конфигу
+        let config_paths: Vec<PathBuf> = if let Some(ref path) = args.config {
+            vec![path.clone()]
+        } else {
+            vec![
+                PathBuf::from("/etc/apt-cacher/config.yaml"),
+                PathBuf::from("./config.yaml"),
+            ]
+        };
 
-        // Выбираем режим компиляции паттернов
+        // Строим figment с приоритетами
+        let mut figment = Figment::new()
+            // Defaults
+            .merge(Serialized::defaults(ConfigFile::default()));
+
+        // Добавляем конфиг файлы (первый найденный)
+        for path in &config_paths {
+            if path.exists() {
+                info!(path = %path.display(), "Loading configuration file");
+                figment = figment.merge(Yaml::file(path));
+                break;
+            }
+        }
+
+        // ENV переменные с префиксом APT_CACHER_
+        figment = figment.merge(Env::prefixed("APT_CACHER_").split("_"));
+
+        // Извлекаем конфигурацию
+        let mut config: ConfigFile = figment.extract()?;
+
+        // CLI args override (применяем явно заданные аргументы)
+        if args.port.is_some() {
+            config.port = args.port;
+        }
+        if args.socket.is_some() {
+            config.socket = args.socket;
+        }
+        if args.cache_dir.is_some() {
+            config.cache_dir = args.cache_dir;
+        }
+        if args.max_cache_size.is_some() {
+            config.max_cache_size = args.max_cache_size.map(ByteSize);
+        }
+        if args.max_lru_entries.is_some() {
+            config.max_lru_entries = args.max_lru_entries;
+        }
+        if args.prometheus {
+            config.prometheus = Some(true);
+        }
+
+        // Компиляция паттернов
         if args.strict_patterns {
             config.cache.compile_patterns_strict()?;
         } else {
@@ -275,44 +346,19 @@ impl Settings {
         }
 
         Ok(Self {
-            port: args.port.or(config.port).unwrap_or(DEFAULT_PORT),
-            socket: args.socket.or(config.socket),
-            repositories: config.repositories.unwrap_or_default(),
-            cache_dir: args
-                .cache_dir
-                .or(config.cache_dir)
-                .unwrap_or_else(|| DEFAULT_CACHE_DIR.into()),
-            max_cache_size: args
+            port: config.port.unwrap_or(DEFAULT_PORT),
+            socket: config.socket,
+            repositories: config.repositories,
+            cache_dir: config.cache_dir.unwrap_or_else(|| DEFAULT_CACHE_DIR.into()),
+            max_cache_size: config
                 .max_cache_size
-                .or(config_max_cache_size)
+                .map(|bs| bs.as_u64())
                 .unwrap_or(DEFAULT_MAX_CACHE_SIZE),
-            max_lru_entries: args
-                .max_lru_entries
-                .or(config.max_lru_entries)
-                .unwrap_or(DEFAULT_MAX_LRU_ENTRIES),
+            max_lru_entries: config.max_lru_entries.unwrap_or(DEFAULT_MAX_LRU_ENTRIES),
             cache: config.cache,
+            prometheus: config.prometheus.unwrap_or(false),
+            prometheus_port: config.prometheus_port.unwrap_or(args.prometheus_port),
         })
-    }
-
-    async fn load_config_file(path: &Option<PathBuf>) -> anyhow::Result<ConfigFile> {
-        if let Some(path) = path {
-            let content = tokio::fs::read_to_string(path).await?;
-            info!(path = %path.display(), "Loaded configuration file");
-            return Ok(serde_yaml::from_str(&content)?);
-        }
-
-        const CONFIG_PATHS: &[&str] = &["/etc/apt-cacher/config.yaml", "./config.yaml"];
-        for path in CONFIG_PATHS {
-            if let Ok(content) = tokio::fs::read_to_string(path).await {
-                if let Ok(config) = serde_yaml::from_str(&content) {
-                    info!(path = %path, "Loaded configuration file");
-                    return Ok(config);
-                }
-            }
-        }
-
-        info!("Using default configuration");
-        Ok(ConfigFile::default())
     }
 
     pub fn display_info(&self) {
@@ -352,6 +398,10 @@ impl Settings {
             for (name, url) in &self.repositories {
                 info!(name = %name, url = %url, "Repository configured");
             }
+        }
+
+        if self.prometheus {
+            info!(port = self.prometheus_port, "Prometheus metrics enabled");
         }
 
         if let Some(ref socket) = self.socket {

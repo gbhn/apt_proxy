@@ -5,11 +5,11 @@ use crate::metrics;
 use crate::storage::{CacheMetadata, Storage};
 use async_stream::stream;
 use axum::{body::Body, response::Response};
+use backoff::{backoff::Backoff, ExponentialBackoff};
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};
 use std::{
-    io::SeekFrom,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -18,7 +18,7 @@ use std::{
 };
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::AsyncReadExt,
     sync::{watch, RwLock},
     time::timeout,
 };
@@ -28,6 +28,7 @@ const HEADER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const READ_BUFFER_SIZE: usize = 64 * 1024;
 const PROGRESS_LOG_INTERVAL: u64 = 50 * 1024 * 1024;
+const MAX_RETRIES: u32 = 3;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum DownloadStatus {
@@ -211,6 +212,17 @@ impl DownloadManager {
         }
     }
 
+    /// Создаёт ExponentialBackoff для retry логики
+    fn create_backoff() -> ExponentialBackoff {
+        ExponentialBackoff {
+            initial_interval: Duration::from_millis(100),
+            max_interval: Duration::from_secs(5),
+            max_elapsed_time: Some(Duration::from_secs(30)),
+            multiplier: 2.0,
+            ..Default::default()
+        }
+    }
+
     pub async fn get_or_download(
         &self,
         key: &str,
@@ -362,7 +374,9 @@ impl DownloadManager {
         tokio::spawn(
             async move {
                 let start = std::time::Instant::now();
-                match download_file(
+                
+                // Используем backoff для retry
+                let result = download_with_retry(
                     client,
                     upstream_url,
                     &key,
@@ -371,8 +385,9 @@ impl DownloadManager {
                     state.clone(),
                     existing_metadata,
                 )
-                .await
-                {
+                .await;
+
+                match result {
                     Ok((downloaded_size, _meta_size)) => {
                         let elapsed = start.elapsed();
                         if downloaded_size > 0 {
@@ -389,7 +404,7 @@ impl DownloadManager {
                         }
                     }
                     Err(e) => {
-                        error!(error = %e, "Download failed");
+                        error!(error = %e, "Download failed after retries");
                     }
                 }
                 metrics::decrement_active_downloads();
@@ -404,21 +419,73 @@ impl DownloadManager {
     }
 }
 
-/// Создаёт stream для чтения из файла, который ещё записывается
-/// Использует async_stream для более декларативного кода
+/// Download с retry логикой используя backoff crate
+async fn download_with_retry(
+    client: reqwest::Client,
+    url: String,
+    key: &str,
+    storage: Arc<Storage>,
+    settings: Arc<CacheSettings>,
+    state: Arc<DownloadState>,
+    existing_metadata: Option<CacheMetadata>,
+) -> anyhow::Result<(u64, u64)> {
+    let mut backoff = DownloadManager::create_backoff();
+    let mut attempts = 0u32;
+
+    loop {
+        attempts += 1;
+        
+        match download_file(
+            client.clone(),
+            url.clone(),
+            key,
+            storage.clone(),
+            settings.clone(),
+            state.clone(),
+            existing_metadata.clone(),
+        )
+        .await
+        {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                // Проверяем, стоит ли retry
+                let is_retryable = matches!(
+                    &e.downcast_ref::<reqwest::Error>(),
+                    Some(err) if err.is_connect() || err.is_timeout()
+                );
+
+                if !is_retryable || attempts >= MAX_RETRIES {
+                    return Err(e);
+                }
+
+                if let Some(duration) = backoff.next_backoff() {
+                    warn!(
+                        attempt = attempts,
+                        delay = ?duration,
+                        error = %e,
+                        "Retrying download"
+                    );
+                    tokio::time::sleep(duration).await;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// Создаёт stream для чтения из файла во время записи
 fn create_streaming_reader(
     mut file: File,
     state: Arc<DownloadState>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
     stream! {
         let mut buffer = vec![0u8; READ_BUFFER_SIZE];
-        let mut position = 0u64;
         let mut status_rx = state.status_rx.clone();
 
         loop {
             match file.read(&mut buffer).await {
                 Ok(0) => {
-                    // EOF - проверяем завершилась ли загрузка
                     let status = state.status();
                     if status.is_finished() {
                         state.remove_waiter();
@@ -431,18 +498,12 @@ fn create_streaming_reader(
                         break;
                     }
                     
-                    // Ждём новых данных
                     tokio::select! {
-                        _ = status_rx.changed() => {
-                            // Статус изменился, попробуем прочитать снова
-                        }
-                        _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                            // Небольшая задержка перед повторной попыткой
-                        }
+                        _ = status_rx.changed() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {}
                     }
                 }
                 Ok(n) => {
-                    position += n as u64;
                     yield Ok(Bytes::copy_from_slice(&buffer[..n]));
                 }
                 Err(e) => {

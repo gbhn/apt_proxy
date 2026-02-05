@@ -1,12 +1,13 @@
+//! Utilities module с использованием готовых crates
+
 use humansize::{SizeFormatter, BINARY};
+use path_clean::PathClean;
 use std::path::{Path, PathBuf};
 
-/// Валидирует путь запроса
-///
-/// # Errors
-/// Возвращает ошибку если путь содержит небезопасные компоненты
+/// Валидирует путь запроса используя path-clean
 #[inline]
 pub fn validate_path(path: &str) -> Result<(), crate::error::ProxyError> {
+    // Проверка длины
     let len = path.len();
     if len == 0 || len > 2048 {
         return Err(crate::error::ProxyError::InvalidPath(
@@ -14,18 +15,25 @@ pub fn validate_path(path: &str) -> Result<(), crate::error::ProxyError> {
         ));
     }
 
+    // Проверка на null bytes
     if memchr::memchr(0, path.as_bytes()).is_some() {
         return Err(crate::error::ProxyError::InvalidPath(
             "Path contains null byte".into(),
         ));
     }
 
-    if path.contains("..") {
+    // Используем path-clean для нормализации и проверки
+    let clean_path = Path::new(path).clean();
+    let clean_str = clean_path.to_string_lossy();
+    
+    // Проверяем что очищенный путь не начинается с ".." или "/"
+    if clean_str.starts_with("..") || clean_str.starts_with('/') {
         return Err(crate::error::ProxyError::InvalidPath(
-            "Path contains '..'".into(),
+            "Path escapes root".into(),
         ));
     }
 
+    // Проверяем оригинальный путь на подозрительные паттерны
     if path.contains("//") || path.starts_with('/') {
         return Err(crate::error::ProxyError::InvalidPath(
             "Invalid path format".into(),
@@ -35,13 +43,19 @@ pub fn validate_path(path: &str) -> Result<(), crate::error::ProxyError> {
     Ok(())
 }
 
-/// Форматирует размер в человекочитаемый формат используя humansize crate
+/// Нормализует путь используя path-clean
+#[inline]
+pub fn normalize_path(path: &str) -> String {
+    Path::new(path).clean().to_string_lossy().into_owned()
+}
+
+/// Форматирует размер используя humansize crate
 #[inline]
 pub fn format_size(bytes: u64) -> String {
     SizeFormatter::new(bytes, BINARY).to_string()
 }
 
-/// Форматирует длительность в человекочитаемый формат используя humantime crate
+/// Форматирует длительность используя humantime crate
 #[inline]
 pub fn format_duration(duration: std::time::Duration) -> String {
     humantime::format_duration(duration).to_string()
@@ -53,9 +67,7 @@ pub fn format_duration_secs(seconds: u64) -> String {
     format_duration(std::time::Duration::from_secs(seconds))
 }
 
-/// Вычисляет путь в кэше для заданного URI.
-///
-/// Использует blake3 для хэширования.
+/// Вычисляет путь в кэше используя blake3
 #[inline]
 pub fn cache_path_for(base_dir: &Path, uri_path: &str) -> PathBuf {
     let hash = blake3::hash(uri_path.as_bytes());
@@ -67,7 +79,7 @@ pub fn cache_path_for(base_dir: &Path, uri_path: &str) -> PathBuf {
         .join(hex_str)
 }
 
-/// Асинхронная версия cache_path_for для очень длинных путей
+/// Асинхронная версия для CPU-intensive hashing
 #[allow(dead_code)]
 pub async fn cache_path_for_async(base_dir: PathBuf, uri_path: String) -> PathBuf {
     tokio::task::spawn_blocking(move || cache_path_for(&base_dir, &uri_path))
@@ -80,12 +92,13 @@ pub fn meta_path_for(cache_path: &Path) -> PathBuf {
     cache_path.with_extension("meta")
 }
 
+/// URL-encode ключа используя percent-encoding
 #[inline]
 pub fn encode_cache_key(key: &str) -> String {
     percent_encoding::utf8_percent_encode(key, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-/// Строит полный URL из базового URL и пути
+/// Строит полный URL используя url crate
 #[inline]
 pub fn build_upstream_url(base_url: &str, path: &str) -> Result<String, url::ParseError> {
     let base = url::Url::parse(base_url)?;
@@ -93,13 +106,13 @@ pub fn build_upstream_url(base_url: &str, path: &str) -> Result<String, url::Par
     Ok(full.to_string())
 }
 
-/// Генерирует уникальный идентификатор (UUID v4)
+/// Генерирует UUID v4
 #[inline]
 pub fn generate_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Генерирует короткий уникальный идентификатор
+/// Генерирует короткий ID
 #[inline]
 pub fn generate_short_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()

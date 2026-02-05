@@ -1,18 +1,30 @@
 [Unit]
-Description=APT Cacher RS Proxy
-After=network.target
+Description=High-Performance APT Caching Proxy
+Documentation=https://github.com/gbhn/apt_proxy
+After=network-online.target
+Wants=network-online.target
+Requires=apt-cacher-rs.socket
 
 [Service]
-Type=simple
-User=www-data
-Group=www-data
+Type=notify
 ExecStart=/usr/bin/apt-cacher-rs --config /etc/apt-cacher/config.yaml
 Restart=on-failure
-RestartSec=5s
-CacheDirectory=apt-cacher
-CacheDirectoryMode=0750
-ProtectSystem=full
-NoNewPrivileges=yes
+RestartSec=5
+User=apt-cacher
+Group=apt-cacher
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+
+ReadWritePaths=/var/cache/apt-cacher
+
+# Resource limits
+LimitNOFILE=65535
+MemoryMax=2G
 
 [Install]
 WantedBy=multi-user.target

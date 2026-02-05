@@ -1,0 +1,10 @@
+[Unit]
+Description=APT Cacher Socket
+
+[Socket]
+ListenStream=3142
+Accept=no
+ReusePort=true
+
+[Install]
+WantedBy=sockets.target

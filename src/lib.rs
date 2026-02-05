@@ -18,8 +18,14 @@ use axum::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
-use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use std::time::{Duration, Instant};
+use tower::ServiceBuilder;
+use tower_http::{
+    catch_panic::CatchPanicLayer,
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    timeout::TimeoutLayer,
+    limit::ConcurrencyLimitLayer,
+};
 use tracing::{debug, info, info_span, warn, Instrument};
 
 use cache_manager::CacheManager;
@@ -29,6 +35,9 @@ use error::{ProxyError, Result};
 use storage::Storage;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_CONCURRENT_REQUESTS: usize = 1000;
 
 pub struct AppState {
     pub settings: Settings,
@@ -43,11 +52,11 @@ impl AppState {
 
         let http_client = reqwest::Client::builder()
             .user_agent(format!("apt-cacher-rs/{}", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(300))
-            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(10))
             .pool_max_idle_per_host(16)
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .tcp_keepalive(std::time::Duration::from_secs(60))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(60))
             .tcp_nodelay(false)
             .build()?;
 
@@ -92,9 +101,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/stats", get(stats_handler))
         .route("/metrics", get(prometheus_handler))
         .route("/{*path}", get(proxy_handler))
+        // Используем tower ServiceBuilder для middleware stack
+        .layer(
+            ServiceBuilder::new()
+                // Catch panics и преобразуем в 500
+                .layer(CatchPanicLayer::new())
+                // Лимит конкурентных запросов
+                .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
+                // Таймаут на весь запрос (из tower-http)
+                .layer(TimeoutLayer::new(REQUEST_TIMEOUT))
+                // Request ID
+                .layer(PropagateRequestIdLayer::x_request_id())
+                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        )
         .layer(middleware::from_fn(request_logging_middleware))
-        .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .with_state(state)
 }
 
@@ -149,13 +169,9 @@ async fn health_check() -> &'static str {
 async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cache_stats = state.cache.stats().await;
     let active = state.downloader.active_count();
-    format!(
-        "{}\nActive Downloads: {}",
-        cache_stats, active
-    )
+    format!("{}\nActive Downloads: {}", cache_stats, active)
 }
 
-/// Endpoint для Prometheus метрик
 async fn prometheus_handler() -> impl IntoResponse {
     match metrics::render_prometheus() {
         Some(metrics) => (
@@ -193,8 +209,7 @@ async fn proxy_handler(
 
             metrics::record_cache_hit(stored.size);
 
-            let stream =
-                tokio_util::io::ReaderStream::with_capacity(stored.file, 256 * 1024);
+            let stream = tokio_util::io::ReaderStream::with_capacity(stored.file, 256 * 1024);
             let mut response = Response::new(axum::body::Body::from_stream(stream));
             response
                 .headers_mut()
@@ -204,12 +219,7 @@ async fn proxy_handler(
         }
     }
 
-    let existing_metadata = state
-        .storage
-        .get_metadata(&path)
-        .await
-        .ok()
-        .flatten();
+    let existing_metadata = state.storage.get_metadata(&path).await.ok().flatten();
 
     metrics::record_cache_miss();
 

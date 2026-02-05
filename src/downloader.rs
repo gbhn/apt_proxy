@@ -2,24 +2,26 @@ use crate::cache::CacheManager;
 use crate::error::{ProxyError, Result};
 use crate::metrics;
 use crate::storage::Metadata;
+use async_stream::stream;
 use axum::body::Body;
 use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED};
 use axum::response::Response;
+use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};
+use std::io::SeekFrom;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{watch, Mutex};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::watch;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, info, warn};
 
 const TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_DOWNLOAD_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+const STREAM_BUFFER_SIZE: usize = 64 * 1024;
 
 const ALLOWED_HEADERS: &[axum::http::HeaderName] = &[
     CONTENT_TYPE,
@@ -29,122 +31,40 @@ const ALLOWED_HEADERS: &[axum::http::HeaderName] = &[
     CACHE_CONTROL,
 ];
 
-#[derive(Clone, Copy, PartialEq)]
-enum Status {
-    Pending,
+#[derive(Clone)]
+struct DownloadProgress {
+    written: u64,
+    content_length: Option<u64>,
+    headers: Option<Arc<axum::http::HeaderMap>>,
+    status: ProgressStatus,
+}
+
+#[derive(Clone)]
+enum ProgressStatus {
+    Starting,
     Downloading,
-    Done(bool),
-}
-
-struct TempFileLease {
-    path: PathBuf,
-}
-
-impl Drop for TempFileLease {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-struct LeaseStream<S> {
-    inner: S,
-    _lease: Arc<TempFileLease>,
-}
-
-impl<S> Stream for LeaseStream<S>
-where
-    S: Stream + Unpin,
-{
-    type Item = S::Item;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
-    }
-}
-
-enum DownloadOutcome {
-    Cached,
-    Temp { lease: Arc<TempFileLease>, meta: Metadata },
+    Complete { from_cache: bool },
+    Failed(String),
 }
 
 struct ActiveDownload {
-    tx: watch::Sender<Status>,
-    rx: watch::Receiver<Status>,
-    outcome: Mutex<Option<Arc<DownloadOutcome>>>,
+    progress_tx: watch::Sender<DownloadProgress>,
+    progress_rx: watch::Receiver<DownloadProgress>,
+    temp_path: PathBuf,
 }
 
 impl ActiveDownload {
-    fn new() -> Self {
-        let (tx, rx) = watch::channel(Status::Pending);
+    fn new(temp_path: PathBuf) -> Self {
+        let (progress_tx, progress_rx) = watch::channel(DownloadProgress {
+            written: 0,
+            content_length: None,
+            headers: None,
+            status: ProgressStatus::Starting,
+        });
         Self {
-            tx,
-            rx,
-            outcome: Mutex::new(None),
-        }
-    }
-}
-
-struct DownloadGuard<'a> {
-    active: &'a DashMap<String, Arc<ActiveDownload>>,
-    key: String,
-    download: &'a ActiveDownload,
-    completed: bool,
-}
-
-impl<'a> DownloadGuard<'a> {
-    fn new(
-        active: &'a DashMap<String, Arc<ActiveDownload>>,
-        key: String,
-        download: &'a ActiveDownload,
-    ) -> Self {
-        Self {
-            active,
-            key,
-            download,
-            completed: false,
-        }
-    }
-
-    fn start(&self) {
-        metrics::inc_active();
-    }
-
-    fn complete(&mut self, success: bool) {
-        self.completed = true;
-        let _ = self.download.tx.send(Status::Done(success));
-    }
-}
-
-impl Drop for DownloadGuard<'_> {
-    fn drop(&mut self) {
-        if !self.completed {
-            let _ = self.download.tx.send(Status::Done(false));
-        }
-        self.active.remove(&self.key);
-        metrics::dec_active();
-    }
-}
-
-struct TempPathGuard {
-    path: PathBuf,
-    keep: bool,
-}
-
-impl TempPathGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path, keep: false }
-    }
-
-    fn keep(mut self) -> Self {
-        self.keep = true;
-        self
-    }
-}
-
-impl Drop for TempPathGuard {
-    fn drop(&mut self) {
-        if !self.keep {
-            let _ = std::fs::remove_file(&self.path);
+            progress_tx,
+            progress_rx,
+            temp_path,
         }
     }
 }
@@ -174,79 +94,271 @@ impl Downloader {
     }
 
     pub async fn fetch(&self, key: &str, url: &str) -> Result<Response> {
+        // Check cache first
         if let Some((file, meta)) = self.cache.open(key).await {
             metrics::record_hit(meta.size);
             debug!(key, size = meta.size, "Cache hit");
-            return Ok(self.response_from_file(file, meta));
+            return Ok(Self::response_from_file(file, meta));
         }
 
         metrics::record_miss();
 
-        let (download, is_leader) = self.get_or_create_download(key);
-
-        if !is_leader {
+        // Check for existing download
+        if let Some(download) = self.active.get(key) {
             metrics::record_coalesced();
-            debug!(key, "Waiting for existing download");
-            return self.wait_for_download(key, download).await;
+            debug!(key, "Joining existing download");
+            return self.follow_download(key, download.clone()).await;
         }
 
-        self.perform_download(key, url, download).await
+        // Start new download
+        self.start_download(key, url).await
     }
 
-    fn get_or_create_download(&self, key: &str) -> (Arc<ActiveDownload>, bool) {
-        use dashmap::mapref::entry::Entry;
+    async fn start_download(&self, key: &str, url: &str) -> Result<Response> {
+        // Create temp file
+        let (temp_path, temp_file) = self.cache.create_temp_data().await.map_err(|e| {
+            metrics::record_error();
+            ProxyError::Download(format!("Failed to create temp file: {e}"))
+        })?;
 
-        match self.active.entry(key.to_string()) {
-            Entry::Occupied(e) => (e.get().clone(), false),
-            Entry::Vacant(e) => {
-                let dl = Arc::new(ActiveDownload::new());
-                e.insert(dl.clone());
-                (dl, true)
+        let download = Arc::new(ActiveDownload::new(temp_path.clone()));
+
+        // Insert into active downloads
+        {
+            use dashmap::mapref::entry::Entry;
+            match self.active.entry(key.to_string()) {
+                Entry::Occupied(e) => {
+                    // Someone else started, join them
+                    metrics::record_coalesced();
+                    debug!(key, "Race: joining existing download");
+                    let existing = e.get().clone();
+                    drop(e);
+                    // Clean up our temp file
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return self.follow_download(key, existing).await;
+                }
+                Entry::Vacant(e) => {
+                    e.insert(download.clone());
+                }
             }
         }
+
+        metrics::inc_active();
+
+        // Spawn download task
+        let downloader = self.clone();
+        let key_owned = key.to_string();
+        let url_owned = url.to_string();
+        let download_clone = download.clone();
+
+        tokio::spawn(async move {
+            downloader
+                .perform_download(&key_owned, &url_owned, temp_file, download_clone)
+                .await;
+        });
+
+        // Return streaming response
+        self.follow_download(key, download).await
     }
 
-    async fn wait_for_download(&self, key: &str, dl: Arc<ActiveDownload>) -> Result<Response> {
-        let mut rx = dl.rx.clone();
+    async fn follow_download(
+        &self,
+        key: &str,
+        download: Arc<ActiveDownload>,
+    ) -> Result<Response> {
+        let mut rx = download.progress_rx.clone();
 
+        // Wait for headers or completion
         loop {
-            let status = *rx.borrow_and_update();
-
-            match status {
-                Status::Done(true) => {
-                    if let Some((file, meta)) = self.cache.open(key).await {
-                        return Ok(self.response_from_file(file, meta));
-                    }
-
-                    let outcome = dl.outcome.lock().await.clone();
-
-                    match outcome.as_deref() {
-                        Some(DownloadOutcome::Temp { lease, meta }) => {
-                            let file =
-                                File::open(&lease.path).await.map_err(ProxyError::Cache)?;
-                            return Ok(self.response_from_temp_file(file, meta.clone(), lease.clone()));
-                        }
-                        Some(DownloadOutcome::Cached) | None => {
-                            return Err(ProxyError::Download(
-                                "Not in cache after download".into(),
-                            ));
-                        }
-                    }
-                }
-                Status::Done(false) => return Err(ProxyError::Download("Download failed".into())),
-                Status::Pending | Status::Downloading => {
+            let progress = rx.borrow().clone();
+            match progress.status {
+                ProgressStatus::Starting => {
                     if rx.changed().await.is_err() {
                         return Err(ProxyError::Download("Download cancelled".into()));
                     }
                 }
+                ProgressStatus::Downloading => break,
+                ProgressStatus::Complete { from_cache } => {
+                    if from_cache {
+                        // 304 case - serve from cache
+                        if let Some((file, meta)) = self.cache.open(key).await {
+                            return Ok(Self::response_from_file(file, meta));
+                        }
+                        return Err(ProxyError::Download("Cache miss after 304".into()));
+                    }
+                    break;
+                }
+                ProgressStatus::Failed(ref err) => {
+                    return Err(ProxyError::Download(err.clone()));
+                }
+            }
+        }
+
+        let progress = rx.borrow().clone();
+        let headers = progress.headers.clone().unwrap_or_default();
+        let temp_path = download.temp_path.clone();
+
+        let stream = Self::create_follow_stream(temp_path, rx);
+
+        let mut resp = Response::new(Body::from_stream(stream));
+        resp.headers_mut().extend((*headers).clone());
+
+        if let Some(len) = progress.content_length {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&len.to_string()) {
+                resp.headers_mut().insert(CONTENT_LENGTH, v);
+            }
+        }
+
+        Ok(resp)
+    }
+
+    fn create_follow_stream(
+        temp_path: PathBuf,
+        progress_rx: watch::Receiver<DownloadProgress>,
+    ) -> impl Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send {
+        stream! {
+            let mut rx = progress_rx;
+            let mut file = match File::open(&temp_path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+
+            let mut position = 0u64;
+            let mut buffer = vec![0u8; STREAM_BUFFER_SIZE];
+
+            loop {
+                let progress = rx.borrow().clone();
+
+                // Read available data
+                while position < progress.written {
+                    let available = progress.written - position;
+                    let to_read = (available as usize).min(buffer.len());
+
+                    match file.read(&mut buffer[..to_read]).await {
+                        Ok(0) => {
+                            // EOF but data should be there, seek and retry
+                            if let Err(e) = file.seek(SeekFrom::Start(position)).await {
+                                yield Err(e);
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                            break;
+                        }
+                        Ok(n) => {
+                            position += n as u64;
+                            yield Ok(Bytes::copy_from_slice(&buffer[..n]));
+                        }
+                        Err(e) => {
+                            yield Err(e);
+                            return;
+                        }
+                    }
+                }
+
+                match progress.status {
+                    ProgressStatus::Starting | ProgressStatus::Downloading => {
+                        // Wait for more data
+                        if rx.changed().await.is_err() {
+                            yield Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "Download interrupted",
+                            ));
+                            return;
+                        }
+                    }
+                    ProgressStatus::Complete { .. } => {
+                        // Read any remaining data
+                        loop {
+                            match file.read(&mut buffer).await {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    yield Ok(Bytes::copy_from_slice(&buffer[..n]));
+                                }
+                                Err(e) => {
+                                    yield Err(e);
+                                    return;
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    ProgressStatus::Failed(err) => {
+                        yield Err(std::io::Error::new(std::io::ErrorKind::Other, err));
+                        return;
+                    }
+                }
             }
         }
     }
 
-    async fn perform_download(&self, key: &str, url: &str, dl: Arc<ActiveDownload>) -> Result<Response> {
-        let mut guard = DownloadGuard::new(&self.active, key.to_string(), dl.as_ref());
-        guard.start();
+    async fn perform_download(
+        &self,
+        key: &str,
+        url: &str,
+        mut temp_file: File,
+        download: Arc<ActiveDownload>,
+    ) {
+        let result = self.do_download(key, url, &mut temp_file, &download).await;
 
+        // Cleanup
+        self.active.remove(key);
+        metrics::dec_active();
+
+        match result {
+            Ok(Some(meta)) => {
+                let temp_path = download.temp_path.clone();
+                match self
+                    .cache
+                    .commit_temp_data(key, temp_path.clone(), &meta)
+                    .await
+                {
+                    Ok(_) => {
+                        info!(key, size = meta.size, "Download complete, cached");
+                        let _ = download.progress_tx.send(DownloadProgress {
+                            written: meta.size,
+                            content_length: Some(meta.size),
+                            headers: download.progress_rx.borrow().headers.clone(),
+                            status: ProgressStatus::Complete { from_cache: false },
+                        });
+                    }
+                    Err(e) => {
+                        warn!(key, error = %e, "Failed to cache, serving from temp");
+                        let _ = download.progress_tx.send(DownloadProgress {
+                            written: meta.size,
+                            content_length: Some(meta.size),
+                            headers: download.progress_rx.borrow().headers.clone(),
+                            status: ProgressStatus::Complete { from_cache: false },
+                        });
+                    }
+                }
+            }
+            Ok(None) => {
+                // 304 case handled in do_download
+                let _ = tokio::fs::remove_file(&download.temp_path).await;
+            }
+            Err(e) => {
+                warn!(key, error = %e, "Download failed");
+                let _ = download.progress_tx.send(DownloadProgress {
+                    written: 0,
+                    content_length: None,
+                    headers: None,
+                    status: ProgressStatus::Failed(e.to_string()),
+                });
+                let _ = tokio::fs::remove_file(&download.temp_path).await;
+            }
+        }
+    }
+
+    async fn do_download(
+        &self,
+        key: &str,
+        url: &str,
+        temp_file: &mut File,
+        download: &ActiveDownload,
+    ) -> Result<Option<Metadata>> {
         debug!(key, url, "Starting download");
 
         let existing = self.cache.get_metadata(key).await;
@@ -261,13 +373,10 @@ impl Downloader {
             }
         }
 
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                metrics::record_error();
-                return Err(e.into());
-            }
-        };
+        let resp = req.send().await.map_err(|e| {
+            metrics::record_error();
+            ProxyError::Upstream(e)
+        })?;
 
         let status = resp.status();
 
@@ -279,45 +388,43 @@ impl Downloader {
                 warn!(key, error = %e, "Failed to touch cache entry");
             }
 
-            *dl.outcome.lock().await = Some(Arc::new(DownloadOutcome::Cached));
-            guard.complete(true);
-
-            if let Some((file, meta)) = self.cache.open(key).await {
-                return Ok(self.response_from_file(file, meta));
+            // Serve from cache
+            if let Some((_, meta)) = self.cache.open(key).await {
+                let _ = download.progress_tx.send(DownloadProgress {
+                    written: meta.size,
+                    content_length: Some(meta.size),
+                    headers: Some(Arc::new(meta.headers.clone())),
+                    status: ProgressStatus::Complete { from_cache: true },
+                });
             }
 
-            return Err(ProxyError::Download("Not in cache after 304".into()));
+            return Ok(None);
         }
 
         if !status.is_success() {
             warn!(key, %status, "Upstream error");
             metrics::record_error();
-            guard.complete(false);
-
             return Err(ProxyError::UpstreamStatus(
                 axum::http::StatusCode::from_u16(status.as_u16())
                     .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
             ));
         }
 
-        let _ = dl.tx.send(Status::Downloading);
-
-        let content_len = resp.content_length().unwrap_or(0);
-        if content_len > MAX_DOWNLOAD_SIZE {
-            warn!(key, size = content_len, max = MAX_DOWNLOAD_SIZE, "File too large");
-            guard.complete(false);
+        let content_len = resp.content_length();
+        if content_len.unwrap_or(0) > MAX_DOWNLOAD_SIZE {
             return Err(ProxyError::Download("File too large".into()));
         }
 
         let headers = resp.headers().clone();
-        let filtered_headers = self.filter_headers(&headers);
+        let filtered_headers = Self::filter_headers(&headers);
 
-        let (temp_path, mut temp_file) = self.cache.create_temp_data().await.map_err(|e| {
-            metrics::record_error();
-            ProxyError::Download(format!("Failed to create temp file: {e}"))
-        })?;
-
-        let temp_guard = TempPathGuard::new(temp_path.clone());
+        // Notify that we're downloading with headers
+        let _ = download.progress_tx.send(DownloadProgress {
+            written: 0,
+            content_length: content_len,
+            headers: Some(Arc::new(filtered_headers.clone())),
+            status: ProgressStatus::Downloading,
+        });
 
         info!(key, size = content_len, "Downloading");
 
@@ -325,45 +432,40 @@ impl Downloader {
         let mut written: u64 = 0;
 
         while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    written = written.saturating_add(bytes.len() as u64);
-                    if written > MAX_DOWNLOAD_SIZE {
-                        warn!(key, "Download exceeded maximum size");
-                        guard.complete(false);
-                        return Err(ProxyError::Download("File too large".into()));
-                    }
-                    if let Err(e) = temp_file.write_all(&bytes).await {
-                        metrics::record_error();
-                        guard.complete(false);
-                        return Err(ProxyError::Cache(e));
-                    }
-                }
-                Err(e) => {
-                    metrics::record_error();
-                    warn!(key, error = %e, "Download error");
-                    guard.complete(false);
-                    return Err(e.into());
-                }
+            let bytes = chunk.map_err(ProxyError::Upstream)?;
+
+            written = written.saturating_add(bytes.len() as u64);
+            if written > MAX_DOWNLOAD_SIZE {
+                return Err(ProxyError::Download("File too large".into()));
+            }
+
+            temp_file
+                .write_all(&bytes)
+                .await
+                .map_err(ProxyError::Cache)?;
+
+            // Flush to make data available to readers
+            temp_file.flush().await.map_err(ProxyError::Cache)?;
+
+            // Notify progress
+            let _ = download.progress_tx.send(DownloadProgress {
+                written,
+                content_length: content_len,
+                headers: Some(Arc::new(filtered_headers.clone())),
+                status: ProgressStatus::Downloading,
+            });
+        }
+
+        temp_file.sync_all().await.map_err(ProxyError::Cache)?;
+
+        if let Some(expected) = content_len {
+            if written != expected {
+                warn!(key, expected, actual = written, "Size mismatch");
+                return Err(ProxyError::Download("Incomplete download".into()));
             }
         }
 
-        if let Err(e) = temp_file.sync_all().await {
-            metrics::record_error();
-            guard.complete(false);
-            return Err(ProxyError::Cache(e));
-        }
-        drop(temp_file);
-
-        let size = written;
-
-        if content_len > 0 && size != content_len {
-            warn!(key, expected = content_len, actual = size, "Size mismatch");
-            guard.complete(false);
-            return Err(ProxyError::Download("Incomplete download".into()));
-        }
-
-        metrics::record_download(size);
+        metrics::record_download(written);
 
         let meta = Metadata {
             headers: filtered_headers,
@@ -373,7 +475,7 @@ impl Downloader {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            size,
+            size: written,
             etag: headers
                 .get(http::header::ETAG)
                 .and_then(|v| v.to_str().ok())
@@ -384,35 +486,10 @@ impl Downloader {
                 .map(Into::into),
         };
 
-        match self.cache.commit_temp_data(key, temp_path.clone(), &meta).await {
-            Ok(_) => {
-                *dl.outcome.lock().await = Some(Arc::new(DownloadOutcome::Cached));
-                guard.complete(true);
-                info!(key, size, "Download complete");
-
-                if let Some((file, meta)) = self.cache.open(key).await {
-                    return Ok(self.response_from_file(file, meta));
-                }
-
-                Err(ProxyError::Download("Cached but cannot open".into()))
-            }
-            Err(e) => {
-                warn!(key, error = %e, "Failed to cache");
-                let lease = Arc::new(TempFileLease { path: temp_path.clone() });
-                *dl.outcome.lock().await = Some(Arc::new(DownloadOutcome::Temp {
-                    lease: lease.clone(),
-                    meta: meta.clone(),
-                }));
-                guard.complete(true);
-
-                let _temp_guard = temp_guard.keep();
-                let file = File::open(&temp_path).await.map_err(ProxyError::Cache)?;
-                Ok(self.response_from_temp_file(file, meta, lease))
-            }
-        }
+        Ok(Some(meta))
     }
 
-    fn filter_headers(&self, headers: &reqwest::header::HeaderMap) -> axum::http::HeaderMap {
+    fn filter_headers(headers: &reqwest::header::HeaderMap) -> axum::http::HeaderMap {
         let mut filtered = axum::http::HeaderMap::new();
         for name in ALLOWED_HEADERS {
             if let Some(value) = headers.get(name.as_str()) {
@@ -424,7 +501,7 @@ impl Downloader {
         filtered
     }
 
-    fn response_from_file(&self, file: File, mut meta: Metadata) -> Response {
+    fn response_from_file(file: File, mut meta: Metadata) -> Response {
         if !meta.headers.contains_key(CONTENT_LENGTH) {
             if let Ok(v) = axum::http::HeaderValue::from_str(&meta.size.to_string()) {
                 meta.headers.insert(CONTENT_LENGTH, v);
@@ -432,23 +509,6 @@ impl Downloader {
         }
 
         let stream = ReaderStream::new(file);
-        let mut resp = Response::new(Body::from_stream(stream));
-        resp.headers_mut().extend(meta.headers);
-        resp
-    }
-
-    fn response_from_temp_file(&self, file: File, mut meta: Metadata, lease: Arc<TempFileLease>) -> Response {
-        if !meta.headers.contains_key(CONTENT_LENGTH) {
-            if let Ok(v) = axum::http::HeaderValue::from_str(&meta.size.to_string()) {
-                meta.headers.insert(CONTENT_LENGTH, v);
-            }
-        }
-
-        let stream = LeaseStream {
-            inner: ReaderStream::new(file),
-            _lease: lease,
-        };
-
         let mut resp = Response::new(Body::from_stream(stream));
         resp.headers_mut().extend(meta.headers);
         resp

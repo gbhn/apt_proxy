@@ -96,6 +96,15 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
+/// Prometheus metrics endpoint
+async fn metrics_handler() -> impl IntoResponse {
+    let content_type = [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")];
+    match metrics::render() {
+        Some(m) => (content_type, m),
+        None => (content_type, "# Prometheus metrics disabled\n".to_string()),
+    }
+}
+
 /// Health check endpoint
 async fn health_handler(State(app): State<Arc<App>>) -> impl IntoResponse {
     let loading = app.cache.is_loading();
@@ -156,7 +165,7 @@ async fn request_logging(req: axum::extract::Request, next: Next) -> Response {
     let elapsed = start.elapsed();
 
     // Record detailed request metrics (skip internal endpoints)
-    if !path.starts_with("/health") && !path.starts_with("/metrics") && !path.starts_with("/stats") {
+    if !path.starts_with("/health") && !path.starts_with("/stats") {
         metrics::record_request(
             method.as_str(),
             status,
@@ -186,15 +195,6 @@ async fn request_logging(req: axum::extract::Request, next: Next) -> Response {
     }
 
     resp
-}
-
-/// Prometheus metrics endpoint
-async fn metrics_handler() -> impl IntoResponse {
-    let content_type = [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")];
-    match metrics::render() {
-        Some(m) => (content_type, m),
-        None => (content_type, "# Prometheus metrics disabled\n".to_string()),
-    }
 }
 
 /// Main proxy handler

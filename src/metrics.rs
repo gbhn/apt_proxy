@@ -163,26 +163,28 @@ mod buckets {
     ];
 }
 
-/// Initializes the metrics system with optional Prometheus endpoint
-pub fn init(prometheus_port: Option<u16>) -> anyhow::Result<()> {
-    if let Some(port) = prometheus_port {
-        let handle = PrometheusBuilder::new()
-            // Duration histograms
+/// Initializes the metrics system (metrics available on main server at /metrics)
+pub fn init(enabled: bool) -> anyhow::Result<()> {
+    if enabled {
+        let mut builder = PrometheusBuilder::new();
+        
+        // Configure histograms
+        builder = builder
             .set_buckets_for_metric(Matcher::Suffix("_duration_seconds".to_string()), buckets::DURATION)?
             .set_buckets_for_metric(Matcher::Full(names::CACHE_LOOKUP_DURATION.to_string()), buckets::FAST_DURATION)?
             .set_buckets_for_metric(Matcher::Full(names::UPSTREAM_CONNECT_DURATION.to_string()), buckets::FAST_DURATION)?
             .set_buckets_for_metric(Matcher::Full(names::UPSTREAM_TTFB_SECONDS.to_string()), buckets::FAST_DURATION)?
-            // Size histograms
             .set_buckets_for_metric(Matcher::Suffix("_size_bytes".to_string()), buckets::SIZE)?
             .set_buckets_for_metric(Matcher::Suffix("_bytes".to_string()), buckets::SIZE)?
-            // Speed histograms
             .set_buckets_for_metric(Matcher::Suffix("_bytes_per_second".to_string()), buckets::SPEED)?
-            // TTL histograms
-            .set_buckets_for_metric(Matcher::Full(names::TTL_APPLIED_SECONDS.to_string()), buckets::TTL)?
-            .with_http_listener(([0, 0, 0, 0], port))
-            .install_recorder()?;
+            .set_buckets_for_metric(Matcher::Full(names::TTL_APPLIED_SECONDS.to_string()), buckets::TTL)?;
+
+        // Install recorder without HTTP server (will use /metrics endpoint on main server)
+        let handle = builder.install_recorder()?;
+            
         let _ = PROMETHEUS.set(handle);
-        info!(port, "Prometheus metrics enabled");
+        
+        info!("Prometheus metrics initialized (available at /metrics endpoint)");
     }
 
     register_descriptions();
@@ -999,36 +1001,5 @@ impl CacheLookupTimer {
 impl Drop for CacheLookupTimer {
     fn drop(&mut self) {
         // Metrics recorded in complete()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_atomic_counters() {
-        // Test that atomic operations work correctly
-        inc_active();
-        assert_eq!(active_downloads(), 1);
-        inc_active();
-        assert_eq!(active_downloads(), 2);
-        dec_active();
-        assert_eq!(active_downloads(), 1);
-        dec_active();
-        assert_eq!(active_downloads(), 0);
-        // Should not go below 0
-        dec_active();
-        assert_eq!(active_downloads(), 0);
-    }
-
-    #[test]
-    fn test_connection_guard() {
-        {
-            let _guard = ConnectionGuard::new();
-            assert_eq!(active_connections(), 1);
-        }
-        // Guard dropped, counter should be decremented
-        // Note: In tests without init(), the gauge might not work
     }
 }

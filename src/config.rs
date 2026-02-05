@@ -15,7 +15,6 @@ mod defaults {
     use std::time::Duration;
 
     pub const PORT: u16 = 3142;
-    pub const PROMETHEUS_PORT: u16 = 9090;
     pub const MAX_CACHE_SIZE: u64 = 10 << 30; // 10 GB
 
     pub const TTL: Duration = Duration::from_secs(86400);      // 1 day
@@ -41,10 +40,6 @@ pub struct Args {
     /// Enable Prometheus metrics
     #[arg(long, env = "APT_CACHER_PROMETHEUS", default_value_t = false)]
     pub prometheus: bool,
-
-    /// Prometheus metrics port
-    #[arg(long, env = "APT_CACHER_PROMETHEUS_PORT")]
-    pub prometheus_port: Option<u16>,
 }
 
 /// Compiled TTL rule with validated regex pattern
@@ -193,7 +188,6 @@ struct ConfigFile {
     #[serde(default)]
     cache: RawCacheConfig,
     prometheus: Option<bool>,
-    prometheus_port: Option<u16>,
 }
 
 /// Application settings with validated configuration
@@ -205,7 +199,6 @@ pub struct Settings {
     pub max_cache_size: u64,
     pub cache: CacheConfig,
     pub prometheus: bool,
-    pub prometheus_port: u16,
 }
 
 impl Settings {
@@ -250,7 +243,6 @@ impl Settings {
                 .unwrap_or(defaults::MAX_CACHE_SIZE),
             cache: CacheConfig::from_raw(config.cache),
             prometheus: config.prometheus.unwrap_or(false),
-            prometheus_port: config.prometheus_port.unwrap_or(defaults::PROMETHEUS_PORT),
         })
     }
 
@@ -263,9 +255,6 @@ impl Settings {
         }
         if args.prometheus {
             config.prometheus = Some(true);
-        }
-        if let Some(port) = args.prometheus_port {
-            config.prometheus_port = Some(port);
         }
     }
 }

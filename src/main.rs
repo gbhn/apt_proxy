@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
-    metrics::init(settings.prometheus.then_some(settings.prometheus_port))
+    metrics::init(settings.prometheus)
         .context("Failed to initialize metrics")?;
 
     let app = Arc::new(

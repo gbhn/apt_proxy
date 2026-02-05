@@ -3,11 +3,24 @@ use serde::{Deserialize, Serialize};
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
+static INSTANCE_ID: OnceLock<u64> = OnceLock::new();
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn get_instance_id() -> u64 {
+    *INSTANCE_ID.get_or_init(|| {
+        let pid = std::process::id() as u64;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        pid ^ timestamp
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
@@ -34,11 +47,12 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn unique_id() -> u64 {
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+fn unique_id() -> String {
+    let instance = get_instance_id();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:016x}_{:016x}", instance, counter)
 }
 
-/// Guard для очистки временных файлов при ошибках
 struct TempFileGuard {
     paths: Vec<PathBuf>,
     committed: bool,
@@ -65,8 +79,10 @@ impl Drop for TempFileGuard {
     fn drop(&mut self) {
         if !self.committed {
             for path in &self.paths {
-                // Используем блокирующий вызов т.к. Drop синхронный
-                let _ = std::fs::remove_file(path);
+                let path = path.clone();
+                tokio::spawn(async move {
+                    let _ = fs::remove_file(&path).await;
+                });
             }
         }
     }
@@ -86,7 +102,6 @@ impl Storage {
         Ok(Self { base_path: path, temp_dir })
     }
 
-    /// Генерирует путь к файлу данных
     fn data_path(&self, key: &str) -> PathBuf {
         let hash = blake3::hash(key.as_bytes());
         let hex = hash.to_hex();
@@ -94,7 +109,6 @@ impl Storage {
         self.base_path.join(&h[0..2]).join(&h[2..4]).join(h)
     }
 
-    /// Путь к файлу метаданных
     fn meta_path(&self, key: &str) -> PathBuf {
         let mut p = self.data_path(key);
         p.set_extension("json");
@@ -105,7 +119,6 @@ impl Storage {
         let data_path = self.data_path(key);
         let meta_path = self.meta_path(key);
 
-        // Сначала читаем метаданные
         let meta_bytes = match fs::read(&meta_path).await {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
@@ -121,11 +134,9 @@ impl Storage {
             }
         };
 
-        // Затем читаем данные
         let data = match fs::read(&data_path).await {
             Ok(d) => d,
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                // Метаданные есть, а данных нет — inconsistent state
                 warn!(key, "Data file missing, removing metadata");
                 let _ = fs::remove_file(&meta_path).await;
                 return Ok(None);
@@ -133,7 +144,6 @@ impl Storage {
             Err(e) => return Err(e.into()),
         };
 
-        // Проверка целостности: размер должен совпадать
         if data.len() as u64 != meta.size {
             warn!(
                 key,
@@ -171,15 +181,12 @@ impl Storage {
         let data_path = self.data_path(key);
         let meta_path = self.meta_path(key);
 
-        // Создаём директорию
         if let Some(parent) = data_path.parent() {
             fs::create_dir_all(parent).await?;
         }
 
-        // Guard для очистки временных файлов при ошибках
         let mut guard = TempFileGuard::new();
 
-        // Атомарная запись через временные файлы
         let id = unique_id();
         let temp_data = self.temp_dir.join(format!("{}.data", id));
         let temp_meta = self.temp_dir.join(format!("{}.json", id));
@@ -187,26 +194,20 @@ impl Storage {
         guard.add(temp_data.clone());
         guard.add(temp_meta.clone());
 
-        // Записываем данные
         let mut file = File::create(&temp_data).await?;
         file.write_all(data).await?;
         file.sync_all().await?;
         drop(file);
 
-        // Записываем метаданные
         let meta_json = serde_json::to_vec(meta)?;
         let mut file = File::create(&temp_meta).await?;
         file.write_all(&meta_json).await?;
         file.sync_all().await?;
         drop(file);
 
-        // Атомарное переименование
-        // Сначала метаданные — если упадёт, данные можно переписать
-        // При следующем запуске cleanup удалит осиротевшие файлы
         fs::rename(&temp_meta, &meta_path).await?;
         fs::rename(&temp_data, &data_path).await?;
 
-        // Успешно — не удаляем временные файлы (они уже переименованы)
         guard.commit();
 
         debug!(key, size = data.len(), "Cached");
@@ -225,21 +226,18 @@ impl Storage {
     }
 
     pub async fn cleanup(&self) -> Result<()> {
-        // Очищаем временные файлы
         if let Ok(mut entries) = fs::read_dir(&self.temp_dir).await {
             while let Ok(Some(e)) = entries.next_entry().await {
                 let _ = fs::remove_file(e.path()).await;
             }
         }
 
-        // Проверяем консистентность: удаляем метаданные без данных
         self.cleanup_orphans().await?;
 
         debug!("Cleanup completed");
         Ok(())
     }
 
-    /// Удаляет осиротевшие метаданные (без соответствующих данных)
     async fn cleanup_orphans(&self) -> Result<()> {
         let mut stack = vec![self.base_path.clone()];
         let mut orphaned = 0usize;
@@ -266,7 +264,6 @@ impl Storage {
                     }
                     stack.push(path);
                 } else if path.extension().map(|e| e == "json").unwrap_or(false) {
-                    // Это файл метаданных — проверяем есть ли данные
                     let data_path = path.with_extension("");
                     if !fs::try_exists(&data_path).await.unwrap_or(false) {
                         debug!(path = %path.display(), "Removing orphaned metadata");
@@ -302,7 +299,6 @@ impl Storage {
                 };
 
                 if file_type.is_dir() {
-                    // Пропускаем .tmp и другие скрытые директории
                     if path.file_name()
                         .map(|n| n.to_string_lossy().starts_with('.'))
                         .unwrap_or(false)

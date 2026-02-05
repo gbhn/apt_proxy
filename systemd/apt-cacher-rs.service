@@ -6,14 +6,13 @@ Wants=network-online.target
 Requires=apt-cacher-rs.socket
 
 [Service]
-Type=notify
+Type=simple
 ExecStart=/usr/bin/apt-cacher-rs --config /etc/apt-cacher/config.yaml
 Restart=on-failure
 RestartSec=5
 User=apt-cacher
 Group=apt-cacher
 
-# Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -22,7 +21,6 @@ PrivateDevices=true
 
 ReadWritePaths=/var/cache/apt-cacher
 
-# Resource limits
 LimitNOFILE=65535
 MemoryMax=2G
 

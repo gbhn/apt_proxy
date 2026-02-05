@@ -64,7 +64,6 @@ impl CacheManager {
         let index: Cache<Arc<str>, Entry> = Cache::builder()
             .max_capacity(max_capacity_kb)
             .weigher(|_, e: &Entry| {
-                // Защита от переполнения: ограничиваем максимальным значением u32
                 let size_kb = e.size / 1024;
                 size_kb.max(1).min(u32::MAX as u64) as u32
             })
@@ -110,7 +109,6 @@ impl CacheManager {
         match self.storage.get(key).await {
             Ok(Some(result)) => Some(result),
             Ok(None) => {
-                // Файл был удалён, инвалидируем индекс
                 self.index.invalidate(&key_arc).await;
                 None
             }
@@ -130,7 +128,10 @@ impl CacheManager {
         self.index
             .insert(Arc::from(key), Entry { size: meta.size })
             .await;
-        self.index.run_pending_tasks().await;
         Ok(())
+    }
+
+    pub async fn run_maintenance(&self) {
+        self.index.run_pending_tasks().await;
     }
 }

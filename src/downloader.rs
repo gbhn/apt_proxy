@@ -2,6 +2,9 @@ use crate::cache::CacheManager;
 use crate::error::{ProxyError, Result};
 use crate::metrics;
 use crate::storage::Metadata;
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED,
+};
 use axum::{body::Body, response::Response};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -12,7 +15,15 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 const TIMEOUT: Duration = Duration::from_secs(300);
-const MAX_DOWNLOAD_SIZE: usize = 2 * 1024 * 1024 * 1024; // 2 GB
+const MAX_DOWNLOAD_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+const ALLOWED_HEADERS: &[axum::http::HeaderName] = &[
+    CONTENT_TYPE,
+    CONTENT_LENGTH,
+    ETAG,
+    LAST_MODIFIED,
+    CACHE_CONTROL,
+];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Status {
@@ -33,7 +44,6 @@ impl ActiveDownload {
     }
 }
 
-/// Guard для очистки ресурсов при завершении загрузки (включая панику)
 struct DownloadGuard<'a> {
     active: &'a DashMap<String, Arc<ActiveDownload>>,
     key: String,
@@ -64,7 +74,6 @@ impl<'a> DownloadGuard<'a> {
 
 impl Drop for DownloadGuard<'_> {
     fn drop(&mut self) {
-        // Если не было явного завершения — это паника или ошибка
         if !self.completed {
             let _ = self.download.tx.send(Status::Done(false));
         }
@@ -98,7 +107,6 @@ impl Downloader {
     }
 
     pub async fn fetch(&self, key: &str, url: &str) -> Result<Response> {
-        // 1. Проверяем кэш
         if let Some((data, meta)) = self.cache.get(key).await {
             metrics::record_hit(meta.size);
             debug!(key, size = meta.size, "Cache hit");
@@ -107,7 +115,6 @@ impl Downloader {
 
         metrics::record_miss();
 
-        // 2. Coalescing - проверяем активные загрузки
         let (download, is_leader) = self.get_or_create_download(key);
 
         if !is_leader {
@@ -116,7 +123,6 @@ impl Downloader {
             return self.wait_for_download(key, &download).await;
         }
 
-        // 3. Мы лидер - качаем с использованием guard
         self.perform_download(key, url, &download).await
     }
 
@@ -167,12 +173,10 @@ impl Downloader {
         url: &str,
         dl: &ActiveDownload,
     ) -> Result<Response> {
-        // Guard автоматически очистит ресурсы при любом выходе
         let mut guard = DownloadGuard::new(&self.active, key.to_string(), dl);
 
         debug!(key, url, "Starting download");
 
-        // Условный запрос если есть метаданные
         let existing = self.cache.get_metadata(key).await;
         let mut req = self.client.get(url);
 
@@ -188,7 +192,6 @@ impl Downloader {
         let resp = req.send().await?;
         let status = resp.status();
 
-        // 304 Not Modified
         if status == reqwest::StatusCode::NOT_MODIFIED {
             info!(key, "304 Not Modified");
             metrics::record_304();
@@ -200,7 +203,6 @@ impl Downloader {
             };
         }
 
-        // Ошибка upstream
         if !status.is_success() {
             warn!(key, %status, "Upstream error");
             metrics::record_error();
@@ -215,9 +217,8 @@ impl Downloader {
         let _ = dl.tx.send(Status::Downloading);
 
         let content_len = resp.content_length().unwrap_or(0);
-        
-        // Проверка размера до начала загрузки
-        if content_len as usize > MAX_DOWNLOAD_SIZE {
+
+        if content_len > MAX_DOWNLOAD_SIZE {
             warn!(key, size = content_len, max = MAX_DOWNLOAD_SIZE, "File too large");
             guard.complete(false);
             return Err(ProxyError::Download("File too large".into()));
@@ -225,17 +226,15 @@ impl Downloader {
 
         info!(key, size = content_len, "Downloading");
 
-        // Собираем данные с ограничением размера
         let headers = resp.headers().clone();
-        let initial_capacity = (content_len as usize).min(10 * 1024 * 1024); // max 10MB initial
+        let initial_capacity = (content_len as usize).min(10 * 1024 * 1024);
         let mut data = Vec::with_capacity(initial_capacity);
         let mut stream = resp.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    // Проверка на превышение максимального размера
-                    if data.len().saturating_add(bytes.len()) > MAX_DOWNLOAD_SIZE {
+                    if (data.len() as u64).saturating_add(bytes.len() as u64) > MAX_DOWNLOAD_SIZE {
                         warn!(key, "Download exceeded maximum size");
                         guard.complete(false);
                         return Err(ProxyError::Download("File too large".into()));
@@ -252,9 +251,16 @@ impl Downloader {
 
         let size = data.len() as u64;
 
-        // Создаём метаданные
+        if content_len > 0 && size != content_len {
+            warn!(key, expected = content_len, actual = size, "Size mismatch");
+            guard.complete(false);
+            return Err(ProxyError::Download("Incomplete download".into()));
+        }
+
+        let filtered_headers = self.filter_headers(&headers);
+
         let meta = Metadata {
-            headers: headers.clone(),
+            headers: filtered_headers.clone(),
             url: url.into(),
             key: key.into(),
             stored_at: std::time::SystemTime::now()
@@ -272,7 +278,6 @@ impl Downloader {
                 .map(Into::into),
         };
 
-        // Сохраняем в кэш
         if let Err(e) = self.cache.put(key, &data, &meta).await {
             warn!(key, error = %e, "Failed to cache");
         }
@@ -283,6 +288,18 @@ impl Downloader {
         info!(key, size, "Download complete");
 
         Ok(self.response_from_data(data, meta))
+    }
+
+    fn filter_headers(&self, headers: &reqwest::header::HeaderMap) -> axum::http::HeaderMap {
+        let mut filtered = axum::http::HeaderMap::new();
+        for name in ALLOWED_HEADERS {
+            if let Some(value) = headers.get(name.as_str()) {
+                if let Ok(v) = axum::http::HeaderValue::from_bytes(value.as_bytes()) {
+                    filtered.insert(name.clone(), v);
+                }
+            }
+        }
+        filtered
     }
 
     fn response_from_data(&self, data: Vec<u8>, meta: Metadata) -> Response {

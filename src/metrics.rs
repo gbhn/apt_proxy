@@ -54,16 +54,16 @@ pub fn record_error() {
 }
 
 pub fn inc_active() {
-    let prev = ACTIVE_DOWNLOADS.fetch_add(1, Ordering::Relaxed);
-    gauge!("active_downloads").set((prev + 1) as f64);
+    let val = ACTIVE_DOWNLOADS.fetch_add(1, Ordering::SeqCst) + 1;
+    gauge!("active_downloads").set(val as f64);
 }
 
 pub fn dec_active() {
-    // Защита от переполнения снизу
-    let prev = ACTIVE_DOWNLOADS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-        Some(v.saturating_sub(1))
-    }).unwrap_or(0);
-    gauge!("active_downloads").set(prev.saturating_sub(1) as f64);
+    let val = ACTIVE_DOWNLOADS
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(1)))
+        .unwrap_or(0)
+        .saturating_sub(1);
+    gauge!("active_downloads").set(val as f64);
 }
 
 pub fn render() -> Option<String> {

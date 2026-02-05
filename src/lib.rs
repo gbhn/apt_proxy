@@ -100,49 +100,48 @@ async fn proxy_handler(
 }
 
 fn validate_path(path: &str) -> Result<()> {
-    // Проверка длины
     if path.is_empty() || path.len() > 2048 {
         return Err(ProxyError::InvalidPath("Invalid length".into()));
     }
 
-    // Проверка на null-байт
     if memchr::memchr(0, path.as_bytes()).is_some() {
         return Err(ProxyError::InvalidPath("Null byte".into()));
     }
 
-    // Проверка на абсолютный путь
     if path.starts_with('/') {
         return Err(ProxyError::InvalidPath("Absolute path not allowed".into()));
     }
 
-    // Проверка на URL-encoded path traversal
     let path_lower = path.to_lowercase();
     if path_lower.contains("%2e") || path_lower.contains("%00") {
         return Err(ProxyError::InvalidPath("Encoded special characters".into()));
     }
 
-    // Проверка на двойные слэши (потенциальная атака)
     if path.contains("//") {
         return Err(ProxyError::InvalidPath("Double slashes not allowed".into()));
     }
 
-    // Проверка компонентов пути
+    if path.contains('\\') {
+        return Err(ProxyError::InvalidPath("Backslashes not allowed".into()));
+    }
+
     for component in path.split('/') {
         if component == ".." || component == "." {
             return Err(ProxyError::InvalidPath("Path traversal".into()));
         }
-        
-        // Проверка на скрытые файлы (начинающиеся с точки)
-        if component.starts_with('.') && !component.is_empty() {
-            return Err(ProxyError::InvalidPath("Hidden files not allowed".into()));
+
+        if component.starts_with('.') && component != ".well-known" && !component.is_empty() {
+            if component.contains("..") {
+                return Err(ProxyError::InvalidPath("Path traversal".into()));
+            }
         }
     }
 
-    // Финальная проверка с нормализацией пути
-    let clean = path_clean::PathClean::clean(std::path::Path::new(path));
+    let normalized = path.replace('\\', "/");
+    let clean = path_clean::PathClean::clean(std::path::Path::new(&normalized));
     let clean_str = clean.to_string_lossy();
-    
-    if clean_str.starts_with("..") || clean_str.starts_with('/') {
+
+    if clean_str.starts_with("..") || clean_str.contains("..") {
         return Err(ProxyError::InvalidPath("Path traversal detected".into()));
     }
 

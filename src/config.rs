@@ -21,7 +21,7 @@ pub struct Args {
     #[arg(long, env = "APT_CACHER_CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
 
-    #[arg(long, env = "APT_CACHER_PROMETHEUS", default_value = "false")]
+    #[arg(long, env = "APT_CACHER_PROMETHEUS", default_value_t = false)]
     pub prometheus: bool,
 
     #[arg(long, env = "APT_CACHER_PROMETHEUS_PORT")]
@@ -144,14 +144,10 @@ impl Settings {
             figment = figment.merge(Yaml::file(path));
         }
 
-        // Используем двойное подчёркивание как разделитель для вложенных полей
-        // APT_CACHER_CACHE__DEFAULT_TTL -> cache.default_ttl
-        // APT_CACHER_CACHE_DIR -> cache_dir (остаётся как есть)
         figment = figment.merge(Env::prefixed("APT_CACHER_").split("__"));
 
         let mut config: ConfigFile = figment.extract()?;
 
-        // Применяем аргументы командной строки (наивысший приоритет)
         if let Some(port) = args.port {
             config.port = Some(port);
         }

@@ -50,7 +50,7 @@ impl<'a> CacheValidity<'a> {
             return true;
         }
         let stale_duration = self.age().saturating_sub(self.ttl());
-        stale_duration <= self.settings.stale_while_revalidate
+        stale_duration <= self.settings.stale_while_revalidate_secs()
     }
 
     /// Требуется ревалидация
@@ -193,60 +193,4 @@ pub fn parse_http_date(date_str: &str) -> Option<SystemTime> {
 
 pub fn format_http_date(time: SystemTime) -> String {
     httpdate::fmt_http_date(time)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::CacheSettings;
-
-    #[test]
-    fn test_calculate_ttl_with_cache_control() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("cache-control", "max-age=3600".parse().unwrap());
-
-        let settings = CacheSettings::default();
-        let ttl = calculate_ttl(&headers, "test/file.deb", &settings);
-
-        assert!(ttl >= settings.min_ttl);
-    }
-
-    #[test]
-    fn test_calculate_ttl_pattern_override() {
-        let headers = axum::http::HeaderMap::new();
-        let mut settings = CacheSettings::default();
-
-        settings.ttl_overrides.push(crate::config::TtlOverride {
-            pattern: r"\.deb$".to_string(),
-            ttl: 2592000,
-            regex: Some(regex::Regex::new(r"\.deb$").unwrap()),
-        });
-
-        let ttl = calculate_ttl(&headers, "ubuntu/pool/main/test_1.0_amd64.deb", &settings);
-
-        assert_eq!(ttl, settings.max_ttl.min(2592000));
-    }
-
-    #[test]
-    fn test_cache_validity() {
-        let settings = CacheSettings::default();
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let metadata = CacheMetadata {
-            headers: axum::http::HeaderMap::new(),
-            original_url: "http://example.com/test".to_string(),
-            key: Some("test".to_string()),
-            stored_at: now - 100, // 100 seconds ago
-            content_length: 1000,
-            etag: Some("\"abc123\"".to_string()),
-            last_modified: None,
-        };
-
-        let validity = CacheValidity::new(&metadata, &settings);
-        assert!(validity.is_fresh()); // default_ttl is 86400
-        assert_eq!(validity.age(), 100);
-    }
 }

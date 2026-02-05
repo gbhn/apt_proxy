@@ -1,9 +1,10 @@
-use crate::logging::fields::size;
+use crate::utils::{format_duration_secs, format_size};
+use bytesize::ByteSize;
 use clap::Parser;
 use regex::Regex;
 use serde::Deserialize;
 use serde_yml as serde_yaml;
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 use tracing::{info, warn};
 
 const DEFAULT_PORT: u16 = 3142;
@@ -44,9 +45,16 @@ pub struct Args {
 #[serde(deny_unknown_fields)]
 pub struct TtlOverride {
     pub pattern: String,
-    pub ttl: u64,
+    #[serde(with = "humantime_serde")]
+    pub ttl: Duration,
     #[serde(skip)]
     pub regex: Option<Regex>,
+}
+
+impl TtlOverride {
+    pub fn ttl_secs(&self) -> u64 {
+        self.ttl.as_secs()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -60,43 +68,57 @@ pub struct ValidationSettings {
     pub always_revalidate: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+fn default_true() -> bool {
+    true
+}
+
+fn default_ttl() -> Duration {
+    Duration::from_secs(DEFAULT_TTL)
+}
+
+fn default_min_ttl() -> Duration {
+    Duration::from_secs(DEFAULT_MIN_TTL)
+}
+
+fn default_max_ttl() -> Duration {
+    Duration::from_secs(DEFAULT_MAX_TTL)
+}
+
+fn default_stale_while_revalidate() -> Duration {
+    Duration::from_secs(DEFAULT_STALE_WHILE_REVALIDATE)
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheSettings {
-    #[serde(default = "default_ttl")]
-    pub default_ttl: u64,
-    #[serde(default = "default_min_ttl")]
-    pub min_ttl: u64,
-    #[serde(default = "default_max_ttl")]
-    pub max_ttl: u64,
+    #[serde(default = "default_ttl", with = "humantime_serde")]
+    pub default_ttl: Duration,
+    #[serde(default = "default_min_ttl", with = "humantime_serde")]
+    pub min_ttl: Duration,
+    #[serde(default = "default_max_ttl", with = "humantime_serde")]
+    pub max_ttl: Duration,
     #[serde(default)]
     pub ignore_cache_control: bool,
-    #[serde(default = "default_stale_while_revalidate")]
-    pub stale_while_revalidate: u64,
+    #[serde(default = "default_stale_while_revalidate", with = "humantime_serde")]
+    pub stale_while_revalidate: Duration,
     #[serde(default)]
     pub ttl_overrides: Vec<TtlOverride>,
     #[serde(default)]
     pub validation: ValidationSettings,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn default_ttl() -> u64 {
-    DEFAULT_TTL
-}
-
-fn default_min_ttl() -> u64 {
-    DEFAULT_MIN_TTL
-}
-
-fn default_max_ttl() -> u64 {
-    DEFAULT_MAX_TTL
-}
-
-fn default_stale_while_revalidate() -> u64 {
-    DEFAULT_STALE_WHILE_REVALIDATE
+impl Default for CacheSettings {
+    fn default() -> Self {
+        Self {
+            default_ttl: default_ttl(),
+            min_ttl: default_min_ttl(),
+            max_ttl: default_max_ttl(),
+            ignore_cache_control: false,
+            stale_while_revalidate: default_stale_while_revalidate(),
+            ttl_overrides: Vec::new(),
+            validation: ValidationSettings::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -106,20 +128,41 @@ pub struct PatternCompilationResult {
 }
 
 impl CacheSettings {
+    /// Возвращает TTL в секундах для обратной совместимости
+    #[inline]
+    pub fn default_ttl_secs(&self) -> u64 {
+        self.default_ttl.as_secs()
+    }
+
+    #[inline]
+    pub fn min_ttl_secs(&self) -> u64 {
+        self.min_ttl.as_secs()
+    }
+
+    #[inline]
+    pub fn max_ttl_secs(&self) -> u64 {
+        self.max_ttl.as_secs()
+    }
+
+    #[inline]
+    pub fn stale_while_revalidate_secs(&self) -> u64 {
+        self.stale_while_revalidate.as_secs()
+    }
+
     pub fn get_ttl_for_path(&self, path: &str) -> u64 {
         for override_rule in &self.ttl_overrides {
             if let Some(regex) = &override_rule.regex {
                 if regex.is_match(path) {
-                    return self.clamp_ttl(override_rule.ttl);
+                    return self.clamp_ttl(override_rule.ttl_secs());
                 }
             }
         }
-        self.clamp_ttl(self.default_ttl)
+        self.clamp_ttl(self.default_ttl_secs())
     }
 
     #[inline]
     pub fn clamp_ttl(&self, ttl: u64) -> u64 {
-        ttl.clamp(self.min_ttl, self.max_ttl)
+        ttl.clamp(self.min_ttl_secs(), self.max_ttl_secs())
     }
 
     /// Компилирует паттерны, пропуская невалидные
@@ -133,7 +176,7 @@ impl CacheSettings {
                     override_rule.regex = Some(regex);
                     info!(
                         pattern = %override_rule.pattern,
-                        ttl = override_rule.ttl,
+                        ttl = %format_duration_secs(override_rule.ttl_secs()),
                         "Compiled TTL override pattern"
                     );
                     successful += 1;
@@ -172,7 +215,7 @@ impl CacheSettings {
             override_rule.regex = Some(regex);
             info!(
                 pattern = %override_rule.pattern,
-                ttl = override_rule.ttl,
+                ttl = %format_duration_secs(override_rule.ttl_secs()),
                 "Compiled TTL override pattern"
             );
         }
@@ -187,81 +230,17 @@ pub struct ConfigFile {
     pub socket: Option<PathBuf>,
     pub repositories: Option<HashMap<String, String>>,
     pub cache_dir: Option<PathBuf>,
-    pub max_cache_size: Option<u64>,
     #[serde(default)]
-    pub max_cache_size_human: Option<String>,
+    pub max_cache_size: Option<ByteSize>,
     pub max_lru_entries: Option<usize>,
     #[serde(default)]
     pub cache: CacheSettings,
 }
 
 impl ConfigFile {
-    pub fn parse_size(s: &str) -> Option<u64> {
-        let s = s.trim();
-        if s.is_empty() {
-            return None;
-        }
-
-        // Чистое число без суффикса
-        if let Ok(n) = s.parse::<u64>() {
-            return Some(n);
-        }
-
-        // Находим границу между числом и суффиксом
-        let mut num_end = 0;
-        let mut has_dot = false;
-
-        for (i, c) in s.char_indices() {
-            if c.is_ascii_digit() {
-                num_end = i + c.len_utf8();
-            } else if c == '.' && !has_dot {
-                has_dot = true;
-                num_end = i + c.len_utf8();
-            } else if c == ' ' {
-                continue;
-            } else {
-                break;
-            }
-        }
-
-        if num_end == 0 {
-            return None;
-        }
-
-        let (num_str, suffix) = s.split_at(num_end);
-        let suffix = suffix.trim().to_ascii_uppercase();
-
-        let multiplier: u64 = match suffix.as_str() {
-            "TB" | "T" | "TIB" => 1 << 40,
-            "GB" | "G" | "GIB" => 1 << 30,
-            "MB" | "M" | "MIB" => 1 << 20,
-            "KB" | "K" | "KIB" => 1 << 10,
-            "B" | "" => 1,
-            _ => return None,
-        };
-
-        // Парсим как float чтобы поддержать "1.5GB"
-        let num: f64 = num_str.trim().parse().ok()?;
-
-        if num < 0.0 || num.is_nan() || num.is_infinite() {
-            return None;
-        }
-
-        let result = num * multiplier as f64;
-
-        if result > u64::MAX as f64 {
-            return None;
-        }
-
-        Some(result as u64)
-    }
-
     #[inline]
-    fn max_cache_size(&self) -> Option<u64> {
-        self.max_cache_size_human
-            .as_ref()
-            .and_then(|s| Self::parse_size(s))
-            .or(self.max_cache_size)
+    fn max_cache_size_bytes(&self) -> Option<u64> {
+        self.max_cache_size.map(|bs| bs.as_u64())
     }
 }
 
@@ -279,7 +258,7 @@ pub struct Settings {
 impl Settings {
     pub async fn load(args: Args) -> anyhow::Result<Self> {
         let mut config = Self::load_config_file(&args.config).await?;
-        let config_max_cache_size = config.max_cache_size();
+        let config_max_cache_size = config.max_cache_size_bytes();
 
         // Выбираем режим компиляции паттернов
         if args.strict_patterns {
@@ -339,16 +318,16 @@ impl Settings {
     pub fn display_info(&self) {
         info!(
             path = %self.cache_dir.display(),
-            max_size = %size(self.max_cache_size),
+            max_size = %format_size(self.max_cache_size),
             max_entries = self.max_lru_entries,
             "Cache configuration"
         );
 
         info!(
-            default_ttl = %format_duration(self.cache.default_ttl),
-            min_ttl = %format_duration(self.cache.min_ttl),
-            max_ttl = %format_duration(self.cache.max_ttl),
-            stale_while_revalidate = %format_duration(self.cache.stale_while_revalidate),
+            default_ttl = %format_duration_secs(self.cache.default_ttl_secs()),
+            min_ttl = %format_duration_secs(self.cache.min_ttl_secs()),
+            max_ttl = %format_duration_secs(self.cache.max_ttl_secs()),
+            stale_while_revalidate = %format_duration_secs(self.cache.stale_while_revalidate_secs()),
             ignore_cache_control = self.cache.ignore_cache_control,
             "TTL settings"
         );
@@ -380,46 +359,5 @@ impl Settings {
         } else {
             info!(port = self.port, "TCP mode");
         }
-    }
-}
-
-fn format_duration(seconds: u64) -> String {
-    if seconds < 60 {
-        format!("{}s", seconds)
-    } else if seconds < 3600 {
-        format!("{}m", seconds / 60)
-    } else if seconds < 86400 {
-        format!("{}h", seconds / 3600)
-    } else {
-        format!("{}d", seconds / 86400)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_size() {
-        assert_eq!(ConfigFile::parse_size("1024"), Some(1024));
-        assert_eq!(ConfigFile::parse_size("1KB"), Some(1024));
-        assert_eq!(ConfigFile::parse_size("1 KB"), Some(1024));
-        assert_eq!(ConfigFile::parse_size("1.5GB"), Some(1610612736));
-        assert_eq!(ConfigFile::parse_size("1.5 GB"), Some(1610612736));
-        assert_eq!(
-            ConfigFile::parse_size("10gb"),
-            Some(10 * 1024 * 1024 * 1024)
-        );
-        assert_eq!(ConfigFile::parse_size("0.5MB"), Some(524288));
-        assert_eq!(ConfigFile::parse_size(""), None);
-        assert_eq!(ConfigFile::parse_size("abc"), None);
-    }
-
-    #[test]
-    fn test_parse_size_edge_cases() {
-        assert_eq!(ConfigFile::parse_size("0"), Some(0));
-        assert_eq!(ConfigFile::parse_size("1B"), Some(1));
-        assert_eq!(ConfigFile::parse_size("1TB"), Some(1 << 40));
-        assert_eq!(ConfigFile::parse_size("  10  MB  "), Some(10 * 1024 * 1024));
     }
 }

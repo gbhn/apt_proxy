@@ -1,7 +1,7 @@
 use crate::cache_policy::is_cache_valid;
 use crate::config::CacheSettings;
-use crate::logging::fields::{self, size};
 use crate::storage::{CacheMetadata, Storage};
+use crate::utils::format_size;
 use std::{
     num::NonZeroUsize,
     sync::{
@@ -71,12 +71,12 @@ impl CacheManager {
             for (key, data_size, meta_size, metadata) in files {
                 if !is_cache_valid(&metadata, &self.settings) {
                     debug!(
-                        key = %fields::path(&key),
+                        key = %crate::logging::fields::path(&key),
                         "Removing expired entry during initialization"
                     );
                     if let Err(e) = self.storage.delete(&key).await {
                         warn!(
-                            key = %fields::path(&key),
+                            key = %crate::logging::fields::path(&key),
                             error = %e,
                             "Failed to delete expired entry"
                         );
@@ -98,8 +98,8 @@ impl CacheManager {
             info!(
                 entries = lru.len(),
                 expired = expired,
-                size = %size(total),
-                max_size = %size(self.max_size),
+                size = %format_size(total),
+                max_size = %format_size(self.max_size),
                 "Cache initialized"
             );
             Ok(())
@@ -119,7 +119,7 @@ impl CacheManager {
                     return true;
                 }
                 debug!(
-                    key = %fields::path(key),
+                    key = %crate::logging::fields::path(key),
                     "Entry found in LRU but expired"
                 );
                 return false;
@@ -140,7 +140,7 @@ impl CacheManager {
                 self.lru_insert(key_arc, entry).await;
 
                 debug!(
-                    key = %fields::path(key),
+                    key = %crate::logging::fields::path(key),
                     "Restored entry to LRU from storage"
                 );
                 return true;
@@ -166,8 +166,8 @@ impl CacheManager {
                 // Вытеснен другой ключ из-за capacity limit
                 self.total_size.fetch_sub(evicted_size, Ordering::AcqRel);
                 debug!(
-                    evicted = %fields::path(&evicted_key),
-                    size = %size(evicted_size),
+                    evicted = %crate::logging::fields::path(&evicted_key),
+                    size = %format_size(evicted_size),
                     "LRU evicted entry due to capacity"
                 );
             }
@@ -274,8 +274,8 @@ impl CacheManager {
 
         let target = (max_size as f64 * 0.8) as u64;
         info!(
-            current = %size(current),
-            target = %size(target),
+            current = %format_size(current),
+            target = %format_size(target),
             "Starting cache cleanup"
         );
 
@@ -311,7 +311,7 @@ impl CacheManager {
 
             info!(
                 to_remove = list.len(),
-                estimated_freed = %size(current.saturating_sub(current_size)),
+                estimated_freed = %format_size(current.saturating_sub(current_size)),
                 "Prepared cleanup list"
             );
 
@@ -328,9 +328,9 @@ impl CacheManager {
                     actually_removed += removed;
                     if removed != expected_size {
                         debug!(
-                            key = %fields::path(&key),
-                            expected = %size(expected_size),
-                            actual = %size(removed),
+                            key = %crate::logging::fields::path(&key),
+                            expected = %format_size(expected_size),
+                            actual = %format_size(removed),
                             "Size mismatch during cleanup"
                         );
                     }
@@ -338,7 +338,7 @@ impl CacheManager {
                 Err(e) => {
                     errors += 1;
                     warn!(
-                        key = %fields::path(&key),
+                        key = %crate::logging::fields::path(&key),
                         error = %e,
                         "Failed to delete cache entry"
                     );
@@ -351,9 +351,9 @@ impl CacheManager {
         let final_size = total_size.load(Ordering::Acquire);
         info!(
             removed = count,
-            freed = %size(actually_removed),
+            freed = %format_size(actually_removed),
             errors = errors,
-            final_size = %size(final_size),
+            final_size = %format_size(final_size),
             usage_percent = (final_size as f64 / max_size as f64 * 100.0) as u32,
             "Cache cleanup completed"
         );
@@ -419,7 +419,7 @@ impl CacheManager {
 
         info!(
             expired = expired_keys.len(),
-            freed = %size(removed_size),
+            freed = %format_size(removed_size),
             "Cleaned up expired entries"
         );
     }
@@ -449,8 +449,8 @@ impl std::fmt::Display for CacheStats {
         write!(
             f,
             "Cache: {}/{} ({}%) │ {} entries",
-            size(self.size),
-            size(self.max_size),
+            format_size(self.size),
+            format_size(self.max_size),
             usage_percent,
             self.entries
         )

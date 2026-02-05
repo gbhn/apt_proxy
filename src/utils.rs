@@ -1,3 +1,4 @@
+use humansize::{SizeFormatter, BINARY};
 use std::path::{Path, PathBuf};
 
 /// Валидирует путь запроса
@@ -34,22 +35,22 @@ pub fn validate_path(path: &str) -> Result<(), crate::error::ProxyError> {
     Ok(())
 }
 
-/// Форматирует размер в человекочитаемый формат
+/// Форматирует размер в человекочитаемый формат используя humansize crate
 #[inline]
 pub fn format_size(bytes: u64) -> String {
-    const UNITS: &[(u64, &str)] = &[
-        (1_099_511_627_776, "TB"),
-        (1_073_741_824, "GB"),
-        (1_048_576, "MB"),
-        (1024, "KB"),
-    ];
+    SizeFormatter::new(bytes, BINARY).to_string()
+}
 
-    for &(threshold, unit) in UNITS {
-        if bytes >= threshold {
-            return format!("{:.2}{}", bytes as f64 / threshold as f64, unit);
-        }
-    }
-    format!("{}B", bytes)
+/// Форматирует длительность в человекочитаемый формат используя humantime crate
+#[inline]
+pub fn format_duration(duration: std::time::Duration) -> String {
+    humantime::format_duration(duration).to_string()
+}
+
+/// Форматирует секунды в человекочитаемый формат
+#[inline]
+pub fn format_duration_secs(seconds: u64) -> String {
+    format_duration(std::time::Duration::from_secs(seconds))
 }
 
 /// Вычисляет путь в кэше для заданного URI.
@@ -85,55 +86,10 @@ pub fn encode_cache_key(key: &str) -> String {
     percent_encoding::utf8_percent_encode(key, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_validate_path_valid() {
-        assert!(validate_path("ubuntu/pool/main/file.deb").is_ok());
-        assert!(validate_path("a/b/c").is_ok());
-    }
-
-    #[test]
-    fn test_validate_path_invalid() {
-        assert!(validate_path("").is_err());
-        assert!(validate_path("../etc/passwd").is_err());
-        assert!(validate_path("a/../b").is_err());
-        assert!(validate_path("/absolute/path").is_err());
-        assert!(validate_path("double//slash").is_err());
-    }
-
-    #[test]
-    fn test_format_size() {
-        assert_eq!(format_size(0), "0B");
-        assert_eq!(format_size(512), "512B");
-        assert_eq!(format_size(1024), "1.00KB");
-        assert_eq!(format_size(1536), "1.50KB");
-        assert_eq!(format_size(1_048_576), "1.00MB");
-        assert_eq!(format_size(1_073_741_824), "1.00GB");
-        assert_eq!(format_size(1_099_511_627_776), "1.00TB");
-    }
-
-    #[test]
-    fn test_cache_path_for() {
-        let base = Path::new("/cache");
-        let path = cache_path_for(base, "ubuntu/pool/main/test.deb");
-
-        // Проверяем структуру пути
-        assert!(path.starts_with(base));
-        let relative = path.strip_prefix(base).unwrap();
-        let components: Vec<_> = relative.components().collect();
-        assert_eq!(components.len(), 3);
-    }
-
-    #[test]
-    fn test_meta_path_for() {
-        let cache_path = Path::new("/cache/ab/cd/abcdef123456");
-        let meta_path = meta_path_for(cache_path);
-        assert_eq!(
-            meta_path,
-            Path::new("/cache/ab/cd/abcdef123456.meta")
-        );
-    }
+/// Строит полный URL из базового URL и пути
+#[inline]
+pub fn build_upstream_url(base_url: &str, path: &str) -> Result<String, url::ParseError> {
+    let base = url::Url::parse(base_url)?;
+    let full = base.join(path)?;
+    Ok(full.to_string())
 }

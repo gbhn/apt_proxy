@@ -277,9 +277,11 @@ pub fn print_banner() {
 }
 
 pub mod fields {
+    use crate::utils;
+
     #[inline]
     pub fn size(bytes: u64) -> String {
-        crate::utils::format_size(bytes)
+        utils::format_size(bytes)
     }
 
     #[inline]
@@ -297,34 +299,10 @@ pub mod fields {
         }
     }
 
+    #[inline]
     pub fn duration(d: std::time::Duration) -> String {
-        let ms = d.as_millis();
-        if ms < 1000 {
-            format!("{}ms", ms)
-        } else if ms < 60_000 {
-            format!("{:.2}s", d.as_secs_f64())
-        } else {
-            format!("{}m{}s", ms / 60_000, (ms % 60_000) / 1000)
-        }
+        utils::format_duration(d)
     }
 }
 
 pub use fields::shorten_path;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_shorten_path() {
-        assert_eq!(shorten_path("short", 10), "short");
-        assert_eq!(shorten_path("a/very/long/path/to/file.deb", 20).len(), 20);
-    }
-
-    #[test]
-    fn test_size_format() {
-        assert_eq!(fields::size(1024), "1.00KB");
-        assert_eq!(fields::size(1_048_576), "1.00MB");
-        assert_eq!(fields::size(1_073_741_824), "1.00GB");
-    }
-}

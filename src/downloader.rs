@@ -266,10 +266,14 @@ impl Downloader {
         download: Arc<ActiveDownload>,
     ) {
         let start = Instant::now();
-        
+        let temp_path = download.temp_path.clone();
+
         let result = self
             .do_download(key, url, repo, &mut temp_file, &download)
             .await;
+
+        // Drop the file handle before any file operations
+        drop(temp_file);
 
         // Always cleanup active download registration
         self.active.remove(key);
@@ -279,11 +283,7 @@ impl Downloader {
         match result {
             Ok(Some((meta, bytes_written))) => {
                 // Commit to cache
-                match self
-                    .cache
-                    .commit(key, download.temp_path.clone(), &meta)
-                    .await
-                {
+                match self.cache.commit(key, temp_path.clone(), &meta).await {
                     Ok(_) => {
                         info!(key, size = meta.size, "Download complete");
                         download.notify(DownloadState::Complete { from_cache: false });
@@ -292,7 +292,16 @@ impl Downloader {
                     }
                     Err(e) => {
                         warn!(key, error = %e, "Failed to commit to cache");
-                        download.notify(DownloadState::Complete { from_cache: false });
+                        // Cleanup temp file on commit failure
+                        if let Err(rm_err) = tokio::fs::remove_file(&temp_path).await {
+                            debug!(
+                                key,
+                                error = %rm_err,
+                                "Failed to remove temp file after commit error"
+                            );
+                        }
+                        // Notify followers about the failure
+                        download.notify(DownloadState::Failed(format!("Commit failed: {e}")));
                         metrics::record_download_failed("commit_error", repo);
                         metrics::record_storage_error("commit");
                     }
@@ -300,13 +309,20 @@ impl Downloader {
             }
             Ok(None) => {
                 // 304 Not Modified - cleanup temp file
-                let _ = tokio::fs::remove_file(&download.temp_path).await;
-                // 304 metrics recorded in do_download
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                // Note: 304 metrics already recorded in do_download
             }
             Err(e) => {
                 warn!(key, error = %e, "Download failed");
                 download.notify(DownloadState::Failed(e.to_string()));
-                let _ = tokio::fs::remove_file(&download.temp_path).await;
+                // Cleanup temp file on download failure
+                if let Err(rm_err) = tokio::fs::remove_file(&temp_path).await {
+                    debug!(
+                        key,
+                        error = %rm_err,
+                        "Failed to remove temp file after download error"
+                    );
+                }
                 metrics::record_download_failed(&categorize_error(&e), repo);
             }
         }
@@ -417,7 +433,9 @@ impl Downloader {
             written = written.saturating_add(bytes.len() as u64);
             if written > limits::MAX_DOWNLOAD_SIZE {
                 metrics::record_upstream_error("size_exceeded", repo);
-                return Err(ProxyError::download("File exceeded size limit during download"));
+                return Err(ProxyError::download(
+                    "File exceeded size limit during download",
+                ));
             }
 
             temp_file.write_all(&bytes).await.map_err(|e| {
@@ -450,7 +468,12 @@ impl Downloader {
         }
 
         // Record successful upstream request
-        metrics::record_upstream_request(status.as_u16(), request_start.elapsed(), Some(written), repo);
+        metrics::record_upstream_request(
+            status.as_u16(),
+            request_start.elapsed(),
+            Some(written),
+            repo,
+        );
         metrics::record_storage_write(written);
 
         // Build metadata

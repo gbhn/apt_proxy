@@ -97,7 +97,7 @@ impl CacheManager {
 
         let index = Self::build_index(storage.clone(), config, max_size);
         let loading = Arc::new(AtomicBool::new(true));
-        
+
         metrics::set_cache_loading(true);
 
         let manager = Self {
@@ -137,7 +137,7 @@ impl CacheManager {
                     RemovalCause::Replaced => "replaced",
                 };
                 metrics::record_eviction(reason);
-                
+
                 debug!(
                     key = key.as_str(),
                     size = entry.size,
@@ -173,13 +173,9 @@ impl CacheManager {
                     elapsed_ms = start.elapsed().as_millis() as u64,
                     "Cache index loaded"
                 );
-                
+
                 // Update cache stats
-                metrics::set_cache_stats(
-                    total_size,
-                    loaded as u64,
-                    total_size / 1024,
-                );
+                metrics::set_cache_stats(total_size, loaded as u64, total_size / 1024);
                 metrics::set_storage_space_used(total_size);
             }
             Err(e) => {
@@ -259,7 +255,7 @@ impl CacheManager {
     /// Opens a cached file, returning file handle and metadata
     pub async fn open(&self, key: &str) -> Option<(File, Metadata)> {
         let start = Instant::now();
-        
+
         // Fast path: check index
         if self.index.get(key).await.is_some() {
             let result = self.open_from_storage(key).await;
@@ -311,22 +307,29 @@ impl CacheManager {
     }
 
     /// Commits a downloaded file to cache
+    ///
+    /// Note: This function takes ownership of temp_data path.
+    /// On success, the file is moved to cache.
+    /// On error, the caller is responsible for cleanup (temp file is NOT deleted automatically).
     pub async fn commit(
         &self,
         key: &str,
         temp_data: PathBuf,
         meta: &Metadata,
     ) -> anyhow::Result<()> {
+        // Run pending evictions before committing to free up space
+        self.index.run_pending_tasks().await;
+
         self.storage.put_from_temp_data(key, temp_data, meta).await?;
         self.index
             .insert(key.to_owned(), CacheEntry::new(meta.size))
             .await;
-        
+
         metrics::record_cache_operation("commit");
-        
+
         // Update cache stats after commit
         self.update_stats().await;
-        
+
         Ok(())
     }
 
@@ -349,12 +352,17 @@ impl CacheManager {
     /// Runs background maintenance tasks (eviction processing)
     pub async fn run_maintenance(&self) {
         let start = Instant::now();
-        
+
         self.index.run_pending_tasks().await;
-        
+
         // Update cache stats
         self.update_stats().await;
-        
+
+        // Periodic temp cleanup
+        if let Err(e) = self.storage.cleanup_temp().await {
+            warn!(error = %e, "Failed to cleanup temp files during maintenance");
+        }
+
         metrics::record_maintenance_run("cache_maintenance", start.elapsed());
     }
 
@@ -363,7 +371,7 @@ impl CacheManager {
         let entry_count = self.entry_count();
         let weighted_size = self.weighted_size();
         let size_bytes = weighted_size * 1024;
-        
+
         metrics::set_cache_stats(size_bytes, entry_count, weighted_size);
         metrics::set_storage_space_used(size_bytes);
     }

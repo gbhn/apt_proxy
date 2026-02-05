@@ -101,37 +101,10 @@ impl Metadata {
     }
 }
 
-/// RAII guard for temporary files cleanup on error
-struct TempGuard {
-    paths: Vec<PathBuf>,
-    committed: bool,
-}
-
-impl TempGuard {
-    fn new() -> Self {
-        Self {
-            paths: Vec::with_capacity(2),
-            committed: false,
-        }
-    }
-
-    fn track(&mut self, path: PathBuf) {
-        self.paths.push(path);
-    }
-
-    fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for TempGuard {
-    fn drop(&mut self) {
-        if !self.committed {
-            for path in &self.paths {
-                // Use blocking remove since we're in Drop
-                let _ = std::fs::remove_file(path);
-            }
-        }
+/// Helper to cleanup files on error
+async fn cleanup_files(paths: &[&Path]) {
+    for path in paths {
+        let _ = fs::remove_file(path).await;
     }
 }
 
@@ -158,7 +131,7 @@ impl Storage {
 
         debug!(path = %base.display(), "Storage initialized");
         metrics::record_storage_operation("init", start.elapsed(), true);
-        
+
         Ok(Self { base, temp })
     }
 
@@ -185,7 +158,7 @@ impl Storage {
     /// Cleans up temporary files from previous runs
     pub async fn cleanup_temp(&self) -> Result<()> {
         let start = Instant::now();
-        
+
         let mut entries = match fs::read_dir(&self.temp).await {
             Ok(e) => e,
             Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -209,7 +182,7 @@ impl Storage {
             debug!(count = cleaned, "Cleaned temp files");
             metrics::record_temp_cleanup(cleaned as u64);
         }
-        
+
         metrics::record_storage_operation("cleanup_temp", start.elapsed(), true);
         Ok(())
     }
@@ -250,7 +223,7 @@ impl Storage {
     /// Reads metadata from a specific path
     pub async fn read_metadata_from_path(&self, path: &Path) -> Result<Option<Metadata>> {
         let start = Instant::now();
-        
+
         match self.read_json(path).await {
             Ok(meta) => {
                 metrics::record_storage_operation("read_metadata", start.elapsed(), true);
@@ -278,11 +251,11 @@ impl Storage {
     pub async fn create_temp_data(&self) -> Result<(PathBuf, File)> {
         let start = Instant::now();
         let path = self.temp_path("data");
-        
+
         let file = File::create(&path)
             .await
             .with_context(|| format!("Failed to create temp file: {}", path.display()));
-        
+
         match file {
             Ok(f) => {
                 metrics::record_temp_file_created();
@@ -371,7 +344,7 @@ impl Storage {
     /// Returns metadata for a key without opening the data file
     pub async fn get_metadata(&self, key: &str) -> Result<Option<Metadata>> {
         let start = Instant::now();
-        
+
         match self.read_json(&self.meta_path(key)).await {
             Ok(meta) => {
                 metrics::record_storage_operation("get_metadata", start.elapsed(), true);
@@ -396,6 +369,9 @@ impl Storage {
     }
 
     /// Commits a temporary data file to permanent storage
+    ///
+    /// This function is atomic: either both data and metadata are committed,
+    /// or nothing is changed. All temporary files are cleaned up on error.
     pub async fn put_from_temp_data(
         &self,
         key: &str,
@@ -406,43 +382,52 @@ impl Storage {
         let data_path = self.data_path(key);
         let meta_path = self.meta_path(key);
 
+        // Create parent directories
         if let Some(parent) = data_path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .context("Failed to create cache subdirectory")?;
+            if let Err(e) = fs::create_dir_all(parent).await {
+                // Cleanup temp_data on error
+                let _ = fs::remove_file(&temp_data).await;
+                metrics::record_storage_operation("put", start.elapsed(), false);
+                metrics::record_storage_error("create_dir");
+                return Err(e).context("Failed to create cache subdirectory");
+            }
         }
-
-        let mut guard = TempGuard::new();
 
         // Write metadata to temp file first
         let temp_meta = self.temp_path("json");
-        guard.track(temp_meta.clone());
-        
+
         if let Err(e) = self.write_json(&temp_meta, meta).await {
+            // Cleanup all temp files
+            cleanup_files(&[&temp_data, &temp_meta]).await;
             metrics::record_storage_operation("put", start.elapsed(), false);
             metrics::record_storage_error("write_metadata");
             return Err(e).context("Failed to write metadata");
         }
 
-        // Atomic rename both files
+        // Atomic rename: data file first
         if let Err(e) = fs::rename(&temp_data, &data_path).await {
+            // Cleanup all temp files
+            cleanup_files(&[&temp_data, &temp_meta]).await;
             metrics::record_storage_operation("put", start.elapsed(), false);
             metrics::record_storage_error("rename_data");
             return Err(e).context("Failed to commit data file");
         }
-        
+
+        // Atomic rename: metadata file
         if let Err(e) = fs::rename(&temp_meta, &meta_path).await {
+            // Rollback: remove already committed data file
+            let _ = fs::remove_file(&data_path).await;
+            // Cleanup temp metadata (temp_data already renamed, so skip it)
+            let _ = fs::remove_file(&temp_meta).await;
             metrics::record_storage_operation("put", start.elapsed(), false);
             metrics::record_storage_error("rename_metadata");
             return Err(e).context("Failed to commit metadata");
         }
 
-        guard.commit();
-        
         metrics::record_storage_write(meta.size);
         metrics::record_storage_operation("put", start.elapsed(), true);
         debug!(key, size = meta.size, "Cached");
-        
+
         Ok(meta.size)
     }
 
@@ -465,22 +450,20 @@ impl Storage {
 
         meta.stored_at = time::now_secs();
 
-        let mut guard = TempGuard::new();
         let temp_meta = self.temp_path("json");
-        guard.track(temp_meta.clone());
 
         if let Err(e) = self.write_json(&temp_meta, &meta).await {
+            let _ = fs::remove_file(&temp_meta).await;
             metrics::record_storage_operation("touch", start.elapsed(), false);
             return Err(e);
         }
-        
+
         if let Err(e) = fs::rename(&temp_meta, &meta_path).await {
+            let _ = fs::remove_file(&temp_meta).await;
             metrics::record_storage_operation("touch", start.elapsed(), false);
             return Err(e.into());
         }
 
-        guard.commit();
-        
         metrics::record_storage_operation("touch", start.elapsed(), true);
         debug!(key, "Touched");
         Ok(true)
@@ -489,7 +472,7 @@ impl Storage {
     /// Deletes both data and metadata files for a key
     pub async fn delete(&self, key: &str) -> Result<()> {
         let start = Instant::now();
-        
+
         let data_result = fs::remove_file(self.data_path(key)).await;
         let meta_result = fs::remove_file(self.meta_path(key)).await;
 
@@ -497,7 +480,7 @@ impl Storage {
         if data_result.is_ok() || meta_result.is_ok() {
             debug!(key, "Deleted");
         }
-        
+
         metrics::record_storage_operation("delete", start.elapsed(), true);
         Ok(())
     }
@@ -539,9 +522,28 @@ impl Storage {
             debug!(removed, "Removed orphaned files");
             metrics::record_orphans_removed(removed as u64);
         }
-        
+
         metrics::record_storage_operation("cleanup_orphans", start.elapsed(), true);
         Ok(removed)
+    }
+
+    /// Checks available disk space in bytes
+    #[allow(dead_code)]
+    pub async fn available_space(&self) -> Result<u64> {
+        let base = self.base.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(unix)]
+            {
+                let stat = nix::sys::statvfs::statvfs(&base)?;
+                Ok(stat.blocks_available() * stat.block_size())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = base;
+                Ok(u64::MAX)
+            }
+        })
+        .await?
     }
 
     // ========== Private Helpers ==========

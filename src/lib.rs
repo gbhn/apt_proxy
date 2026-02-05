@@ -38,6 +38,7 @@ mod app_config {
 pub struct App {
     pub settings: Settings,
     downloader: Downloader,
+    cache: CacheManager,
 }
 
 impl App {
@@ -59,7 +60,8 @@ impl App {
 
         Ok(Self {
             settings,
-            downloader: Downloader::new(cache),
+            downloader: Downloader::new(cache.clone()),
+            cache,
         })
     }
 
@@ -70,6 +72,11 @@ impl App {
         let url = format!("{}/{}", base.trim_end_matches('/'), rest);
         Some((prefix.to_string(), url))
     }
+
+    /// Returns the repository name from a path
+    fn extract_repo(path: &str) -> &str {
+        path.split('/').next().unwrap_or("unknown")
+    }
 }
 
 /// Creates the application router
@@ -78,6 +85,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/", get(|| async { "OK" }))
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/stats", get(stats_handler))
         .route("/{*path}", get(proxy_handler))
         .layer(
             ServiceBuilder::new()
@@ -89,20 +97,75 @@ pub fn router(app: Arc<App>) -> Router {
 }
 
 /// Health check endpoint
-async fn health_handler() -> impl IntoResponse {
-    "OK"
+async fn health_handler(State(app): State<Arc<App>>) -> impl IntoResponse {
+    let loading = app.cache.is_loading();
+    let active = metrics::active_downloads();
+    
+    if loading {
+        metrics::set_health_status(true); // Still healthy, just loading
+    }
+    
+    let status = if loading { "loading" } else { "ready" };
+    format!("OK\nstatus: {}\nactive_downloads: {}\n", status, active)
 }
 
-/// Request logging middleware
+/// Stats endpoint with detailed information
+async fn stats_handler(State(app): State<Arc<App>>) -> impl IntoResponse {
+    let entries = app.cache.entry_count();
+    let size_kb = app.cache.weighted_size();
+    let loading = app.cache.is_loading();
+    let active = metrics::active_downloads();
+    let connections = metrics::active_connections();
+    let in_flight = metrics::requests_in_flight();
+    
+    format!(
+        "cache_entries: {}\n\
+         cache_size_kb: {}\n\
+         cache_size_mb: {}\n\
+         index_loading: {}\n\
+         active_downloads: {}\n\
+         active_connections: {}\n\
+         requests_in_flight: {}\n",
+        entries,
+        size_kb,
+        size_kb / 1024,
+        loading,
+        active,
+        connections,
+        in_flight
+    )
+}
+
+/// Request logging middleware with metrics
 async fn request_logging(req: axum::extract::Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
     let start = Instant::now();
 
+    // Extract repo from path (skip leading slash if present)
+    let path_trimmed = path.trim_start_matches('/');
+    let repo = App::extract_repo(path_trimmed);
+
+    metrics::inc_requests_in_flight();
+    
     let resp = next.run(req).await;
+
+    metrics::dec_requests_in_flight();
 
     let status = resp.status().as_u16();
     let elapsed = start.elapsed();
+
+    // Record detailed request metrics (skip internal endpoints)
+    if !path.starts_with("/health") && !path.starts_with("/metrics") && !path.starts_with("/stats") {
+        metrics::record_request(
+            method.as_str(),
+            status,
+            repo,
+            elapsed,
+            0, // request size - would need body wrapper
+            0, // response size - would need body wrapper
+        );
+    }
 
     if status < 400 {
         info!(
@@ -139,16 +202,60 @@ async fn proxy_handler(
     Path(path): Path<String>,
     State(app): State<Arc<App>>,
 ) -> Result<Response> {
+    let repo = App::extract_repo(&path);
+    
     // Validate path before processing
     validate_path(&path)?;
+
+    // Record repository request
+    metrics::record_repo_request(repo);
 
     // Resolve URL from configured repositories
     let (_prefix, url) = app
         .resolve_url(&path)
-        .ok_or_else(|| ProxyError::RepositoryNotFound(path.split('/').next().unwrap_or("").into()))?;
+        .ok_or_else(|| {
+            metrics::record_repo_error(repo, "not_configured");
+            ProxyError::RepositoryNotFound(path.split('/').next().unwrap_or("").into())
+        })?;
 
     // Fetch from cache or upstream
     app.downloader.fetch(&path, &url).await
+}
+
+/// Path validation with metrics
+fn validate_path(path: &str) -> Result<()> {
+    match path_validation::validate(path) {
+        Ok(()) => {
+            metrics::record_path_validation(true, None);
+            Ok(())
+        }
+        Err(e) => {
+            let reason = match &e {
+                ProxyError::InvalidPath(msg) => {
+                    if msg.contains("length") {
+                        "invalid_length"
+                    } else if msg.contains("traversal") {
+                        "path_traversal"
+                    } else if msg.contains("UTF-8") {
+                        "invalid_utf8"
+                    } else if msg.contains("Hidden") {
+                        "hidden_file"
+                    } else if msg.contains("Null") {
+                        "null_byte"
+                    } else if msg.contains("Backslash") {
+                        "backslash"
+                    } else if msg.contains("Double") {
+                        "double_slash"
+                    } else {
+                        "other"
+                    }
+                }
+                _ => "unknown",
+            };
+            metrics::record_path_validation(false, Some(reason));
+            Err(e)
+        }
+    }
 }
 
 /// Path validation module
@@ -225,9 +332,4 @@ mod path_validation {
             _ => Ok(()),
         }
     }
-}
-
-/// Public validation function
-fn validate_path(path: &str) -> Result<()> {
-    path_validation::validate(path)
 }

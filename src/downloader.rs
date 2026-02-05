@@ -12,7 +12,7 @@ use futures::{Stream, StreamExt};
 use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
@@ -115,35 +115,47 @@ impl Downloader {
         }
     }
 
+    /// Extracts repository name from cache key
+    fn extract_repo(key: &str) -> &str {
+        key.split('/').next().unwrap_or("unknown")
+    }
+
     /// Fetches a file, returning from cache or downloading from upstream
     pub async fn fetch(&self, key: &str, url: &str) -> Result<Response> {
+        let repo = Self::extract_repo(key);
+        let lookup_start = Instant::now();
+
         // Fast path: cache hit
         if let Some((file, meta)) = self.cache.open(key).await {
-            metrics::record_hit(meta.size);
+            metrics::record_cache_lookup(true, lookup_start.elapsed());
+            metrics::record_repo_hit(repo, meta.size);
             debug!(key, size = meta.size, "Cache hit");
             return Ok(file_response(file, meta));
         }
 
-        metrics::record_miss();
+        metrics::record_cache_lookup(false, lookup_start.elapsed());
+        metrics::record_repo_miss(repo);
 
         // Check for existing download to coalesce
         if let Some(download) = self.active.get(key) {
             metrics::record_coalesced();
             debug!(key, "Joining existing download");
+            let _follower_guard = metrics::FollowerGuard::new();
             return self.follow_download(key, download.clone()).await;
         }
 
         // Start new download
-        self.start_download(key, url).await
+        self.start_download(key, url, repo).await
     }
 
-    async fn start_download(&self, key: &str, url: &str) -> Result<Response> {
+    async fn start_download(&self, key: &str, url: &str, repo: &str) -> Result<Response> {
         // Create temp file for download
         let (temp_path, temp_file) = self.cache.create_temp_data().await.map_err(|e| {
-            metrics::record_error();
+            metrics::record_storage_error("create_temp");
             ProxyError::download(format!("Failed to create temp file: {e}"))
         })?;
 
+        let _temp_guard = metrics::TempFileGuard::new();
         let download = Arc::new(ActiveDownload::new(temp_path.clone()));
 
         // Try to register as primary downloader (atomic operation)
@@ -156,6 +168,7 @@ impl Downloader {
                 let existing_download = existing.get().clone();
                 drop(existing);
                 let _ = tokio::fs::remove_file(&temp_path).await;
+                let _follower_guard = metrics::FollowerGuard::new();
                 return self.follow_download(key, existing_download).await;
             }
             Entry::Vacant(vacant) => {
@@ -164,18 +177,21 @@ impl Downloader {
         };
 
         metrics::inc_active();
+        metrics::record_download_started();
 
         // Spawn background download task
         let this = self.clone();
         let key_owned = key.to_string();
         let url_owned = url.to_string();
+        let repo_owned = repo.to_string();
         let download_clone = download.clone();
 
         tokio::spawn(async move {
-            this.perform_download(&key_owned, &url_owned, temp_file, download_clone)
+            this.perform_download(&key_owned, &url_owned, &repo_owned, temp_file, download_clone)
                 .await;
         });
 
+        let _follower_guard = metrics::FollowerGuard::new();
         self.follow_download(key, download).await
     }
 
@@ -245,19 +261,23 @@ impl Downloader {
         &self,
         key: &str,
         url: &str,
+        repo: &str,
         mut temp_file: File,
         download: Arc<ActiveDownload>,
     ) {
+        let start = Instant::now();
+        
         let result = self
-            .do_download(key, url, &mut temp_file, &download)
+            .do_download(key, url, repo, &mut temp_file, &download)
             .await;
 
         // Always cleanup active download registration
         self.active.remove(key);
         metrics::dec_active();
+        metrics::clear_download_progress(key);
 
         match result {
-            Ok(Some(meta)) => {
+            Ok(Some((meta, bytes_written))) => {
                 // Commit to cache
                 match self
                     .cache
@@ -267,21 +287,27 @@ impl Downloader {
                     Ok(_) => {
                         info!(key, size = meta.size, "Download complete");
                         download.notify(DownloadState::Complete { from_cache: false });
+                        metrics::record_download_complete(bytes_written, start.elapsed(), repo);
+                        metrics::record_repo_bytes_served(repo, bytes_written);
                     }
                     Err(e) => {
                         warn!(key, error = %e, "Failed to commit to cache");
                         download.notify(DownloadState::Complete { from_cache: false });
+                        metrics::record_download_failed("commit_error", repo);
+                        metrics::record_storage_error("commit");
                     }
                 }
             }
             Ok(None) => {
                 // 304 Not Modified - cleanup temp file
                 let _ = tokio::fs::remove_file(&download.temp_path).await;
+                // 304 metrics recorded in do_download
             }
             Err(e) => {
                 warn!(key, error = %e, "Download failed");
                 download.notify(DownloadState::Failed(e.to_string()));
                 let _ = tokio::fs::remove_file(&download.temp_path).await;
+                metrics::record_download_failed(&categorize_error(&e), repo);
             }
         }
     }
@@ -290,9 +316,10 @@ impl Downloader {
         &self,
         key: &str,
         url: &str,
+        repo: &str,
         temp_file: &mut File,
         download: &ActiveDownload,
-    ) -> Result<Option<Metadata>> {
+    ) -> Result<Option<(Metadata, u64)>> {
         debug!(key, url, "Starting download");
 
         // Build request with conditional headers for revalidation
@@ -306,10 +333,20 @@ impl Downloader {
             }
         }
 
+        let request_start = Instant::now();
         let resp = req.send().await.map_err(|e| {
-            metrics::record_error();
+            if e.is_timeout() {
+                metrics::record_upstream_timeout(repo);
+            } else if e.is_connect() {
+                metrics::record_upstream_error("connect", repo);
+            } else {
+                metrics::record_upstream_error("request", repo);
+            }
             ProxyError::Upstream(e)
         })?;
+
+        let connect_time = request_start.elapsed();
+        metrics::record_upstream_connect_time(connect_time);
 
         let status = resp.status();
 
@@ -317,6 +354,7 @@ impl Downloader {
         if status == reqwest::StatusCode::NOT_MODIFIED {
             info!(key, "304 Not Modified");
             metrics::record_304();
+            metrics::record_upstream_request(304, connect_time, None, repo);
 
             if let Err(e) = self.cache.touch(key).await {
                 warn!(key, error = %e, "Failed to touch cache entry");
@@ -330,7 +368,8 @@ impl Downloader {
 
         if !status.is_success() {
             warn!(key, %status, "Upstream error");
-            metrics::record_error();
+            metrics::record_upstream_error(&format!("status_{}", status.as_u16()), repo);
+            metrics::record_upstream_request(status.as_u16(), connect_time, None, repo);
             return Err(ProxyError::UpstreamStatus(
                 axum::http::StatusCode::from_u16(status.as_u16())
                     .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
@@ -339,6 +378,7 @@ impl Downloader {
 
         let content_len = resp.content_length();
         if content_len.unwrap_or(0) > limits::MAX_DOWNLOAD_SIZE {
+            metrics::record_upstream_error("too_large", repo);
             return Err(ProxyError::download(format!(
                 "File too large: {} bytes exceeds {} byte limit",
                 content_len.unwrap_or(0),
@@ -350,6 +390,10 @@ impl Downloader {
         let resp_headers = resp.headers().clone();
         let headers = filter_headers(&resp_headers);
         let headers_arc = Arc::new(headers.clone());
+
+        // Record TTFB
+        let ttfb = request_start.elapsed();
+        metrics::record_upstream_ttfb(ttfb);
 
         // Notify followers that streaming has started
         download.notify(DownloadState::Streaming {
@@ -365,22 +409,30 @@ impl Downloader {
         let mut written = 0u64;
 
         while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(ProxyError::Upstream)?;
+            let bytes = chunk.map_err(|e| {
+                metrics::record_upstream_error("stream", repo);
+                ProxyError::Upstream(e)
+            })?;
 
             written = written.saturating_add(bytes.len() as u64);
             if written > limits::MAX_DOWNLOAD_SIZE {
+                metrics::record_upstream_error("size_exceeded", repo);
                 return Err(ProxyError::download("File exceeded size limit during download"));
             }
 
-            temp_file.write_all(&bytes).await.map_err(ProxyError::Cache)?;
+            temp_file.write_all(&bytes).await.map_err(|e| {
+                metrics::record_storage_error("write");
+                ProxyError::Cache(e)
+            })?;
             temp_file.flush().await.map_err(ProxyError::Cache)?;
 
-            // Update progress for followers
+            // Update progress for followers and metrics
             download.notify(DownloadState::Streaming {
                 written,
                 content_length: content_len,
                 headers: headers_arc.clone(),
             });
+            metrics::set_download_progress(key, written);
         }
 
         temp_file.sync_all().await.map_err(ProxyError::Cache)?;
@@ -389,6 +441,7 @@ impl Downloader {
         if let Some(expected) = content_len {
             if written != expected {
                 warn!(key, expected, actual = written, "Size mismatch");
+                metrics::record_upstream_error("size_mismatch", repo);
                 return Err(ProxyError::download(format!(
                     "Incomplete download: expected {} bytes, got {}",
                     expected, written
@@ -396,7 +449,9 @@ impl Downloader {
             }
         }
 
-        metrics::record_download(written);
+        // Record successful upstream request
+        metrics::record_upstream_request(status.as_u16(), request_start.elapsed(), Some(written), repo);
+        metrics::record_storage_write(written);
 
         // Build metadata
         let meta = Metadata::new(key, url, written, headers).with_conditionals(
@@ -410,7 +465,33 @@ impl Downloader {
                 .map(String::from),
         );
 
-        Ok(Some(meta))
+        Ok(Some((meta, written)))
+    }
+}
+
+/// Categorizes an error for metrics
+fn categorize_error(e: &ProxyError) -> String {
+    match e {
+        ProxyError::Upstream(req_err) => {
+            if req_err.is_timeout() {
+                "timeout".to_string()
+            } else if req_err.is_connect() {
+                "connect".to_string()
+            } else {
+                "request".to_string()
+            }
+        }
+        ProxyError::UpstreamStatus(status) => format!("status_{}", status.as_u16()),
+        ProxyError::Cache(_) => "cache_io".to_string(),
+        ProxyError::Download(msg) => {
+            if msg.contains("size") {
+                "size".to_string()
+            } else {
+                "download".to_string()
+            }
+        }
+        ProxyError::Timeout => "timeout".to_string(),
+        _ => "other".to_string(),
     }
 }
 

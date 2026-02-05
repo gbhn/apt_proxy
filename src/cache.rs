@@ -1,4 +1,5 @@
 use crate::config::CacheConfig;
+use crate::metrics;
 use crate::storage::{Metadata, Storage};
 use futures::StreamExt;
 use moka::future::Cache;
@@ -46,7 +47,10 @@ impl Expiry<String, CacheEntry> for TtlPolicy {
         _value: &CacheEntry,
         _current_time: Instant,
     ) -> Option<Duration> {
-        Some(Duration::from_secs(self.config.ttl_for(key)))
+        let ttl_secs = self.config.ttl_for(key);
+        let pattern = self.config.pattern_for(key);
+        metrics::record_ttl_applied(ttl_secs, pattern);
+        Some(Duration::from_secs(ttl_secs))
     }
 
     fn expire_after_update(
@@ -87,10 +91,14 @@ impl CacheManager {
         config: Arc<CacheConfig>,
         max_size: u64,
     ) -> anyhow::Result<Self> {
+        let start = Instant::now();
         storage.cleanup_temp().await?;
+        metrics::record_maintenance_run("cleanup_temp_startup", start.elapsed());
 
         let index = Self::build_index(storage.clone(), config, max_size);
         let loading = Arc::new(AtomicBool::new(true));
+        
+        metrics::set_cache_loading(true);
 
         let manager = Self {
             storage: storage.clone(),
@@ -117,7 +125,26 @@ impl CacheManager {
             .max_capacity(max_capacity_kb)
             .weigher(|_, entry: &CacheEntry| entry.weight())
             .expire_after(TtlPolicy { config })
-            .eviction_listener(move |key: Arc<String>, _, cause| {
+            .eviction_listener(move |key: Arc<String>, entry, cause| {
+                // Record eviction metrics
+                let reason = match cause {
+                    RemovalCause::Expired => {
+                        metrics::record_ttl_expiration();
+                        "expired"
+                    }
+                    RemovalCause::Size => "size",
+                    RemovalCause::Explicit => "explicit",
+                    RemovalCause::Replaced => "replaced",
+                };
+                metrics::record_eviction(reason);
+                
+                debug!(
+                    key = key.as_str(),
+                    size = entry.size,
+                    reason,
+                    "Cache eviction"
+                );
+
                 if matches!(cause, RemovalCause::Expired | RemovalCause::Size) {
                     let storage = storage.clone();
                     let key = key.to_string();
@@ -146,18 +173,39 @@ impl CacheManager {
                     elapsed_ms = start.elapsed().as_millis() as u64,
                     "Cache index loaded"
                 );
+                
+                // Update cache stats
+                metrics::set_cache_stats(
+                    total_size,
+                    loaded as u64,
+                    total_size / 1024,
+                );
+                metrics::set_storage_space_used(total_size);
             }
             Err(e) => {
                 warn!(error = %e, "Failed to load cache entries");
+                metrics::record_storage_error("index_load");
             }
         }
 
         // Cleanup orphaned files after loading
-        if let Err(e) = storage.cleanup_orphans().await {
-            warn!(error = %e, "Failed to cleanup orphans");
+        let orphan_start = Instant::now();
+        match storage.cleanup_orphans().await {
+            Ok(count) => {
+                if count > 0 {
+                    metrics::record_orphans_removed(count as u64);
+                }
+                metrics::record_maintenance_run("cleanup_orphans_startup", orphan_start.elapsed());
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to cleanup orphans");
+                metrics::record_storage_error("cleanup_orphans");
+            }
         }
 
         loading.store(false, Ordering::Release);
+        metrics::set_cache_loading(false);
+        metrics::record_maintenance_run("index_load", start.elapsed());
     }
 
     async fn load_entries(
@@ -168,6 +216,9 @@ impl CacheManager {
         if paths.is_empty() {
             return Ok((0, 0));
         }
+
+        let total_paths = paths.len();
+        debug!(count = total_paths, "Loading cache entries");
 
         let results: Vec<_> = futures::stream::iter(paths)
             .map(|path| {
@@ -189,6 +240,11 @@ impl CacheManager {
             loaded += 1;
         }
 
+        let errors = total_paths.saturating_sub(loaded);
+        if errors > 0 {
+            debug!(errors, "Entries failed to load (likely corrupted)");
+        }
+
         // Process any pending evictions
         index.run_pending_tasks().await;
 
@@ -202,9 +258,13 @@ impl CacheManager {
 
     /// Opens a cached file, returning file handle and metadata
     pub async fn open(&self, key: &str) -> Option<(File, Metadata)> {
+        let start = Instant::now();
+        
         // Fast path: check index
         if self.index.get(key).await.is_some() {
-            return self.open_from_storage(key).await;
+            let result = self.open_from_storage(key).await;
+            metrics::record_cache_lookup(result.is_some(), start.elapsed());
+            return result;
         }
 
         // During loading, fallback to direct storage check
@@ -214,10 +274,12 @@ impl CacheManager {
                 self.index
                     .insert(key.to_owned(), CacheEntry::new(result.1.size))
                     .await;
+                metrics::record_cache_lookup(true, start.elapsed());
                 return Some(result);
             }
         }
 
+        metrics::record_cache_lookup(false, start.elapsed());
         None
     }
 
@@ -232,6 +294,7 @@ impl CacheManager {
             Err(e) => {
                 debug!(key, error = %e, "Failed to open cached file");
                 self.index.invalidate(key).await;
+                metrics::record_storage_error("open");
                 None
             }
         }
@@ -258,6 +321,12 @@ impl CacheManager {
         self.index
             .insert(key.to_owned(), CacheEntry::new(meta.size))
             .await;
+        
+        metrics::record_cache_operation("commit");
+        
+        // Update cache stats after commit
+        self.update_stats().await;
+        
         Ok(())
     }
 
@@ -271,13 +340,32 @@ impl CacheManager {
                     .insert(key.to_owned(), CacheEntry::new(meta.size))
                     .await;
             }
+            metrics::record_ttl_refresh();
+            metrics::record_cache_operation("touch");
         }
         Ok(touched)
     }
 
     /// Runs background maintenance tasks (eviction processing)
     pub async fn run_maintenance(&self) {
+        let start = Instant::now();
+        
         self.index.run_pending_tasks().await;
+        
+        // Update cache stats
+        self.update_stats().await;
+        
+        metrics::record_maintenance_run("cache_maintenance", start.elapsed());
+    }
+
+    /// Updates cache statistics metrics
+    async fn update_stats(&self) {
+        let entry_count = self.entry_count();
+        let weighted_size = self.weighted_size();
+        let size_bytes = weighted_size * 1024;
+        
+        metrics::set_cache_stats(size_bytes, entry_count, weighted_size);
+        metrics::set_storage_space_used(size_bytes);
     }
 
     /// Returns approximate number of entries in the cache

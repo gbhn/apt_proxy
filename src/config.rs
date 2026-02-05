@@ -51,6 +51,7 @@ pub struct Args {
 #[derive(Debug, Clone)]
 pub struct CompiledTtlRule {
     pub pattern: Regex,
+    pub pattern_str: String,
     pub ttl: Duration,
 }
 
@@ -68,6 +69,7 @@ impl TtlRule {
         match Regex::new(&self.pattern) {
             Ok(regex) => Some(CompiledTtlRule {
                 pattern: regex,
+                pattern_str: self.pattern.clone(),
                 ttl: self.ttl,
             }),
             Err(e) => {
@@ -111,6 +113,15 @@ impl CacheConfig {
         ttl.clamp(self.min_ttl.as_secs(), self.max_ttl.as_secs())
     }
 
+    /// Returns the pattern name that matched the path (for metrics)
+    pub fn pattern_for(&self, path: &str) -> &str {
+        self.compiled_rules
+            .iter()
+            .find(|rule| rule.pattern.is_match(path))
+            .map(|rule| rule.pattern_str.as_str())
+            .unwrap_or("default")
+    }
+
     /// Creates a new CacheConfig from raw configuration
     fn from_raw(raw: RawCacheConfig) -> Self {
         let mut config = Self {
@@ -129,6 +140,14 @@ impl CacheConfig {
             );
             std::mem::swap(&mut config.min_ttl, &mut config.max_ttl);
         }
+
+        info!(
+            default_ttl = ?config.default_ttl,
+            min_ttl = ?config.min_ttl,
+            max_ttl = ?config.max_ttl,
+            rules = config.compiled_rules.len(),
+            "Cache TTL configuration loaded"
+        );
 
         config
     }

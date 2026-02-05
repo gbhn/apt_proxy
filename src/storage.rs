@@ -1,9 +1,11 @@
+use crate::metrics;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::time::Instant;
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
@@ -143,6 +145,7 @@ pub struct Storage {
 impl Storage {
     /// Creates a new storage instance at the given base path
     pub async fn new(base: PathBuf) -> Result<Self> {
+        let start = Instant::now();
         let temp = base.join(".tmp");
 
         fs::create_dir_all(&base)
@@ -154,6 +157,8 @@ impl Storage {
             .with_context(|| format!("Failed to create temp directory: {}", temp.display()))?;
 
         debug!(path = %base.display(), "Storage initialized");
+        metrics::record_storage_operation("init", start.elapsed(), true);
+        
         Ok(Self { base, temp })
     }
 
@@ -179,10 +184,18 @@ impl Storage {
 
     /// Cleans up temporary files from previous runs
     pub async fn cleanup_temp(&self) -> Result<()> {
+        let start = Instant::now();
+        
         let mut entries = match fs::read_dir(&self.temp).await {
             Ok(e) => e,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e).context("Failed to read temp directory"),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                metrics::record_storage_operation("cleanup_temp", start.elapsed(), true);
+                return Ok(());
+            }
+            Err(e) => {
+                metrics::record_storage_operation("cleanup_temp", start.elapsed(), false);
+                return Err(e).context("Failed to read temp directory");
+            }
         };
 
         let mut cleaned = 0u32;
@@ -194,12 +207,16 @@ impl Storage {
 
         if cleaned > 0 {
             debug!(count = cleaned, "Cleaned temp files");
+            metrics::record_temp_cleanup(cleaned as u64);
         }
+        
+        metrics::record_storage_operation("cleanup_temp", start.elapsed(), true);
         Ok(())
     }
 
     /// Lists all metadata file paths for bulk loading
     pub async fn list_metadata_paths(&self) -> Result<Vec<PathBuf>> {
+        let start = Instant::now();
         let mut result = Vec::new();
         let mut stack = vec![self.base.clone()];
 
@@ -226,46 +243,83 @@ impl Storage {
             }
         }
 
+        metrics::record_storage_operation("list_metadata", start.elapsed(), true);
         Ok(result)
     }
 
     /// Reads metadata from a specific path
     pub async fn read_metadata_from_path(&self, path: &Path) -> Result<Option<Metadata>> {
+        let start = Instant::now();
+        
         match self.read_json(path).await {
-            Ok(meta) => Ok(Some(meta)),
-            Err(e) if is_not_found(&e) => Ok(None),
+            Ok(meta) => {
+                metrics::record_storage_operation("read_metadata", start.elapsed(), true);
+                Ok(Some(meta))
+            }
+            Err(e) if is_not_found(&e) => {
+                metrics::record_storage_operation("read_metadata", start.elapsed(), true);
+                Ok(None)
+            }
             Err(e) if is_parse_error(&e) => {
                 warn!(path = %path.display(), error = %e, "Corrupted metadata, removing");
+                metrics::record_metadata_parse_error();
+                metrics::record_storage_operation("read_metadata", start.elapsed(), false);
                 let _ = fs::remove_file(path).await;
                 Ok(None)
             }
-            Err(e) => Err(e).context("Failed to read metadata"),
+            Err(e) => {
+                metrics::record_storage_operation("read_metadata", start.elapsed(), false);
+                Err(e).context("Failed to read metadata")
+            }
         }
     }
 
     /// Creates a new temporary file for writing
     pub async fn create_temp_data(&self) -> Result<(PathBuf, File)> {
+        let start = Instant::now();
         let path = self.temp_path("data");
+        
         let file = File::create(&path)
             .await
-            .with_context(|| format!("Failed to create temp file: {}", path.display()))?;
-        Ok((path, file))
+            .with_context(|| format!("Failed to create temp file: {}", path.display()));
+        
+        match file {
+            Ok(f) => {
+                metrics::record_temp_file_created();
+                metrics::record_storage_operation("create_temp", start.elapsed(), true);
+                Ok((path, f))
+            }
+            Err(e) => {
+                metrics::record_storage_operation("create_temp", start.elapsed(), false);
+                metrics::record_storage_error("create_temp");
+                Err(e)
+            }
+        }
     }
 
     /// Opens a cached file by key, returns file handle and metadata
     pub async fn open(&self, key: &str) -> Result<Option<(File, Metadata)>> {
+        let start = Instant::now();
         let meta_path = self.meta_path(key);
         let data_path = self.data_path(key);
 
         let meta: Metadata = match self.read_json(&meta_path).await {
             Ok(m) => m,
-            Err(e) if is_not_found(&e) => return Ok(None),
-            Err(e) if is_parse_error(&e) => {
-                warn!(key, error = %e, "Corrupted metadata, removing");
-                let _ = self.delete(key).await;
+            Err(e) if is_not_found(&e) => {
+                metrics::record_storage_operation("open", start.elapsed(), true);
                 return Ok(None);
             }
-            Err(e) => return Err(e).context("Failed to read metadata"),
+            Err(e) if is_parse_error(&e) => {
+                warn!(key, error = %e, "Corrupted metadata, removing");
+                metrics::record_metadata_parse_error();
+                let _ = self.delete(key).await;
+                metrics::record_storage_operation("open", start.elapsed(), false);
+                return Ok(None);
+            }
+            Err(e) => {
+                metrics::record_storage_operation("open", start.elapsed(), false);
+                return Err(e).context("Failed to read metadata");
+            }
         };
 
         // Verify data file exists and matches expected size
@@ -274,9 +328,14 @@ impl Storage {
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 warn!(key, "Data file missing, removing metadata");
                 let _ = fs::remove_file(&meta_path).await;
+                metrics::record_storage_error("missing_data");
+                metrics::record_storage_operation("open", start.elapsed(), false);
                 return Ok(None);
             }
-            Err(e) => return Err(e).context("Failed to stat data file"),
+            Err(e) => {
+                metrics::record_storage_operation("open", start.elapsed(), false);
+                return Err(e).context("Failed to stat data file");
+            }
         };
 
         if data_size != meta.size {
@@ -286,28 +345,53 @@ impl Storage {
                 actual = data_size,
                 "Size mismatch, removing"
             );
+            metrics::record_storage_error("size_mismatch");
             let _ = self.delete(key).await;
+            metrics::record_storage_operation("open", start.elapsed(), false);
             return Ok(None);
         }
 
         match File::open(&data_path).await {
-            Ok(file) => Ok(Some((file, meta))),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).context("Failed to open data file"),
+            Ok(file) => {
+                metrics::record_storage_read(meta.size);
+                metrics::record_storage_operation("open", start.elapsed(), true);
+                Ok(Some((file, meta)))
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                metrics::record_storage_operation("open", start.elapsed(), true);
+                Ok(None)
+            }
+            Err(e) => {
+                metrics::record_storage_operation("open", start.elapsed(), false);
+                Err(e).context("Failed to open data file")
+            }
         }
     }
 
     /// Returns metadata for a key without opening the data file
     pub async fn get_metadata(&self, key: &str) -> Result<Option<Metadata>> {
+        let start = Instant::now();
+        
         match self.read_json(&self.meta_path(key)).await {
-            Ok(meta) => Ok(Some(meta)),
-            Err(e) if is_not_found(&e) => Ok(None),
-            Err(e) if is_parse_error(&e) => {
-                warn!(key, error = %e, "Corrupted metadata");
-                let _ = self.delete(key).await;
+            Ok(meta) => {
+                metrics::record_storage_operation("get_metadata", start.elapsed(), true);
+                Ok(Some(meta))
+            }
+            Err(e) if is_not_found(&e) => {
+                metrics::record_storage_operation("get_metadata", start.elapsed(), true);
                 Ok(None)
             }
-            Err(e) => Err(e).context("Failed to read metadata"),
+            Err(e) if is_parse_error(&e) => {
+                warn!(key, error = %e, "Corrupted metadata");
+                metrics::record_metadata_parse_error();
+                let _ = self.delete(key).await;
+                metrics::record_storage_operation("get_metadata", start.elapsed(), false);
+                Ok(None)
+            }
+            Err(e) => {
+                metrics::record_storage_operation("get_metadata", start.elapsed(), false);
+                Err(e).context("Failed to read metadata")
+            }
         }
     }
 
@@ -318,6 +402,7 @@ impl Storage {
         temp_data: PathBuf,
         meta: &Metadata,
     ) -> Result<u64> {
+        let start = Instant::now();
         let data_path = self.data_path(key);
         let meta_path = self.meta_path(key);
 
@@ -332,31 +417,50 @@ impl Storage {
         // Write metadata to temp file first
         let temp_meta = self.temp_path("json");
         guard.track(temp_meta.clone());
-        self.write_json(&temp_meta, meta)
-            .await
-            .context("Failed to write metadata")?;
+        
+        if let Err(e) = self.write_json(&temp_meta, meta).await {
+            metrics::record_storage_operation("put", start.elapsed(), false);
+            metrics::record_storage_error("write_metadata");
+            return Err(e).context("Failed to write metadata");
+        }
 
         // Atomic rename both files
-        fs::rename(&temp_data, &data_path)
-            .await
-            .context("Failed to commit data file")?;
-        fs::rename(&temp_meta, &meta_path)
-            .await
-            .context("Failed to commit metadata")?;
+        if let Err(e) = fs::rename(&temp_data, &data_path).await {
+            metrics::record_storage_operation("put", start.elapsed(), false);
+            metrics::record_storage_error("rename_data");
+            return Err(e).context("Failed to commit data file");
+        }
+        
+        if let Err(e) = fs::rename(&temp_meta, &meta_path).await {
+            metrics::record_storage_operation("put", start.elapsed(), false);
+            metrics::record_storage_error("rename_metadata");
+            return Err(e).context("Failed to commit metadata");
+        }
 
         guard.commit();
+        
+        metrics::record_storage_write(meta.size);
+        metrics::record_storage_operation("put", start.elapsed(), true);
         debug!(key, size = meta.size, "Cached");
+        
         Ok(meta.size)
     }
 
     /// Updates the stored_at timestamp for a key (for 304 responses)
     pub async fn touch(&self, key: &str) -> Result<bool> {
+        let start = Instant::now();
         let meta_path = self.meta_path(key);
 
         let mut meta: Metadata = match self.read_json(&meta_path).await {
             Ok(m) => m,
-            Err(e) if is_not_found(&e) => return Ok(false),
-            Err(_) => return Ok(false),
+            Err(e) if is_not_found(&e) => {
+                metrics::record_storage_operation("touch", start.elapsed(), true);
+                return Ok(false);
+            }
+            Err(_) => {
+                metrics::record_storage_operation("touch", start.elapsed(), false);
+                return Ok(false);
+            }
         };
 
         meta.stored_at = time::now_secs();
@@ -365,16 +469,27 @@ impl Storage {
         let temp_meta = self.temp_path("json");
         guard.track(temp_meta.clone());
 
-        self.write_json(&temp_meta, &meta).await?;
-        fs::rename(&temp_meta, &meta_path).await?;
+        if let Err(e) = self.write_json(&temp_meta, &meta).await {
+            metrics::record_storage_operation("touch", start.elapsed(), false);
+            return Err(e);
+        }
+        
+        if let Err(e) = fs::rename(&temp_meta, &meta_path).await {
+            metrics::record_storage_operation("touch", start.elapsed(), false);
+            return Err(e.into());
+        }
 
         guard.commit();
+        
+        metrics::record_storage_operation("touch", start.elapsed(), true);
         debug!(key, "Touched");
         Ok(true)
     }
 
     /// Deletes both data and metadata files for a key
     pub async fn delete(&self, key: &str) -> Result<()> {
+        let start = Instant::now();
+        
         let data_result = fs::remove_file(self.data_path(key)).await;
         let meta_result = fs::remove_file(self.meta_path(key)).await;
 
@@ -382,11 +497,14 @@ impl Storage {
         if data_result.is_ok() || meta_result.is_ok() {
             debug!(key, "Deleted");
         }
+        
+        metrics::record_storage_operation("delete", start.elapsed(), true);
         Ok(())
     }
 
     /// Removes orphaned files (data without metadata or vice versa)
     pub async fn cleanup_orphans(&self) -> Result<usize> {
+        let start = Instant::now();
         let mut stack = vec![self.base.clone()];
         let mut removed = 0usize;
 
@@ -419,7 +537,10 @@ impl Storage {
 
         if removed > 0 {
             debug!(removed, "Removed orphaned files");
+            metrics::record_orphans_removed(removed as u64);
         }
+        
+        metrics::record_storage_operation("cleanup_orphans", start.elapsed(), true);
         Ok(removed)
     }
 

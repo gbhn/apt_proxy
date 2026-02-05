@@ -1,3 +1,4 @@
+use crate::metrics;
 use anyhow::{Context, Result};
 use axum::Router;
 use listenfd::ListenFd;
@@ -15,11 +16,17 @@ pub async fn serve(app: Router, port: u16) -> Result<()> {
 
     info!(addr = %local_addr, "Server listening");
 
+    // Set health status to healthy once we're listening
+    metrics::set_health_status(true);
+
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("Server error")?;
 
+    // Set health status to unhealthy during shutdown
+    metrics::set_health_status(false);
+    
     info!("Server stopped gracefully");
     Ok(())
 }

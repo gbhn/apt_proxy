@@ -5,12 +5,15 @@ use apt_cacher_rs::{
 };
 use clap::Parser;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
+
+    let start_time = Instant::now();
 
     let settings = Settings::load(Args::parse()).context("Failed to load configuration")?;
 
@@ -32,6 +35,15 @@ async fn main() -> Result<()> {
             .await
             .context("Failed to initialize application")?,
     );
+
+    // Start uptime tracker
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            metrics::update_uptime(start_time);
+        }
+    });
 
     server::serve(router(app), settings.port).await
 }

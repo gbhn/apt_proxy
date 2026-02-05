@@ -1,6 +1,6 @@
 [package]
 name = "apt-cacher-rs"
-version = "3.0.8"
+version = "3.0.9"
 edition = "2024"
 description = "A high-performance caching proxy for APT repositories"
 license = "MIT"

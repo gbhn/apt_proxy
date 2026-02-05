@@ -90,6 +90,20 @@ impl ProxyError {
     pub fn internal(msg: impl fmt::Display) -> Self {
         Self::Internal(msg.to_string())
     }
+
+    /// Returns error category for metrics
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::InvalidPath(_) => "invalid_path",
+            Self::RepositoryNotFound(_) => "repo_not_found",
+            Self::Cache(_) => "cache_io",
+            Self::Upstream(_) => "upstream",
+            Self::UpstreamStatus(_) => "upstream_status",
+            Self::Download(_) => "download",
+            Self::Timeout => "timeout",
+            Self::Internal(_) => "internal",
+        }
+    }
 }
 
 impl IntoResponse for ProxyError {

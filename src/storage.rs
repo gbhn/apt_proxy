@@ -7,7 +7,10 @@ use tokio::fs::File;
 use tracing::{debug, info};
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,15 +28,20 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    pub fn new(key: impl Into<String>, url: impl Into<String>, size: u64, headers: axum::http::HeaderMap) -> Self {
-        Self { 
-            headers, 
-            url: url.into(), 
-            key: key.into(), 
-            stored_at: now_secs(), 
-            size, 
-            etag: None, 
-            last_modified: None 
+    pub fn new(
+        key: impl Into<String>,
+        url: impl Into<String>,
+        size: u64,
+        headers: axum::http::HeaderMap,
+    ) -> Self {
+        Self {
+            headers,
+            url: url.into(),
+            key: key.into(),
+            stored_at: now_secs(),
+            size,
+            etag: None,
+            last_modified: None,
         }
     }
 
@@ -51,7 +59,8 @@ pub struct Storage {
 
 impl Storage {
     pub async fn new(base: PathBuf) -> Result<Self> {
-        tokio::fs::create_dir_all(&base).await
+        tokio::fs::create_dir_all(&base)
+            .await
             .context("Failed to create cache directory")?;
         debug!(path = %base.display(), "Storage initialized with cacache");
         Ok(Self { cache_path: base })
@@ -83,17 +92,19 @@ impl Storage {
             };
 
             Ok(Some((data, meta)))
-        }).await??;
+        })
+        .await??;
 
         match result {
             Some((data, meta)) => {
                 // Записываем во временный файл и открываем
-                let temp_path = std::env::temp_dir().join(format!("apt-cache-{}.tmp", uuid::Uuid::new_v4()));
+                let temp_path =
+                    std::env::temp_dir().join(format!("apt-cache-{}.tmp", uuid::Uuid::new_v4()));
                 tokio::fs::write(&temp_path, &data).await?;
                 let file = File::open(&temp_path).await?;
                 // Удаляем temp файл после открытия (он останется пока file handle открыт на Unix)
                 let _ = tokio::fs::remove_file(&temp_path).await;
-                
+
                 metrics::record_storage_operation("open", start.elapsed(), true);
                 metrics::record_storage_read(meta.size);
                 Ok(Some((file, meta)))
@@ -115,7 +126,8 @@ impl Storage {
                 }
                 _ => Ok(None),
             }
-        }).await?
+        })
+        .await?
     }
 
     /// Записать данные в кэш
@@ -130,16 +142,20 @@ impl Storage {
         let integrity = tokio::task::spawn_blocking(move || -> Result<ssri::Integrity> {
             // Сначала записываем данные
             let sri = cacache::write_sync(&cache_path, &key_owned, &data)?;
-            
+
             // Затем обновляем метаданные в индексе
-            cacache::index::insert(&cache_path, &key_owned, cacache::WriteOpts::new()
-                .integrity(sri.clone())
-                .metadata(meta_json)
-                .size(data.len())
+            cacache::index::insert(
+                &cache_path,
+                &key_owned,
+                cacache::WriteOpts::new()
+                    .integrity(sri.clone())
+                    .metadata(meta_json)
+                    .size(data.len()),
             )?;
-            
+
             Ok(sri)
-        }).await??;
+        })
+        .await??;
 
         metrics::record_storage_operation("put", start.elapsed(), true);
         metrics::record_storage_write(size);
@@ -168,14 +184,18 @@ impl Storage {
             let meta_json = serde_json::to_value(&meta)?;
 
             // Обновляем только индекс с новыми метаданными
-            cacache::index::insert(&cache_path, &key_owned, cacache::WriteOpts::new()
-                .integrity(entry.integrity)
-                .metadata(meta_json)
-                .size(entry.size)
+            cacache::index::insert(
+                &cache_path,
+                &key_owned,
+                cacache::WriteOpts::new()
+                    .integrity(entry.integrity)
+                    .metadata(meta_json)
+                    .size(entry.size),
             )?;
 
             Ok(true)
-        }).await?
+        })
+        .await?
     }
 
     /// Удалить запись
@@ -186,9 +206,18 @@ impl Storage {
         let key_for_log = key.to_string();
 
         tokio::task::spawn_blocking(move || -> Result<()> {
-            cacache::remove_sync(&cache_path, &key_owned)?;
-            Ok(())
-        }).await??;
+            // ВАЖНО: обычный remove_sync удаляет только запись в индексе,
+            // content на диске может остаться. Нужно remove_fully(true).
+            match cacache::index::RemoveOpts::new()
+                .remove_fully(true)
+                .remove_sync(&cache_path, &key_owned)
+            {
+                Ok(()) => Ok(()),
+                Err(cacache::Error::EntryNotFound(_, _)) => Ok(()), // идемпотентный delete
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await??;
 
         metrics::record_storage_operation("delete", start.elapsed(), true);
         debug!(key = key_for_log, "Deleted");
@@ -202,23 +231,27 @@ impl Storage {
 
         let removed = tokio::task::spawn_blocking(move || -> Result<usize> {
             let mut removed = 0usize;
-            
+
             // Итерируем по всем записям и проверяем их целостность
             for entry_result in cacache::list_sync(&cache_path) {
                 let entry = match entry_result {
                     Ok(e) => e,
                     Err(_) => continue,
                 };
-                
+
                 // Проверяем что content существует и читается
                 if cacache::read_sync(&cache_path, &entry.key).is_err() {
-                    let _ = cacache::remove_sync(&cache_path, &entry.key);
+                    // Удаляем полностью (индекс + content), иначе будет утечка диска
+                    let _ = cacache::index::RemoveOpts::new()
+                        .remove_fully(true)
+                        .remove_sync(&cache_path, &entry.key);
                     removed += 1;
                 }
             }
-            
+
             Ok(removed)
-        }).await??;
+        })
+        .await??;
 
         if removed > 0 {
             info!(removed, "GC completed");
@@ -236,13 +269,12 @@ impl Storage {
         tokio::task::spawn_blocking(move || -> Result<Vec<Metadata>> {
             let entries: Vec<Metadata> = cacache::list_sync(&cache_path)
                 .filter_map(|entry_result| {
-                    entry_result.ok().and_then(|entry| {
-                        serde_json::from_value::<Metadata>(entry.metadata).ok()
-                    })
+                    entry_result.ok().and_then(|entry| serde_json::from_value::<Metadata>(entry.metadata).ok())
                 })
                 .collect();
             Ok(entries)
-        }).await?
+        })
+        .await?
     }
 
     /// Проверить целостность
@@ -257,10 +289,16 @@ impl Storage {
                 Err(cacache::Error::IntegrityError(_)) => Ok(false),
                 Err(e) => Err(e.into()),
             }
-        }).await?
+        })
+        .await?
     }
 
     // Legacy compatibility
-    pub async fn cleanup_temp(&self) -> Result<()> { Ok(()) }
-    pub async fn cleanup_orphans(&self) -> Result<usize> { self.gc().await }
+    pub async fn cleanup_temp(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub async fn cleanup_orphans(&self) -> Result<usize> {
+        self.gc().await
+    }
 }

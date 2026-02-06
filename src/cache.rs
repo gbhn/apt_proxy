@@ -1,6 +1,6 @@
 use crate::config::CacheConfig;
 use crate::metrics;
-use crate::storage::{CacheWriter, Metadata, Storage};
+use crate::storage::{Metadata, Storage};
 use moka::future::Cache;
 use moka::notification::RemovalCause;
 use moka::Expiry;
@@ -84,7 +84,6 @@ impl CacheManager {
             loading: loading.clone() 
         };
         
-        // Background index loading
         tokio::spawn(async move {
             let start = Instant::now();
             match Self::load_entries(&storage, &index).await {
@@ -95,7 +94,6 @@ impl CacheManager {
                 Err(e) => warn!(error = %e, "Index load failed"),
             }
             
-            // Run initial GC
             if let Err(e) = storage.gc().await {
                 warn!(error = %e, "Initial GC failed");
             }
@@ -134,7 +132,6 @@ impl CacheManager {
         let found = if self.index.get(key).await.is_some() {
             self.storage.open(key).await.ok().flatten()
         } else if self.is_loading() {
-            // During loading, check storage directly
             let result = self.storage.open(key).await.ok().flatten();
             if let Some((_, ref m)) = result {
                 self.index.insert(key.to_owned(), CacheEntry { size: m.size }).await;
@@ -152,16 +149,12 @@ impl CacheManager {
         self.storage.get_metadata(key).await.ok().flatten()
     }
 
-    /// Создать writer для streaming записи в кэш
-    pub async fn create_writer(&self, key: &str, meta: &Metadata) -> anyhow::Result<CacheWriter> {
-        self.storage.create_writer(key, meta).await
-    }
-
-    /// Зафиксировать запись в индексе после успешного commit writer'а
-    pub async fn register(&self, key: &str, size: u64) {
-        self.index.insert(key.to_owned(), CacheEntry { size }).await;
+    pub async fn put(&self, key: &str, data: &[u8], meta: &Metadata) -> anyhow::Result<()> {
+        self.storage.put(key, data, meta).await?;
+        self.index.insert(key.to_owned(), CacheEntry { size: meta.size }).await;
         metrics::record_cache_operation("commit");
         self.update_stats().await;
+        Ok(())
     }
 
     pub async fn touch(&self, key: &str) -> anyhow::Result<bool> {
@@ -180,7 +173,6 @@ impl CacheManager {
         self.index.run_pending_tasks().await;
         self.update_stats().await;
         
-        // Periodic GC
         if let Err(e) = self.storage.gc().await {
             warn!(error = %e, "Maintenance GC failed");
         }

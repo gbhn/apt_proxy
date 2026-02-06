@@ -1,12 +1,10 @@
 use crate::metrics;
 use anyhow::{Context, Result};
-use cacache::WriteOpts;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncWriteExt};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs()
@@ -62,222 +60,207 @@ impl Storage {
     /// Открыть закэшированный файл
     pub async fn open(&self, key: &str) -> Result<Option<(File, Metadata)>> {
         let start = Instant::now();
-        
-        let entry = match cacache::index::find_async(&self.cache_path, key).await? {
-            Some(e) => e,
-            None => return Ok(None),
-        };
+        let cache_path = self.cache_path.clone();
+        let key_owned = key.to_string();
 
-        let meta: Metadata = match &entry.metadata {
-            serde_json::Value::Null => return Ok(None),
-            v => serde_json::from_value(v.clone()).context("Failed to parse metadata")?,
-        };
+        let result = tokio::task::spawn_blocking(move || -> Result<Option<(Vec<u8>, Metadata)>> {
+            // Читаем через cacache
+            let data = match cacache::read_sync(&cache_path, &key_owned) {
+                Ok(d) => d,
+                Err(cacache::Error::EntryNotFound(_, _)) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
 
-        let content_path = cacache::content_path(&self.cache_path, &entry.integrity);
-        
-        match File::open(&content_path).await {
-            Ok(file) => {
+            // Получаем метаданные из индекса
+            let entry = match cacache::index::find(&cache_path, &key_owned)? {
+                Some(e) => e,
+                None => return Ok(None),
+            };
+
+            let meta: Metadata = match &entry.metadata {
+                serde_json::Value::Null => return Ok(None),
+                v => serde_json::from_value(v.clone()).context("Failed to parse metadata")?,
+            };
+
+            Ok(Some((data, meta)))
+        }).await??;
+
+        match result {
+            Some((data, meta)) => {
+                // Записываем во временный файл и открываем
+                let temp_path = std::env::temp_dir().join(format!("apt-cache-{}.tmp", uuid::Uuid::new_v4()));
+                tokio::fs::write(&temp_path, &data).await?;
+                let file = File::open(&temp_path).await?;
+                // Удаляем temp файл после открытия (он останется пока file handle открыт на Unix)
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                
                 metrics::record_storage_operation("open", start.elapsed(), true);
                 metrics::record_storage_read(meta.size);
                 Ok(Some((file, meta)))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                warn!(key, "Content missing for index entry, cleaning up");
-                let _ = cacache::remove_async(&self.cache_path, key).await;
-                metrics::record_storage_error("content_missing");
-                Ok(None)
-            }
-            Err(e) => Err(e.into()),
+            None => Ok(None),
         }
     }
 
     /// Получить только metadata
     pub async fn get_metadata(&self, key: &str) -> Result<Option<Metadata>> {
-        match cacache::index::find_async(&self.cache_path, key).await? {
-            Some(entry) if entry.metadata != serde_json::Value::Null => {
-                let meta: Metadata = serde_json::from_value(entry.metadata)?;
-                Ok(Some(meta))
+        let cache_path = self.cache_path.clone();
+        let key_owned = key.to_string();
+
+        tokio::task::spawn_blocking(move || -> Result<Option<Metadata>> {
+            match cacache::index::find(&cache_path, &key_owned)? {
+                Some(entry) if entry.metadata != serde_json::Value::Null => {
+                    let meta: Metadata = serde_json::from_value(entry.metadata)?;
+                    Ok(Some(meta))
+                }
+                _ => Ok(None),
             }
-            _ => Ok(None),
-        }
+        }).await?
     }
 
-    /// Создать writer для streaming записи
-    pub async fn create_writer(&self, key: &str, meta: &Metadata) -> Result<CacheWriter> {
+    /// Записать данные в кэш
+    pub async fn put(&self, key: &str, data: &[u8], meta: &Metadata) -> Result<ssri::Integrity> {
         let start = Instant::now();
+        let cache_path = self.cache_path.clone();
+        let key_owned = key.to_string();
+        let data = data.to_vec();
         let meta_json = serde_json::to_value(meta)?;
-        
-        let writer = WriteOpts::new()
-            .algorithm(cacache::Algorithm::Sha256)
-            .metadata(meta_json)
-            .open_async(&self.cache_path, key)
-            .await
-            .context("Failed to create cache writer")?;
-        
-        metrics::record_storage_operation("create_writer", start.elapsed(), true);
-        metrics::inc_temp_files();
-        
-        Ok(CacheWriter { 
-            inner: writer,
-            key: key.to_string(),
-            size: 0,
-        })
-    }
+        let size = meta.size;
 
-    /// Записать данные из AsyncRead
-    pub async fn put_from_reader<R: AsyncRead + Unpin>(
-        &self, 
-        key: &str, 
-        reader: R, 
-        meta: &Metadata
-    ) -> Result<ssri::Integrity> {
-        let start = Instant::now();
-        let meta_json = serde_json::to_value(meta)?;
-        
-        let integrity = cacache::copy_async(&self.cache_path, key, reader).await
-            .context("Failed to write to cache")?;
-
-        // Update metadata
-        cacache::index::insert_async(
-            &self.cache_path, 
-            key, 
-            WriteOpts::new()
-                .integrity(integrity.clone())
+        let integrity = tokio::task::spawn_blocking(move || -> Result<ssri::Integrity> {
+            // Сначала записываем данные
+            let sri = cacache::write_sync(&cache_path, &key_owned, &data)?;
+            
+            // Затем обновляем метаданные в индексе
+            cacache::index::insert(&cache_path, &key_owned, cacache::WriteOpts::new()
+                .integrity(sri.clone())
                 .metadata(meta_json)
-                .size(meta.size as usize)
-        ).await?;
-        
+                .size(data.len())
+            )?;
+            
+            Ok(sri)
+        }).await??;
+
         metrics::record_storage_operation("put", start.elapsed(), true);
-        metrics::record_storage_write(meta.size);
-        debug!(key, size = meta.size, hash = %integrity, "Cached");
-        
+        metrics::record_storage_write(size);
+        debug!(key, size, hash = %integrity, "Cached");
+
         Ok(integrity)
     }
 
     /// Обновить timestamp (touch) для TTL refresh
     pub async fn touch(&self, key: &str) -> Result<bool> {
-        let entry = match cacache::index::find_async(&self.cache_path, key).await? {
-            Some(e) => e,
-            None => return Ok(false),
-        };
+        let cache_path = self.cache_path.clone();
+        let key_owned = key.to_string();
 
-        let mut meta: Metadata = match serde_json::from_value(entry.metadata) {
-            Ok(m) => m,
-            Err(_) => return Ok(false),
-        };
-        
-        meta.stored_at = now_secs();
-        let meta_json = serde_json::to_value(&meta)?;
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let entry = match cacache::index::find(&cache_path, &key_owned)? {
+                Some(e) => e,
+                None => return Ok(false),
+            };
 
-        cacache::index::insert_async(
-            &self.cache_path, 
-            key, 
-            WriteOpts::new()
+            let mut meta: Metadata = match serde_json::from_value(entry.metadata) {
+                Ok(m) => m,
+                Err(_) => return Ok(false),
+            };
+
+            meta.stored_at = now_secs();
+            let meta_json = serde_json::to_value(&meta)?;
+
+            // Обновляем только индекс с новыми метаданными
+            cacache::index::insert(&cache_path, &key_owned, cacache::WriteOpts::new()
                 .integrity(entry.integrity)
                 .metadata(meta_json)
                 .size(entry.size)
-        ).await?;
+            )?;
 
-        debug!(key, "Touched");
-        Ok(true)
+            Ok(true)
+        }).await?
     }
 
     /// Удалить запись
     pub async fn delete(&self, key: &str) -> Result<()> {
         let start = Instant::now();
-        cacache::remove_async(&self.cache_path, key).await?;
+        let cache_path = self.cache_path.clone();
+        let key_owned = key.to_string();
+        let key_for_log = key.to_string();
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            cacache::remove_sync(&cache_path, &key_owned)?;
+            Ok(())
+        }).await??;
+
         metrics::record_storage_operation("delete", start.elapsed(), true);
-        debug!(key, "Deleted");
+        debug!(key = key_for_log, "Deleted");
         Ok(())
     }
 
-    /// Garbage collection - удаляет unreferenced content
+    /// Garbage collection
     pub async fn gc(&self) -> Result<usize> {
         let start = Instant::now();
         let cache_path = self.cache_path.clone();
-        
-        // cacache gc is sync, run in blocking task
-        let removed = tokio::task::spawn_blocking(move || {
-            cacache::clear_sync(&cache_path)
+
+        let removed = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let mut removed = 0usize;
+            
+            // Итерируем по всем записям и проверяем их целостность
+            for entry_result in cacache::list_sync(&cache_path) {
+                let entry = match entry_result {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                
+                // Проверяем что content существует и читается
+                if cacache::read_sync(&cache_path, &entry.key).is_err() {
+                    let _ = cacache::remove_sync(&cache_path, &entry.key);
+                    removed += 1;
+                }
+            }
+            
+            Ok(removed)
         }).await??;
-        
+
         if removed > 0 {
             info!(removed, "GC completed");
             metrics::record_orphans_removed(removed as u64);
         }
         metrics::record_maintenance_run("gc", start.elapsed());
-        
+
         Ok(removed)
     }
 
-    /// Список всех записей (для загрузки индекса)
+    /// Список всех записей
     pub async fn list_entries(&self) -> Result<Vec<Metadata>> {
         let cache_path = self.cache_path.clone();
-        
-        let entries = tokio::task::spawn_blocking(move || {
-            cacache::list_sync(&cache_path)
-                .filter_map(|entry| {
-                    serde_json::from_value::<Metadata>(entry.metadata).ok()
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<Metadata>> {
+            let entries: Vec<Metadata> = cacache::list_sync(&cache_path)
+                .filter_map(|entry_result| {
+                    entry_result.ok().and_then(|entry| {
+                        serde_json::from_value::<Metadata>(entry.metadata).ok()
+                    })
                 })
-                .collect::<Vec<_>>()
-        }).await?;
-        
-        Ok(entries)
+                .collect();
+            Ok(entries)
+        }).await?
     }
 
-    /// Проверить целостность content
+    /// Проверить целостность
     pub async fn verify(&self, key: &str) -> Result<bool> {
-        let entry = match cacache::index::find_async(&self.cache_path, key).await? {
-            Some(e) => e,
-            None => return Ok(false),
-        };
+        let cache_path = self.cache_path.clone();
+        let key_owned = key.to_string();
 
-        let content_path = cacache::content_path(&self.cache_path, &entry.integrity);
-        
-        match tokio::fs::metadata(&content_path).await {
-            Ok(m) => Ok(m.len() == entry.size as u64),
-            Err(_) => Ok(false),
-        }
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            match cacache::read_sync(&cache_path, &key_owned) {
+                Ok(_) => Ok(true),
+                Err(cacache::Error::EntryNotFound(_, _)) => Ok(false),
+                Err(cacache::Error::IntegrityError(_)) => Ok(false),
+                Err(e) => Err(e.into()),
+            }
+        }).await?
     }
 
-    // Legacy compatibility - теперь пустые операции
+    // Legacy compatibility
     pub async fn cleanup_temp(&self) -> Result<()> { Ok(()) }
     pub async fn cleanup_orphans(&self) -> Result<usize> { self.gc().await }
-}
-
-/// Streaming cache writer с автоматическим commit
-pub struct CacheWriter {
-    inner: cacache::Writer,
-    key: String,
-    size: u64,
-}
-
-impl CacheWriter {
-    pub async fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.inner.write_all(data).await?;
-        self.size += data.len() as u64;
-        Ok(data.len())
-    }
-
-    pub async fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush().await
-    }
-
-    pub fn written(&self) -> u64 {
-        self.size
-    }
-
-    pub async fn commit(self) -> Result<(u64, ssri::Integrity)> {
-        let integrity = self.inner.commit().await
-            .context("Failed to commit cache write")?;
-        metrics::dec_temp_files();
-        metrics::record_storage_write(self.size);
-        debug!(key = %self.key, size = self.size, hash = %integrity, "Committed");
-        Ok((self.size, integrity))
-    }
-}
-
-impl Drop for CacheWriter {
-    fn drop(&mut self) {
-    }
 }

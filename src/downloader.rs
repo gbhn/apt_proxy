@@ -1,7 +1,7 @@
 use crate::cache::CacheManager;
 use crate::error::{ProxyError, Result};
 use crate::metrics;
-use crate::storage::{CacheWriter, Metadata};
+use crate::storage::Metadata;
 use async_stream::stream;
 use axum::body::Body;
 use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED};
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, info, warn};
@@ -42,7 +42,7 @@ struct Download {
     tx: watch::Sender<State>,
     rx: watch::Receiver<State>,
     temp_path: PathBuf,
-    headers: RwLock<axum::http::HeaderMap>,  // Исправление бага #2
+    headers: RwLock<axum::http::HeaderMap>,
 }
 
 impl Download {
@@ -122,7 +122,6 @@ impl Downloader {
     }
 
     async fn start(&self, key: &str, url: &str, repo: &str) -> Result<Response> {
-        // Создаём временный файл для followers (они читают пока мы пишем)
         let temp_dir = std::env::temp_dir().join("apt-cacher-rs");
         tokio::fs::create_dir_all(&temp_dir).await.map_err(|e| {
             ProxyError::download(format!("Temp dir: {e}"))
@@ -166,10 +165,8 @@ impl Downloader {
         let mut rx = dl.subscribe();
 
         let len = loop {
-            let state = {
-                let borrowed = rx.borrow_and_update();
-                borrowed.clone()
-            };
+            // Clone state before await to avoid holding Ref across await
+            let state = rx.borrow_and_update().clone();
             
             match state {
                 State::Starting => { 
@@ -194,7 +191,7 @@ impl Downloader {
             }
         };
 
-        let headers = dl.get_headers();  // Thread-safe read
+        let headers = dl.get_headers();
         let stream = follow_stream(dl.temp_path.clone(), rx);
         
         let mut resp = Response::new(Body::from_stream(stream));
@@ -218,7 +215,6 @@ impl Downloader {
         metrics::dec_active();
         metrics::clear_download_progress(key);
 
-        // Cleanup temp file
         let _ = tokio::fs::remove_file(&temp_path).await;
 
         match result {
@@ -241,7 +237,6 @@ impl Downloader {
     async fn download_inner(&self, key: &str, url: &str, repo: &str, dl: &Download) -> Result<Option<u64>> {
         debug!(key, url, "Downloading");
 
-        // Build request with conditional headers
         let mut req = self.client.get(url);
         if let Some(meta) = self.cache.get_metadata(key).await {
             if let Some(ref etag) = meta.etag { 
@@ -261,7 +256,6 @@ impl Downloader {
 
         let status = resp.status();
 
-        // Handle 304 Not Modified
         if status == reqwest::StatusCode::NOT_MODIFIED {
             info!(key, "304 Not Modified");
             metrics::record_304();
@@ -285,7 +279,6 @@ impl Downloader {
             return Err(ProxyError::download("File too large"));
         }
 
-        // Extract headers
         let resp_headers = resp.headers().clone();
         let etag = resp_headers.get(http::header::ETAG)
             .and_then(|v| v.to_str().ok())
@@ -295,23 +288,17 @@ impl Downloader {
             .map(String::from);
         
         let headers = filter_headers(&resp_headers);
-        dl.set_headers(headers.clone());  // Thread-safe write
+        dl.set_headers(headers.clone());
 
         dl.notify(State::Streaming { written: 0, len: content_len });
 
-        // Create temp file for followers to read from
+        // Create temp file for followers
         let mut temp_file = tokio::fs::File::create(&dl.temp_path).await
             .map_err(ProxyError::Cache)?;
 
-        // Prepare metadata (size will be updated after download)
-        let mut meta = Metadata::new(key, url, 0, headers)
-            .with_conditionals(etag, last_modified);
+        // Buffer for collecting data to write to cache
+        let mut all_data = Vec::new();
 
-        // Create cache writer for atomic commit
-        let mut cache_writer = self.cache.create_writer(key, &meta).await
-            .map_err(|e| ProxyError::download(format!("Cache writer: {e}")))?;
-
-        // Stream download
         let mut stream = resp.bytes_stream();
         let mut written = 0u64;
 
@@ -323,35 +310,31 @@ impl Downloader {
                 return Err(ProxyError::download("Size exceeded")); 
             }
             
-            // Write to cache (atomic via cacache)
-            cache_writer.write(&bytes).await.map_err(ProxyError::Cache)?;
+            // Collect data for cache
+            all_data.extend_from_slice(&bytes);
             
-            // Write to temp file for followers (исправление бага #4 - без flush)
-            use tokio::io::AsyncWriteExt;
+            // Write to temp file for followers
             temp_file.write_all(&bytes).await.map_err(ProxyError::Cache)?;
             
             dl.notify(State::Streaming { written, len: content_len });
             metrics::set_download_progress(key, written);
         }
 
-        // Sync temp file for followers
         temp_file.sync_all().await.map_err(ProxyError::Cache)?;
 
-        // Verify size
         if let Some(expected) = content_len {
             if written != expected {
                 return Err(ProxyError::download(format!("Incomplete: {written}/{expected}")));
             }
         }
 
-        // Commit to cache atomically
-        meta.size = written;
-        let (size, _integrity) = cache_writer.commit().await
-            .map_err(|e| ProxyError::download(format!("Commit: {e}")))?;
+        // Write to cache
+        let meta = Metadata::new(key, url, written, headers)
+            .with_conditionals(etag, last_modified);
 
-        // Register in moka index
-        self.cache.register(key, size).await;
-        
+        self.cache.put(key, &all_data, &meta).await
+            .map_err(|e| ProxyError::download(format!("Cache write: {e}")))?;
+
         metrics::record_storage_write(written);
         Ok(Some(written))
     }
@@ -391,12 +374,11 @@ fn follow_stream(
                 Ok(f) => break f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     tokio::time::sleep(Duration::from_millis(5)).await;
-                    if rx.has_changed().unwrap_or(true) {
-                        let state = rx.borrow().clone();
-                        if matches!(state, State::Failed(_)) {
-                            yield Err(std::io::Error::other("Download failed"));
-                            return;
-                        }
+                    // Clone before checking to avoid holding ref across await
+                    let state = rx.borrow().clone();
+                    if matches!(state, State::Failed(_)) {
+                        yield Err(std::io::Error::other("Download failed"));
+                        return;
                     }
                 }
                 Err(e) => { 
@@ -410,27 +392,26 @@ fn follow_stream(
         let mut buf = vec![0u8; BUFFER_SIZE];
 
         loop {
+            // Clone state to avoid holding Ref across await
             let (written, done) = {
-                let state = rx.borrow_and_update();
-                match *state {
+                let state = rx.borrow_and_update().clone();
+                match state {
                     State::Starting => (0, false),
                     State::Streaming { written, .. } => (written, false),
                     State::Done { .. } => (u64::MAX, true),
-                    State::Failed(ref e) => { 
-                        yield Err(std::io::Error::other(e.clone())); 
+                    State::Failed(e) => { 
+                        yield Err(std::io::Error::other(e)); 
                         return; 
                     }
                 }
             };
 
-            // Read available data
             while pos < written {
                 let remaining = (written - pos) as usize;
                 let to_read = remaining.min(buf.len());
                 
                 match file.read(&mut buf[..to_read]).await {
                     Ok(0) => {
-                        // EOF but more data expected - seek back and retry
                         let _ = file.seek(SeekFrom::Start(pos)).await;
                         tokio::time::sleep(Duration::from_millis(1)).await;
                         break;
@@ -447,7 +428,6 @@ fn follow_stream(
             }
 
             if done {
-                // Read remaining data
                 loop {
                     match file.read(&mut buf).await {
                         Ok(0) => break,
@@ -461,7 +441,6 @@ fn follow_stream(
                 return;
             }
 
-            // Wait for more data
             if rx.changed().await.is_err() {
                 yield Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof, 

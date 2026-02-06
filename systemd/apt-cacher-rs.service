@@ -10,8 +10,8 @@ Type=simple
 ExecStart=/usr/bin/apt-cacher-rs --config /etc/apt-cacher/config.yaml
 Restart=on-failure
 RestartSec=5
-User=apt-cacher
-Group=apt-cacher
+User=www-data
+Group=www-data
 
 NoNewPrivileges=true
 ProtectSystem=strict

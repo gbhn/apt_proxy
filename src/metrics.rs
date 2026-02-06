@@ -1,4 +1,4 @@
-//! Prometheus metrics - simplified
+//! Prometheus metrics - исправлены баги с atomic operations
 
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
@@ -9,7 +9,7 @@ use tracing::info;
 
 static PROMETHEUS: OnceLock<PrometheusHandle> = OnceLock::new();
 
-// ============ Atomic Gauge Macro ============
+// ============ Исправленный Atomic Gauge Macro ============
 
 macro_rules! atomic_gauge {
     ($static:ident, $metric:literal, $inc:ident, $dec:ident, $get:ident) => {
@@ -21,8 +21,11 @@ macro_rules! atomic_gauge {
         }
 
         pub fn $dec() {
-            let val = $static.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
-            gauge!($metric).set(val as f64);
+            // Исправление бага #3: используем fetch_update для предотвращения underflow
+            let val = $static.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            }).unwrap_or(0);
+            gauge!($metric).set(val.saturating_sub(1) as f64);
         }
 
         pub fn $get() -> u64 {
@@ -34,8 +37,8 @@ macro_rules! atomic_gauge {
 atomic_gauge!(ACTIVE_DOWNLOADS, "downloads_active", inc_active, dec_active, active_downloads);
 atomic_gauge!(REQUESTS_IN_FLIGHT, "http_requests_in_flight", inc_requests_in_flight, dec_requests_in_flight, requests_in_flight);
 atomic_gauge!(ACTIVE_CONNECTIONS, "http_active_connections", inc_connections, dec_connections, active_connections);
-atomic_gauge!(PENDING_FOLLOWERS, "downloads_pending_followers", inc_followers, dec_followers, _pending_followers);
-atomic_gauge!(TEMP_FILES_ACTIVE, "storage_temp_files_active", inc_temp_files, dec_temp_files, _temp_files_active);
+atomic_gauge!(PENDING_FOLLOWERS, "downloads_pending_followers", inc_followers, dec_followers, pending_followers);
+atomic_gauge!(TEMP_FILES_ACTIVE, "storage_temp_files_active", inc_temp_files, dec_temp_files, temp_files_active);
 
 // ============ Histogram Buckets ============
 
@@ -141,11 +144,6 @@ pub fn record_repo_error(repo: &str, error_type: &str) {
     counter!("repository_errors_total", "repo" => repo.to_string(), "type" => error_type.to_string()).increment(1);
 }
 
-#[inline]
-pub fn record_repo_bytes_served(repo: &str, bytes: u64) {
-    counter!("repository_bytes_served_total", "repo" => repo.to_string()).increment(bytes);
-}
-
 // ============ Download Metrics ============
 
 #[inline]
@@ -203,25 +201,6 @@ pub fn record_upstream_timeout(repo: &str) {
     counter!("upstream_timeouts_total", "repo" => repo.to_string()).increment(1);
 }
 
-#[inline]
-pub fn record_upstream_request(status: u16, duration: Duration, size: Option<u64>, repo: &str) {
-    counter!("upstream_requests_total", "status" => status.to_string(), "repo" => repo.to_string()).increment(1);
-    histogram!("upstream_request_duration_seconds", "repo" => repo.to_string()).record(duration.as_secs_f64());
-    if let Some(s) = size {
-        histogram!("upstream_response_size_bytes", "repo" => repo.to_string()).record(s as f64);
-    }
-}
-
-#[inline]
-pub fn record_upstream_connect_time(duration: Duration) {
-    histogram!("upstream_connect_duration_seconds").record(duration.as_secs_f64());
-}
-
-#[inline]
-pub fn record_upstream_ttfb(duration: Duration) {
-    histogram!("upstream_time_to_first_byte_seconds").record(duration.as_secs_f64());
-}
-
 // ============ Storage Metrics ============
 
 #[inline]
@@ -249,12 +228,6 @@ pub fn record_storage_write(bytes: u64) {
 #[inline]
 pub fn set_storage_space_used(bytes: u64) {
     gauge!("storage_space_used_bytes").set(bytes as f64);
-}
-
-#[inline]
-pub fn record_temp_file_created() {
-    counter!("storage_temp_files_created_total").increment(1);
-    inc_temp_files();
 }
 
 #[inline]
@@ -304,15 +277,6 @@ pub fn record_request(method: &str, status: u16, repo: &str, duration: Duration,
     ).record(duration.as_secs_f64());
 }
 
-#[inline]
-pub fn record_path_validation(success: bool, reason: Option<&str>) {
-    let result = if success { "success" } else { "failure" };
-    counter!("path_validations_total", "result" => result).increment(1);
-    if let Some(r) = reason {
-        counter!("path_validation_failures_total", "reason" => r.to_string()).increment(1);
-    }
-}
-
 // ============ Maintenance Metrics ============
 
 #[inline]
@@ -340,38 +304,4 @@ fn now_secs() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs_f64()
-}
-
-// ============ RAII Guards ============
-
-/// Guard for tracking followers
-pub struct FollowerGuard;
-
-impl FollowerGuard {
-    pub fn new() -> Self {
-        inc_followers();
-        Self
-    }
-}
-
-impl Drop for FollowerGuard {
-    fn drop(&mut self) {
-        dec_followers();
-    }
-}
-
-/// Guard for tracking temp files
-pub struct TempFileGuard;
-
-impl TempFileGuard {
-    pub fn new() -> Self {
-        record_temp_file_created();
-        Self
-    }
-}
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        dec_temp_files();
-    }
 }

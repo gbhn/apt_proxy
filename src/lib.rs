@@ -79,22 +79,31 @@ pub fn router(app: Arc<App>) -> Router {
 }
 
 async fn metrics_handler() -> impl IntoResponse {
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-     metrics::render().unwrap_or_else(|| "# Metrics disabled\n".into()))
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        metrics::render().unwrap_or_else(|| "# Metrics disabled\n".into())
+    )
 }
 
 async fn health(State(app): State<Arc<App>>) -> impl IntoResponse {
     let status = if app.cache.is_loading() { "loading" } else { "ready" };
-    format!("OK\nstatus: {}\nactive: {}\n", status, metrics::active_downloads())
+    format!(
+        "OK\nstatus: {}\nactive: {}\nentries: {}\n", 
+        status, 
+        metrics::active_downloads(),
+        app.cache.entry_count()
+    )
 }
 
 async fn stats(State(app): State<Arc<App>>) -> impl IntoResponse {
     format!(
-        "entries: {}\nsize_kb: {}\nloading: {}\nactive: {}\n",
+        "entries: {}\nsize_kb: {}\nloading: {}\nactive: {}\nfollowers: {}\ntemp_files: {}\n",
         app.cache.entry_count(),
         app.cache.weighted_size(),
         app.cache.is_loading(),
-        metrics::active_downloads()
+        metrics::active_downloads(),
+        metrics::pending_followers(),
+        metrics::temp_files_active()
     )
 }
 
@@ -110,7 +119,7 @@ async fn logging(req: axum::extract::Request, next: Next) -> Response {
     let status = resp.status().as_u16();
     let elapsed = start.elapsed();
 
-    if !path.starts_with("/health") && !path.starts_with("/stats") {
+    if !path.starts_with("/health") && !path.starts_with("/stats") && !path.starts_with("/metrics") {
         let repo = path.trim_start_matches('/').split('/').next().unwrap_or("unknown");
         metrics::record_request(method.as_str(), status, repo, elapsed, 0, 0);
     }
@@ -154,9 +163,8 @@ fn validate_path(path: &str) -> Result<()> {
         if component == "." || component == ".." {
             return Err(ProxyError::InvalidPath("Path traversal".into()));
         }
-        if component.starts_with('.') && component != ".well-known" {
-            return Err(ProxyError::InvalidPath("Hidden files".into()));
-        }
+        // Разрешаем .well-known и другие dotfiles кроме . и ..
+        // Исправление бага #9 - менее строгая проверка
     }
 
     let normalized = std::panic::catch_unwind(|| {

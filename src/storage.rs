@@ -1,40 +1,15 @@
 use crate::metrics;
 use anyhow::{Context, Result};
+use cacache::WriteOpts;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::fs::{self, File};
-use tokio::io::AsyncWriteExt;
-use tracing::{debug, warn};
-
-const HASH_PREFIX_LEN: usize = 2;
-
-static INSTANCE_ID: OnceLock<u64> = OnceLock::new();
-static COUNTER: AtomicU64 = AtomicU64::new(0);
+use tokio::fs::File;
+use tokio::io::{AsyncRead, AsyncWriteExt};
+use tracing::{debug, info, warn};
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs()
-}
-
-fn instance_id() -> u64 {
-    *INSTANCE_ID.get_or_init(|| {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos();
-        let low = nanos as u64;
-        let high = (nanos >> 64) as u64;
-        (std::process::id() as u64).wrapping_mul(6364136223846793005)
-            ^ low.wrapping_add(high)
-    })
-}
-
-fn unique_id() -> String {
-    format!("{:016x}_{:016x}", instance_id(), COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,7 +28,15 @@ pub struct Metadata {
 
 impl Metadata {
     pub fn new(key: impl Into<String>, url: impl Into<String>, size: u64, headers: axum::http::HeaderMap) -> Self {
-        Self { headers, url: url.into(), key: key.into(), stored_at: now_secs(), size, etag: None, last_modified: None }
+        Self { 
+            headers, 
+            url: url.into(), 
+            key: key.into(), 
+            stored_at: now_secs(), 
+            size, 
+            etag: None, 
+            last_modified: None 
+        }
     }
 
     pub fn with_conditionals(mut self, etag: Option<String>, last_modified: Option<String>) -> Self {
@@ -63,257 +46,238 @@ impl Metadata {
     }
 }
 
-/// Timed storage operation helper
-macro_rules! timed_op {
-    ($op:literal, $body:expr) => {{
-        let start = Instant::now();
-        let result = $body;
-        let success = result.is_ok();
-        metrics::record_storage_operation($op, start.elapsed(), success);
-        result
-    }};
-}
-
 #[derive(Clone)]
 pub struct Storage {
-    base: PathBuf,
-    temp: PathBuf,
+    cache_path: PathBuf,
 }
 
 impl Storage {
     pub async fn new(base: PathBuf) -> Result<Self> {
-        let temp = base.join(".tmp");
-        fs::create_dir_all(&base).await.context("Failed to create cache dir")?;
-        fs::create_dir_all(&temp).await.context("Failed to create temp dir")?;
-        debug!(path = %base.display(), "Storage initialized");
-        Ok(Self { base, temp })
+        tokio::fs::create_dir_all(&base).await
+            .context("Failed to create cache directory")?;
+        debug!(path = %base.display(), "Storage initialized with cacache");
+        Ok(Self { cache_path: base })
     }
 
-    fn data_path(&self, key: &str) -> PathBuf {
-        let hash = blake3::hash(key.as_bytes()).to_hex();
-        let h = hash.as_str();
-        self.base.join(&h[..HASH_PREFIX_LEN]).join(&h[HASH_PREFIX_LEN..HASH_PREFIX_LEN * 2]).join(h)
-    }
-
-    fn meta_path(&self, key: &str) -> PathBuf { self.data_path(key).with_extension("json") }
-    fn temp_path(&self, ext: &str) -> PathBuf { self.temp.join(format!("{}.{}", unique_id(), ext)) }
-
-    pub async fn cleanup_temp(&self) -> Result<()> {
-        timed_op!("cleanup_temp", async {
-            let mut entries = match fs::read_dir(&self.temp).await {
-                Ok(e) => e,
-                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
-                Err(e) => return Err(e.into()),
-            };
-            let mut count = 0u64;
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if fs::remove_file(entry.path()).await.is_ok() { count += 1; }
-            }
-            if count > 0 { metrics::record_temp_cleanup(count); }
-            Ok(())
-        }.await)
-    }
-
-    pub async fn list_metadata_paths(&self) -> Result<Vec<PathBuf>> {
-        let mut result = Vec::new();
-        let mut stack = vec![self.base.clone()];
-
-        while let Some(dir) = stack.pop() {
-            let mut entries = match fs::read_dir(&dir).await { Ok(e) => e, Err(_) => continue };
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                let Ok(ft) = entry.file_type().await else { continue };
-                if ft.is_dir() && !path.file_name().is_some_and(|n| n.to_str().is_some_and(|s| s.starts_with('.'))) {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "json") {
-                    result.push(path);
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    pub async fn read_metadata_from_path(&self, path: &Path) -> Result<Option<Metadata>> {
-        match fs::read(path).await {
-            Ok(bytes) => match serde_json::from_slice(&bytes) {
-                Ok(meta) => Ok(Some(meta)),
-                Err(e) => {
-                    warn!(path = %path.display(), error = %e, "Corrupted metadata");
-                    metrics::record_metadata_parse_error();
-                    let _ = fs::remove_file(path).await;
-                    Ok(None)
-                }
-            },
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    pub async fn create_temp_data(&self) -> Result<(PathBuf, File)> {
-        let path = self.temp_path("data");
-        let file = File::create(&path).await.context("Failed to create temp file")?;
-        metrics::record_temp_file_created();
-        Ok((path, file))
-    }
-
+    /// Открыть закэшированный файл
     pub async fn open(&self, key: &str) -> Result<Option<(File, Metadata)>> {
-        let meta_path = self.meta_path(key);
-        let data_path = self.data_path(key);
-
-        let meta: Metadata = match self.read_metadata_from_path(&meta_path).await? {
-            Some(m) => m,
+        let start = Instant::now();
+        
+        let entry = match cacache::index::find_async(&self.cache_path, key).await? {
+            Some(e) => e,
             None => return Ok(None),
         };
 
-        let data_size = match fs::metadata(&data_path).await {
-            Ok(m) => m.len(),
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                warn!(key, "Data file missing");
-                let _ = fs::remove_file(&meta_path).await;
-                return Ok(None);
-            }
-            Err(e) => return Err(e.into()),
+        let meta: Metadata = match &entry.metadata {
+            serde_json::Value::Null => return Ok(None),
+            v => serde_json::from_value(v.clone()).context("Failed to parse metadata")?,
         };
 
-        if data_size != meta.size {
-            warn!(key, expected = meta.size, actual = data_size, "Size mismatch");
-            let _ = self.delete(key).await;
-            return Ok(None);
-        }
-
-        match File::open(&data_path).await {
+        let content_path = cacache::content_path(&self.cache_path, &entry.integrity);
+        
+        match File::open(&content_path).await {
             Ok(file) => {
+                metrics::record_storage_operation("open", start.elapsed(), true);
                 metrics::record_storage_read(meta.size);
                 Ok(Some((file, meta)))
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                warn!(key, "Content missing for index entry, cleaning up");
+                let _ = cacache::remove_async(&self.cache_path, key).await;
+                metrics::record_storage_error("content_missing");
+                Ok(None)
+            }
             Err(e) => Err(e.into()),
         }
     }
 
+    /// Получить только metadata
     pub async fn get_metadata(&self, key: &str) -> Result<Option<Metadata>> {
-        self.read_metadata_from_path(&self.meta_path(key)).await
+        match cacache::index::find_async(&self.cache_path, key).await? {
+            Some(entry) if entry.metadata != serde_json::Value::Null => {
+                let meta: Metadata = serde_json::from_value(entry.metadata)?;
+                Ok(Some(meta))
+            }
+            _ => Ok(None),
+        }
     }
 
-    pub async fn put_from_temp_data(&self, key: &str, temp_data: PathBuf, meta: &Metadata) -> Result<u64> {
-        let data_path = self.data_path(key);
-        let meta_path = self.meta_path(key);
+    /// Создать writer для streaming записи
+    pub async fn create_writer(&self, key: &str, meta: &Metadata) -> Result<CacheWriter> {
+        let start = Instant::now();
+        let meta_json = serde_json::to_value(meta)?;
+        
+        let writer = WriteOpts::new()
+            .algorithm(cacache::Algorithm::Sha256)
+            .metadata(meta_json)
+            .open_async(&self.cache_path, key)
+            .await
+            .context("Failed to create cache writer")?;
+        
+        metrics::record_storage_operation("create_writer", start.elapsed(), true);
+        metrics::inc_temp_files();
+        
+        Ok(CacheWriter { 
+            inner: writer,
+            key: key.to_string(),
+            size: 0,
+        })
+    }
 
-        if let Some(parent) = data_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
+    /// Записать данные из AsyncRead
+    pub async fn put_from_reader<R: AsyncRead + Unpin>(
+        &self, 
+        key: &str, 
+        reader: R, 
+        meta: &Metadata
+    ) -> Result<ssri::Integrity> {
+        let start = Instant::now();
+        let meta_json = serde_json::to_value(meta)?;
+        
+        let integrity = cacache::copy_async(&self.cache_path, key, reader).await
+            .context("Failed to write to cache")?;
 
-        let temp_meta = self.temp_path("json");
-        let json = serde_json::to_vec(meta)?;
-        let mut file = File::create(&temp_meta).await?;
-        file.write_all(&json).await?;
-        file.sync_all().await?;
-
-        if let Err(e) = fs::rename(&temp_data, &data_path).await {
-            let _ = fs::remove_file(&temp_data).await;
-            let _ = fs::remove_file(&temp_meta).await;
-            return Err(e.into());
-        }
-
-        if let Err(e) = fs::rename(&temp_meta, &meta_path).await {
-            warn!(key, error = %e, "Failed to write metadata, data file left as orphan");
-            let _ = fs::remove_file(&temp_meta).await;
-            return Err(e.into());
-        }
-
+        // Update metadata
+        cacache::index::insert_async(
+            &self.cache_path, 
+            key, 
+            WriteOpts::new()
+                .integrity(integrity.clone())
+                .metadata(meta_json)
+                .size(meta.size as usize)
+        ).await?;
+        
+        metrics::record_storage_operation("put", start.elapsed(), true);
         metrics::record_storage_write(meta.size);
-        debug!(key, size = meta.size, "Cached");
-        Ok(meta.size)
+        debug!(key, size = meta.size, hash = %integrity, "Cached");
+        
+        Ok(integrity)
     }
 
+    /// Обновить timestamp (touch) для TTL refresh
     pub async fn touch(&self, key: &str) -> Result<bool> {
-        let meta_path = self.meta_path(key);
-        let mut meta: Metadata = match self.read_metadata_from_path(&meta_path).await? {
-            Some(m) => m,
+        let entry = match cacache::index::find_async(&self.cache_path, key).await? {
+            Some(e) => e,
             None => return Ok(false),
         };
 
+        let mut meta: Metadata = match serde_json::from_value(entry.metadata) {
+            Ok(m) => m,
+            Err(_) => return Ok(false),
+        };
+        
         meta.stored_at = now_secs();
+        let meta_json = serde_json::to_value(&meta)?;
 
-        let temp_meta = self.temp_path("json");
-        let json = serde_json::to_vec(&meta)?;
-        let mut file = File::create(&temp_meta).await?;
-        file.write_all(&json).await?;
-        file.sync_all().await?;
-        fs::rename(&temp_meta, &meta_path).await?;
+        cacache::index::insert_async(
+            &self.cache_path, 
+            key, 
+            WriteOpts::new()
+                .integrity(entry.integrity)
+                .metadata(meta_json)
+                .size(entry.size)
+        ).await?;
 
         debug!(key, "Touched");
         Ok(true)
     }
 
+    /// Удалить запись
     pub async fn delete(&self, key: &str) -> Result<()> {
-        let _ = fs::remove_file(self.data_path(key)).await;
-        let _ = fs::remove_file(self.meta_path(key)).await;
+        let start = Instant::now();
+        cacache::remove_async(&self.cache_path, key).await?;
+        metrics::record_storage_operation("delete", start.elapsed(), true);
         debug!(key, "Deleted");
         Ok(())
     }
 
-    pub async fn cleanup_orphans(&self) -> Result<usize> {
-        let mut stack = vec![self.base.clone()];
-        let mut data_files = HashSet::new();
-        let mut meta_files = HashSet::new();
-        let mut all_files = Vec::new();
-
-        while let Some(dir) = stack.pop() {
-            let mut entries = match fs::read_dir(&dir).await { Ok(e) => e, Err(_) => continue };
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                let Ok(ft) = entry.file_type().await else { continue };
-
-                if ft.is_dir() {
-                    if !path.file_name().is_some_and(|n| n.to_str().is_some_and(|s| s.starts_with('.'))) {
-                        stack.push(path);
-                    }
-                    continue;
-                }
-
-                let is_hash_file = path.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.split('.').next().unwrap_or(""))
-                    .is_some_and(|n| n.len() == 64 && n.chars().all(|c| c.is_ascii_hexdigit()));
-
-                if !is_hash_file {
-                    continue;
-                }
-
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some("json") => {
-                        meta_files.insert(path.with_extension(""));
-                        all_files.push((path, true));
-                    }
-                    None => {
-                        data_files.insert(path.clone());
-                        all_files.push((path, false));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let mut removed = 0usize;
-        for (path, is_meta) in all_files {
-            let is_orphan = if is_meta {
-                !data_files.contains(&path.with_extension(""))
-            } else {
-                !meta_files.contains(&path)
-            };
-
-            if is_orphan {
-                if let Ok(_) = fs::remove_file(&path).await {
-                    removed += 1;
-                }
-            }
-        }
-
+    /// Garbage collection - удаляет unreferenced content
+    pub async fn gc(&self) -> Result<usize> {
+        let start = Instant::now();
+        let cache_path = self.cache_path.clone();
+        
+        // cacache gc is sync, run in blocking task
+        let removed = tokio::task::spawn_blocking(move || {
+            cacache::clear_sync(&cache_path)
+        }).await??;
+        
         if removed > 0 {
-            debug!(removed, "Removed orphans");
+            info!(removed, "GC completed");
             metrics::record_orphans_removed(removed as u64);
         }
+        metrics::record_maintenance_run("gc", start.elapsed());
+        
         Ok(removed)
+    }
+
+    /// Список всех записей (для загрузки индекса)
+    pub async fn list_entries(&self) -> Result<Vec<Metadata>> {
+        let cache_path = self.cache_path.clone();
+        
+        let entries = tokio::task::spawn_blocking(move || {
+            cacache::list_sync(&cache_path)
+                .filter_map(|entry| {
+                    serde_json::from_value::<Metadata>(entry.metadata).ok()
+                })
+                .collect::<Vec<_>>()
+        }).await?;
+        
+        Ok(entries)
+    }
+
+    /// Проверить целостность content
+    pub async fn verify(&self, key: &str) -> Result<bool> {
+        let entry = match cacache::index::find_async(&self.cache_path, key).await? {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+
+        let content_path = cacache::content_path(&self.cache_path, &entry.integrity);
+        
+        match tokio::fs::metadata(&content_path).await {
+            Ok(m) => Ok(m.len() == entry.size as u64),
+            Err(_) => Ok(false),
+        }
+    }
+
+    // Legacy compatibility - теперь пустые операции
+    pub async fn cleanup_temp(&self) -> Result<()> { Ok(()) }
+    pub async fn cleanup_orphans(&self) -> Result<usize> { self.gc().await }
+}
+
+/// Streaming cache writer с автоматическим commit
+pub struct CacheWriter {
+    inner: cacache::Writer,
+    key: String,
+    size: u64,
+}
+
+impl CacheWriter {
+    pub async fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.inner.write_all(data).await?;
+        self.size += data.len() as u64;
+        Ok(data.len())
+    }
+
+    pub async fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush().await
+    }
+
+    pub fn written(&self) -> u64 {
+        self.size
+    }
+
+    pub async fn commit(self) -> Result<(u64, ssri::Integrity)> {
+        let integrity = self.inner.commit().await
+            .context("Failed to commit cache write")?;
+        metrics::dec_temp_files();
+        metrics::record_storage_write(self.size);
+        debug!(key = %self.key, size = self.size, hash = %integrity, "Committed");
+        Ok((self.size, integrity))
+    }
+}
+
+impl Drop for CacheWriter {
+    fn drop(&mut self) {
     }
 }

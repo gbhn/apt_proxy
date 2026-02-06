@@ -1,7 +1,7 @@
 use crate::cache::CacheManager;
 use crate::error::{ProxyError, Result};
 use crate::metrics;
-use crate::storage::Metadata;
+use crate::storage::{CacheWriter, Metadata};
 use async_stream::stream;
 use axum::body::Body;
 use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED};
@@ -9,12 +9,13 @@ use axum::response::Response;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};
+use parking_lot::RwLock;
 use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::watch;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, info, warn};
@@ -25,7 +26,9 @@ const MAX_SIZE: u64 = 2 << 30;
 const BUFFER_SIZE: usize = 128 * 1024;
 const FOLLOW_TIMEOUT: Duration = Duration::from_secs(30);
 
-const FORWARD_HEADERS: &[axum::http::HeaderName] = &[CONTENT_TYPE, CONTENT_LENGTH, ETAG, LAST_MODIFIED, CACHE_CONTROL];
+const FORWARD_HEADERS: &[axum::http::HeaderName] = &[
+    CONTENT_TYPE, CONTENT_LENGTH, ETAG, LAST_MODIFIED, CACHE_CONTROL
+];
 
 #[derive(Clone, Debug)]
 enum State {
@@ -38,19 +41,35 @@ enum State {
 struct Download {
     tx: watch::Sender<State>,
     rx: watch::Receiver<State>,
-    path: PathBuf,
-    headers: Arc<axum::http::HeaderMap>,
+    temp_path: PathBuf,
+    headers: RwLock<axum::http::HeaderMap>,  // Исправление бага #2
 }
 
 impl Download {
-    fn new(path: PathBuf) -> Self {
+    fn new(temp_path: PathBuf) -> Self {
         let (tx, rx) = watch::channel(State::Starting);
-        Self { tx, rx, path, headers: Arc::new(axum::http::HeaderMap::new()) }
+        Self { 
+            tx, 
+            rx, 
+            temp_path,
+            headers: RwLock::new(axum::http::HeaderMap::new()),
+        }
     }
-    fn notify(&self, s: State) { let _ = self.tx.send(s); }
-    fn subscribe(&self) -> watch::Receiver<State> { self.rx.clone() }
-    fn set_headers(&mut self, headers: axum::http::HeaderMap) {
-        self.headers = Arc::new(headers);
+    
+    fn notify(&self, s: State) { 
+        let _ = self.tx.send(s); 
+    }
+    
+    fn subscribe(&self) -> watch::Receiver<State> { 
+        self.rx.clone() 
+    }
+    
+    fn set_headers(&self, headers: axum::http::HeaderMap) {
+        *self.headers.write() = headers;
+    }
+    
+    fn get_headers(&self) -> axum::http::HeaderMap {
+        self.headers.read().clone()
     }
 }
 
@@ -71,10 +90,16 @@ impl Downloader {
             .build()
             .expect("HTTP client");
 
-        Self { client, cache, active: Arc::new(DashMap::new()) }
+        Self { 
+            client, 
+            cache, 
+            active: Arc::new(DashMap::new()) 
+        }
     }
 
-    fn repo(key: &str) -> &str { key.split('/').next().unwrap_or("unknown") }
+    fn repo(key: &str) -> &str { 
+        key.split('/').next().unwrap_or("unknown") 
+    }
 
     pub async fn fetch(&self, key: &str, url: &str) -> Result<Response> {
         let repo = Self::repo(key);
@@ -97,11 +122,15 @@ impl Downloader {
     }
 
     async fn start(&self, key: &str, url: &str, repo: &str) -> Result<Response> {
-        let (path, file) = self.cache.create_temp_data().await.map_err(|e| {
-            ProxyError::download(format!("Temp file: {e}"))
+        // Создаём временный файл для followers (они читают пока мы пишем)
+        let temp_dir = std::env::temp_dir().join("apt-cacher-rs");
+        tokio::fs::create_dir_all(&temp_dir).await.map_err(|e| {
+            ProxyError::download(format!("Temp dir: {e}"))
         })?;
-
-        let dl = Arc::new(Download::new(path.clone()));
+        
+        let temp_path = temp_dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
+        
+        let dl = Arc::new(Download::new(temp_path.clone()));
 
         use dashmap::mapref::entry::Entry;
         match self.active.entry(key.to_string()) {
@@ -109,12 +138,11 @@ impl Downloader {
                 metrics::record_coalesced();
                 let existing = e.get().clone();
                 drop(e);
-                tokio::spawn(async move { 
-                    let _ = tokio::fs::remove_file(&path).await; 
-                });
                 return self.follow(key, existing).await;
             }
-            Entry::Vacant(v) => { v.insert(dl.clone()); }
+            Entry::Vacant(v) => { 
+                v.insert(dl.clone()); 
+            }
         }
 
         metrics::inc_active();
@@ -127,7 +155,7 @@ impl Downloader {
         let dl2 = dl.clone();
 
         tokio::spawn(async move {
-            this.do_download(&key_owned, &url_owned, &repo_owned, file, &dl2).await;
+            this.do_download(&key_owned, &url_owned, &repo_owned, &dl2).await;
         });
 
         self.follow(key, dl).await
@@ -152,19 +180,26 @@ impl Downloader {
                     }
                 }
                 State::Streaming { len, .. } => break len,
-                State::Done { cached: true } => return self.cache.open(key).await
-                    .map(|(f, m)| file_response(f, m))
-                    .ok_or_else(|| ProxyError::download("Cache miss after 304")),
-                State::Done { cached: false } => return self.cache.open(key).await
-                    .map(|(f, m)| file_response(f, m))
-                    .ok_or_else(|| ProxyError::download("Not found after download")),
+                State::Done { cached: true } => {
+                    return self.cache.open(key).await
+                        .map(|(f, m)| file_response(f, m))
+                        .ok_or_else(|| ProxyError::download("Cache miss after 304"));
+                }
+                State::Done { cached: false } => {
+                    return self.cache.open(key).await
+                        .map(|(f, m)| file_response(f, m))
+                        .ok_or_else(|| ProxyError::download("Not found after download"));
+                }
                 State::Failed(e) => return Err(ProxyError::Download(e)),
             }
         };
 
-        let stream = follow_stream(dl.path.clone(), rx);
+        let headers = dl.get_headers();  // Thread-safe read
+        let stream = follow_stream(dl.temp_path.clone(), rx);
+        
         let mut resp = Response::new(Body::from_stream(stream));
-        resp.headers_mut().extend((*dl.headers).clone());
+        resp.headers_mut().extend(headers);
+        
         if let Some(l) = len {
             if let Ok(v) = axum::http::HeaderValue::from_str(&l.to_string()) {
                 resp.headers_mut().insert(CONTENT_LENGTH, v);
@@ -173,59 +208,60 @@ impl Downloader {
         Ok(resp)
     }
 
-    async fn do_download(&self, key: &str, url: &str, repo: &str, mut file: File, dl: &Download) {
+    async fn do_download(&self, key: &str, url: &str, repo: &str, dl: &Download) {
         let start = Instant::now();
-        let path = dl.path.clone();
+        let temp_path = dl.temp_path.clone();
 
-        let result = self.download_inner(key, url, repo, &mut file, dl).await;
-        drop(file);
+        let result = self.download_inner(key, url, repo, dl).await;
 
         self.active.remove(key);
         metrics::dec_active();
         metrics::clear_download_progress(key);
 
+        // Cleanup temp file
+        let _ = tokio::fs::remove_file(&temp_path).await;
+
         match result {
-            Ok(Some((meta, bytes))) => {
-                match self.cache.commit(key, path.clone(), &meta).await {
-                    Ok(_) => {
-                        info!(key, size = meta.size, "Downloaded");
-                        dl.notify(State::Done { cached: false });
-                        metrics::record_download_complete(bytes, start.elapsed(), repo);
-                    }
-                    Err(e) => {
-                        warn!(key, error = %e, "Commit failed");
-                        let _ = tokio::fs::remove_file(&path).await;
-                        dl.notify(State::Failed(format!("Commit: {e}")));
-                        metrics::record_download_failed("commit", repo);
-                    }
-                }
+            Ok(Some(bytes)) => {
+                info!(key, size = bytes, elapsed_ms = start.elapsed().as_millis(), "Downloaded");
+                dl.notify(State::Done { cached: false });
+                metrics::record_download_complete(bytes, start.elapsed(), repo);
             }
-            Ok(None) => { let _ = tokio::fs::remove_file(&path).await; }
+            Ok(None) => {
+                // 304 Not Modified
+            }
             Err(e) => {
                 warn!(key, error = %e, "Download failed");
                 dl.notify(State::Failed(e.to_string()));
-                let _ = tokio::fs::remove_file(&path).await;
                 metrics::record_download_failed("error", repo);
             }
         }
     }
 
-    async fn download_inner(&self, key: &str, url: &str, repo: &str, file: &mut File, dl: &Download) -> Result<Option<(Metadata, u64)>> {
+    async fn download_inner(&self, key: &str, url: &str, repo: &str, dl: &Download) -> Result<Option<u64>> {
         debug!(key, url, "Downloading");
 
+        // Build request with conditional headers
         let mut req = self.client.get(url);
         if let Some(meta) = self.cache.get_metadata(key).await {
-            if let Some(ref etag) = meta.etag { req = req.header("If-None-Match", etag); }
-            if let Some(ref lm) = meta.last_modified { req = req.header("If-Modified-Since", lm); }
+            if let Some(ref etag) = meta.etag { 
+                req = req.header("If-None-Match", etag); 
+            }
+            if let Some(ref lm) = meta.last_modified { 
+                req = req.header("If-Modified-Since", lm); 
+            }
         }
 
         let resp = req.send().await.map_err(|e| {
-            if e.is_timeout() { metrics::record_upstream_timeout(repo); }
+            if e.is_timeout() { 
+                metrics::record_upstream_timeout(repo); 
+            }
             ProxyError::Upstream(e)
         })?;
 
         let status = resp.status();
 
+        // Handle 304 Not Modified
         if status == reqwest::StatusCode::NOT_MODIFIED {
             info!(key, "304 Not Modified");
             metrics::record_304();
@@ -239,7 +275,8 @@ impl Downloader {
         if !status.is_success() {
             metrics::record_upstream_error(&format!("status_{}", status.as_u16()), repo);
             return Err(ProxyError::UpstreamStatus(
-                axum::http::StatusCode::from_u16(status.as_u16()).unwrap_or(axum::http::StatusCode::BAD_GATEWAY)
+                axum::http::StatusCode::from_u16(status.as_u16())
+                    .unwrap_or(axum::http::StatusCode::BAD_GATEWAY)
             ));
         }
 
@@ -248,6 +285,7 @@ impl Downloader {
             return Err(ProxyError::download("File too large"));
         }
 
+        // Extract headers
         let resp_headers = resp.headers().clone();
         let etag = resp_headers.get(http::header::ETAG)
             .and_then(|v| v.to_str().ok())
@@ -257,42 +295,65 @@ impl Downloader {
             .map(String::from);
         
         let headers = filter_headers(&resp_headers);
-        
-        let dl_mut = unsafe { &mut *(dl as *const Download as *mut Download) };
-        dl_mut.set_headers(headers.clone());
+        dl.set_headers(headers.clone());  // Thread-safe write
 
         dl.notify(State::Streaming { written: 0, len: content_len });
 
-        // Now consume the response
+        // Create temp file for followers to read from
+        let mut temp_file = tokio::fs::File::create(&dl.temp_path).await
+            .map_err(ProxyError::Cache)?;
+
+        // Prepare metadata (size will be updated after download)
+        let mut meta = Metadata::new(key, url, 0, headers)
+            .with_conditionals(etag, last_modified);
+
+        // Create cache writer for atomic commit
+        let mut cache_writer = self.cache.create_writer(key, &meta).await
+            .map_err(|e| ProxyError::download(format!("Cache writer: {e}")))?;
+
+        // Stream download
         let mut stream = resp.bytes_stream();
         let mut written = 0u64;
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(ProxyError::Upstream)?;
             written += bytes.len() as u64;
-            if written > MAX_SIZE { return Err(ProxyError::download("Size exceeded")); }
             
-            file.write_all(&bytes).await.map_err(ProxyError::Cache)?;
-            file.flush().await.map_err(ProxyError::Cache)?;
+            if written > MAX_SIZE { 
+                return Err(ProxyError::download("Size exceeded")); 
+            }
+            
+            // Write to cache (atomic via cacache)
+            cache_writer.write(&bytes).await.map_err(ProxyError::Cache)?;
+            
+            // Write to temp file for followers (исправление бага #4 - без flush)
+            use tokio::io::AsyncWriteExt;
+            temp_file.write_all(&bytes).await.map_err(ProxyError::Cache)?;
             
             dl.notify(State::Streaming { written, len: content_len });
             metrics::set_download_progress(key, written);
         }
 
-        file.sync_all().await.map_err(ProxyError::Cache)?;
+        // Sync temp file for followers
+        temp_file.sync_all().await.map_err(ProxyError::Cache)?;
 
+        // Verify size
         if let Some(expected) = content_len {
             if written != expected {
                 return Err(ProxyError::download(format!("Incomplete: {written}/{expected}")));
             }
         }
 
+        // Commit to cache atomically
+        meta.size = written;
+        let (size, _integrity) = cache_writer.commit().await
+            .map_err(|e| ProxyError::download(format!("Commit: {e}")))?;
+
+        // Register in moka index
+        self.cache.register(key, size).await;
+        
         metrics::record_storage_write(written);
-
-        let meta = Metadata::new(key, url, written, headers)
-            .with_conditionals(etag, last_modified);
-
-        Ok(Some((meta, written)))
+        Ok(Some(written))
     }
 }
 
@@ -319,11 +380,30 @@ fn file_response(file: File, mut meta: Metadata) -> Response {
     resp
 }
 
-fn follow_stream(path: PathBuf, mut rx: watch::Receiver<State>) -> impl Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send {
+fn follow_stream(
+    path: PathBuf, 
+    mut rx: watch::Receiver<State>
+) -> impl Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send {
     stream! {
-        let mut file = match File::open(&path).await {
-            Ok(f) => f,
-            Err(e) => { yield Err(e); return; }
+        // Wait for file to be created
+        let mut file = loop {
+            match File::open(&path).await {
+                Ok(f) => break f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    if rx.has_changed().unwrap_or(true) {
+                        let state = rx.borrow().clone();
+                        if matches!(state, State::Failed(_)) {
+                            yield Err(std::io::Error::other("Download failed"));
+                            return;
+                        }
+                    }
+                }
+                Err(e) => { 
+                    yield Err(e); 
+                    return; 
+                }
+            }
         };
 
         let mut pos = 0u64;
@@ -343,13 +423,14 @@ fn follow_stream(path: PathBuf, mut rx: watch::Receiver<State>) -> impl Stream<I
                 }
             };
 
+            // Read available data
             while pos < written {
                 let remaining = (written - pos) as usize;
-                let buf_len = buf.len();
-                let to_read = remaining.min(buf_len);
+                let to_read = remaining.min(buf.len());
                 
                 match file.read(&mut buf[..to_read]).await {
                     Ok(0) => {
+                        // EOF but more data expected - seek back and retry
                         let _ = file.seek(SeekFrom::Start(pos)).await;
                         tokio::time::sleep(Duration::from_millis(1)).await;
                         break;
@@ -358,23 +439,34 @@ fn follow_stream(path: PathBuf, mut rx: watch::Receiver<State>) -> impl Stream<I
                         pos += n as u64; 
                         yield Ok(Bytes::copy_from_slice(&buf[..n])); 
                     }
-                    Err(e) => { yield Err(e); return; }
+                    Err(e) => { 
+                        yield Err(e); 
+                        return; 
+                    }
                 }
             }
 
             if done {
+                // Read remaining data
                 loop {
                     match file.read(&mut buf).await {
                         Ok(0) => break,
                         Ok(n) => yield Ok(Bytes::copy_from_slice(&buf[..n])),
-                        Err(e) => { yield Err(e); return; }
+                        Err(e) => { 
+                            yield Err(e); 
+                            return; 
+                        }
                     }
                 }
                 return;
             }
 
+            // Wait for more data
             if rx.changed().await.is_err() {
-                yield Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Interrupted"));
+                yield Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof, 
+                    "Download interrupted"
+                ));
                 return;
             }
         }

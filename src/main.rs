@@ -8,23 +8,33 @@ use tracing::info;
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "apt_cacher_rs=info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "apt_cacher_rs=info".into())
+        )
         .with_target(false)
         .init();
 
     let start = Instant::now();
     let settings = Settings::load(Args::parse())?;
 
-    info!(port = settings.port, repos = settings.repositories.len(), "Starting v{}", env!("CARGO_PKG_VERSION"));
+    info!(
+        port = settings.port, 
+        repos = settings.repositories.len(), 
+        cache_dir = %settings.cache_dir.display(),
+        "Starting v{}", 
+        env!("CARGO_PKG_VERSION")
+    );
 
     metrics::init(settings.prometheus)?;
     
     let app = Arc::new(App::new(settings.clone()).await?);
 
+    // Uptime reporter
     tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            interval.tick().await;
             metrics::update_uptime(start);
         }
     });
